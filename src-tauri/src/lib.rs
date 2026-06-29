@@ -785,8 +785,9 @@ pub fn run() {
 
                 TrayIconBuilder::with_id("resonance")
                     .icon(tray_icon)
+                    .icon_as_template(true)
                     .menu(&menu)
-                    .tooltip("Resonance")
+                    .tooltip("Scribe")
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "show" => {
                             if let Some(window) = app.get_webview_window("main") {
