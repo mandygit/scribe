@@ -359,15 +359,26 @@ function MeetingDetailView({
           <Spinner />
           <span className="label">Transcribing the recording…</span>
         </div>
+      ) : summarizing ? (
+        <div className="pending">
+          <Spinner />
+          <span className="label" style={{ flex: 1 }}>
+            Summarizing with Gemma on device…
+            <br />
+            <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+              Loading the model can take up to a minute the first time.
+            </span>
+          </span>
+        </div>
       ) : hasTranscript ? (
         <div className="pending">
           <Icon name="sparkles" />
           <span className="label" style={{ flex: 1 }}>
             Generate on-device notes from this transcript with Gemma.
           </span>
-          <button type="button" className="primary-btn" disabled={!canSummarize || summarizing} onClick={onSummarize}>
-            {summarizing ? <Spinner /> : <Icon name="sparkles" />}
-            {summarizing ? 'Summarizing…' : 'Generate notes'}
+          <button type="button" className="primary-btn" disabled={!canSummarize} onClick={onSummarize}>
+            <Icon name="sparkles" />
+            Generate notes
           </button>
         </div>
       ) : (
