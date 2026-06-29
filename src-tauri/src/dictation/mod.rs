@@ -1,12 +1,18 @@
-//! System-wide dictation: clean up dictated text with the on-device Apple
-//! Intelligence polish sidecar. Capture, hotkey, and injection land in later
-//! slices; this module owns the polish step.
+//! System-wide dictation: record a push-to-talk clip, transcribe it, and clean
+//! up the text with the on-device Apple Intelligence polish sidecar. Hotkey and
+//! injection land in later slices.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::domain::AppError;
+
+pub mod capture;
+pub mod inject;
+
+pub use capture::{new_dictation_wav_path, transcribe_clip, DictationRecorder};
+pub use inject::inject_text;
 
 fn polish_helper_unavailable() -> AppError {
     AppError {

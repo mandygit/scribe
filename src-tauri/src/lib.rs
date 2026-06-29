@@ -12,6 +12,7 @@ use audio::{
     AudioDevice, CpalCaptureBackend, RecordingManager, RecordingMetadata, RecordingStarted,
     ScreenCaptureKitSystemAudioBackend,
 };
+use dictation::DictationRecorder;
 use domain::{
     AnalyzerProvider, AppError, MeetingId, MeetingLifecycleState, ProcessingStage, ReportId,
     ResonanceSettings,
@@ -49,6 +50,7 @@ pub mod transcription;
 struct AppState {
     repository: Mutex<SqliteRepository>,
     recordings: Mutex<RecordingManager<CpalCaptureBackend, ScreenCaptureKitSystemAudioBackend>>,
+    dictation: Mutex<DictationRecorder<CpalCaptureBackend>>,
     echo_cancellation: SpeexEchoCancellationBackend,
 }
 
@@ -523,6 +525,57 @@ async fn summarize_meeting(
     })
 }
 
+/// Starts a push-to-talk dictation capture. Returns immediately; the matching
+/// `stop_dictation` call transcribes the clip.
+#[tauri::command]
+fn start_dictation(state: State<'_, AppState>) -> Result<(), AppError> {
+    let wav_path = dictation::new_dictation_wav_path()?;
+    let mut recorder = state.dictation.lock().map_err(map_lock_error)?;
+    recorder.start(wav_path, None)
+}
+
+/// Stops the in-flight dictation capture, transcribes the clip off the main
+/// thread, deletes the temporary WAV, and returns the raw transcript.
+#[tauri::command]
+async fn stop_dictation(state: State<'_, AppState>) -> Result<String, AppError> {
+    let wav_path = {
+        let mut recorder = state.dictation.lock().map_err(map_lock_error)?;
+        recorder.finish()?
+    };
+    let settings = {
+        let repository = state.repository.lock().map_err(map_lock_error)?;
+        load_effective_settings(&repository)?
+    };
+
+    let transcribe_path = wav_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let transcriber = WhisperShellTranscriber::from_settings(&settings)?;
+        dictation::transcribe_clip(&transcriber, &transcribe_path)
+    })
+    .await
+    .map_err(|error| AppError {
+        code: "dictation_transcription_task_failed".to_string(),
+        message: "The dictation transcription task did not finish.".to_string(),
+        details: Some(error.to_string()),
+    })?;
+
+    let _ = fs::remove_file(&wav_path);
+    result
+}
+
+/// Injects dictated text into the focused app via clipboard paste. Runs off the
+/// main thread because it spawns `pbcopy` and `osascript`.
+#[tauri::command]
+async fn inject_dictation_text(text: String) -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(move || dictation::inject_text(&text))
+        .await
+        .map_err(|error| AppError {
+            code: "dictation_inject_task_failed".to_string(),
+            message: "The dictation injection task did not finish.".to_string(),
+            details: Some(error.to_string()),
+        })?
+}
+
 #[tauri::command]
 async fn polish_dictation(text: String) -> Result<String, AppError> {
     tauri::async_runtime::spawn_blocking(move || dictation::polish_text(&text))
@@ -738,6 +791,9 @@ pub fn run() {
             transcribe_meeting,
             calculate_metrics,
             summarize_meeting,
+            start_dictation,
+            stop_dictation,
+            inject_dictation_text,
             polish_dictation,
             update_transcriber_settings,
             update_audio_processing_settings,
@@ -781,6 +837,7 @@ pub fn run() {
                     CpalCaptureBackend::new(),
                     ScreenCaptureKitSystemAudioBackend::new(),
                 )),
+                dictation: Mutex::new(DictationRecorder::new(CpalCaptureBackend::new())),
                 echo_cancellation: SpeexEchoCancellationBackend,
             });
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
