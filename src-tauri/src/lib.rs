@@ -36,6 +36,7 @@ use transcription::{
 
 pub mod analysis;
 pub mod audio;
+pub mod dictation;
 pub mod domain;
 pub mod media_import;
 pub mod nudges;
@@ -522,6 +523,17 @@ async fn summarize_meeting(
     })
 }
 
+#[tauri::command]
+async fn polish_dictation(text: String) -> Result<String, AppError> {
+    tauri::async_runtime::spawn_blocking(move || dictation::polish_text(&text))
+        .await
+        .map_err(|error| AppError {
+            code: "dictation_polish_task_failed".to_string(),
+            message: "The dictation polish task did not finish.".to_string(),
+            details: Some(error.to_string()),
+        })?
+}
+
 /// Runs the LM Studio summary lifecycle: start the server, load the model,
 /// summarize, then unload to free RAM regardless of the outcome.
 fn run_lm_studio_summary(
@@ -714,6 +726,7 @@ fn stop_recording(state: State<'_, AppState>) -> Result<RecordingMetadata, AppEr
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
             list_meeting_history,
@@ -725,6 +738,7 @@ pub fn run() {
             transcribe_meeting,
             calculate_metrics,
             summarize_meeting,
+            polish_dictation,
             update_transcriber_settings,
             update_audio_processing_settings,
             update_privacy_settings,

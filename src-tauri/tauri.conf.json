@@ -41,7 +41,8 @@
     "shortDescription": "Private on-device meeting notes and dictation for macOS.",
     "longDescription": "Scribe records meetings on device, transcribes them with whisper.cpp, and writes concise notes with a local model — your audio never leaves your Mac.",
     "externalBin": [
-      "binaries/resonance-system-audio-capture"
+      "binaries/resonance-system-audio-capture",
+      "binaries/scribe-dictation-polish"
     ],
     "macOS": {
       "minimumSystemVersion": "13.0",
