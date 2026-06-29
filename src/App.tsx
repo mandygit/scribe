@@ -154,7 +154,7 @@ export default function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark" aria-hidden="true" />
+          <BrandMark />
           <span className="brand-name">Scribe</span>
         </div>
 
@@ -289,6 +289,21 @@ function Icon({ name, size = 16 }: { name: keyof typeof ICON_PATHS | string; siz
       style={{ flexShrink: 0 }}
     >
       <path d={ICON_PATHS[name] ?? ''} />
+    </svg>
+  );
+}
+
+function BrandMark() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect x="0" y="0" width="24" height="24" rx="5.5" fill="var(--brand)" />
+      <g fill="#ffffff">
+        <rect x="6.2" y="10" width="1.6" height="4" rx="0.8" />
+        <rect x="8.8" y="8" width="1.6" height="8" rx="0.8" />
+        <rect x="11.2" y="6" width="1.6" height="12" rx="0.8" />
+        <rect x="13.6" y="8.5" width="1.6" height="7" rx="0.8" />
+        <rect x="16.2" y="10.25" width="1.6" height="3.5" rx="0.8" />
+      </g>
     </svg>
   );
 }
