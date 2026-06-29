@@ -1,0 +1,31 @@
+[package]
+name = "resonance"
+version = "0.1.0"
+description = "Resonance desktop meeting coach scaffold"
+authors = ["Resonance"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "resonance_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = []
+speaker-matching-sherpa = ["dep:sherpa-onnx"]
+
+[dependencies]
+cpal = "=0.17.1"
+hound = "3.5.1"
+rusqlite = "0.39.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sherpa-onnx = { version = "1.13.0", default-features = false, features = ["static"], optional = true }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tempfile = "3.27.0"
+
+[profile.dev]
+debug = 1

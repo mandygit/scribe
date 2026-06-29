@@ -1,0 +1,440 @@
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{sync_channel, SyncSender, TrySendError},
+        Arc, Mutex,
+    },
+};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+use crate::domain::AppError;
+
+use super::{
+    audio_error,
+    domain::AudioDevice,
+    wav::{spawn_i16_mono_wav_writer, WavWriterHandle},
+};
+
+// Five seconds of 48 kHz mono i16 samples. This absorbs short disk scheduling
+// hiccups without allowing unbounded memory growth in the audio callback path.
+const AUDIO_SAMPLE_CHANNEL_CAPACITY: usize = 48_000 * 5;
+
+pub trait AudioCaptureBackend: Send + Sync {
+    fn list_input_devices(&self) -> Result<Vec<AudioDevice>, AppError>;
+
+    fn start_recording(
+        &self,
+        file_path: PathBuf,
+        device_id: Option<String>,
+    ) -> Result<ActiveCapture, AppError>;
+}
+
+pub trait CaptureSessionHandle: Send {
+    fn stop(self: Box<Self>) -> Result<CaptureSummary, AppError>;
+}
+
+pub struct ActiveCapture {
+    pub file_path: PathBuf,
+    pub sample_rate_hz: u32,
+    pub started_at_ms: u64,
+    pub handle: Box<dyn CaptureSessionHandle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSummary {
+    pub sample_count: u64,
+    pub dropped_sample_count: u64,
+    pub stream_error: Option<String>,
+}
+
+#[derive(Default)]
+pub struct CpalCaptureBackend;
+
+impl CpalCaptureBackend {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl AudioCaptureBackend for CpalCaptureBackend {
+    fn list_input_devices(&self) -> Result<Vec<AudioDevice>, AppError> {
+        let host = cpal::default_host();
+        let default_id = host
+            .default_input_device()
+            .and_then(|device| device.id().ok())
+            .map(|id| id.to_string());
+        let devices = host.input_devices().map_err(map_cpal_devices_error)?;
+
+        devices
+            .map(|device| {
+                let id = device.id().map_err(map_cpal_device_id_error)?.to_string();
+                let name = device
+                    .description()
+                    .map_err(map_cpal_device_name_error)?
+                    .name()
+                    .to_string();
+                Ok(AudioDevice {
+                    is_default_input: default_id.as_deref() == Some(id.as_str()),
+                    id,
+                    name,
+                })
+            })
+            .collect()
+    }
+
+    fn start_recording(
+        &self,
+        file_path: PathBuf,
+        device_id: Option<String>,
+    ) -> Result<ActiveCapture, AppError> {
+        let host = cpal::default_host();
+        let device = select_input_device(&host, device_id.as_deref())?;
+        let supported_config = device
+            .default_input_config()
+            .map_err(map_cpal_config_error)?;
+        let sample_format = supported_config.sample_format();
+        let config: cpal::StreamConfig = supported_config.config();
+        let sample_rate_hz = config.sample_rate;
+        if sample_rate_hz == 0 {
+            return Err(audio_error(
+                "audio_input_config_invalid",
+                "Microphone input sample rate must be greater than zero.",
+                None,
+            ));
+        }
+        let channels = usize::from(config.channels);
+        let (sample_sender, sample_receiver) = sync_channel(AUDIO_SAMPLE_CHANNEL_CAPACITY);
+        let dropped_sample_count = Arc::new(AtomicU64::new(0));
+        let stream_error = Arc::new(Mutex::new(None));
+        let err_callback = {
+            let stream_error = Arc::clone(&stream_error);
+            move |error: cpal::StreamError| {
+                if let Ok(mut slot) = stream_error.lock() {
+                    *slot = Some(error.to_string());
+                }
+            }
+        };
+
+        let stream = match sample_format {
+            cpal::SampleFormat::I16 => build_i16_stream(
+                &device,
+                &config,
+                channels,
+                sample_sender,
+                Arc::clone(&dropped_sample_count),
+                err_callback,
+            ),
+            cpal::SampleFormat::U16 => build_u16_stream(
+                &device,
+                &config,
+                channels,
+                sample_sender,
+                Arc::clone(&dropped_sample_count),
+                err_callback,
+            ),
+            cpal::SampleFormat::F32 => build_f32_stream(
+                &device,
+                &config,
+                channels,
+                sample_sender,
+                Arc::clone(&dropped_sample_count),
+                err_callback,
+            ),
+            unsupported => Err(audio_error(
+                "audio_sample_format_unsupported",
+                "Default microphone sample format is not supported yet.",
+                Some(format!("sample_format={unsupported:?}")),
+            )),
+        }?;
+
+        let writer = spawn_i16_mono_wav_writer(file_path.clone(), sample_rate_hz, sample_receiver);
+        if let Err(error) = stream.play() {
+            drop(stream);
+            writer.join()?;
+            return Err(map_cpal_play_error(error));
+        }
+
+        Ok(ActiveCapture {
+            file_path,
+            sample_rate_hz,
+            started_at_ms: current_time_ms()?,
+            handle: Box::new(CpalCaptureSession {
+                stream,
+                writer,
+                dropped_sample_count,
+                stream_error,
+            }),
+        })
+    }
+}
+
+struct CpalCaptureSession {
+    stream: cpal::Stream,
+    writer: WavWriterHandle,
+    dropped_sample_count: Arc<AtomicU64>,
+    stream_error: Arc<Mutex<Option<String>>>,
+}
+
+impl CaptureSessionHandle for CpalCaptureSession {
+    fn stop(self: Box<Self>) -> Result<CaptureSummary, AppError> {
+        let Self {
+            stream,
+            writer,
+            dropped_sample_count,
+            stream_error,
+        } = *self;
+        drop(stream);
+
+        let writer_summary = writer.join()?;
+        let stream_error = stream_error.lock().map_err(|error| {
+            audio_error(
+                "audio_state_lock_failed",
+                "Could not read microphone stream error state.",
+                Some(error.to_string()),
+            )
+        })?;
+
+        Ok(CaptureSummary {
+            sample_count: writer_summary.sample_count,
+            dropped_sample_count: dropped_sample_count.load(Ordering::Relaxed),
+            stream_error: stream_error.clone(),
+        })
+    }
+}
+
+fn build_i16_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    sender: SyncSender<i16>,
+    dropped_sample_count: Arc<AtomicU64>,
+    err_callback: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, AppError> {
+    device
+        .build_input_stream(
+            config,
+            move |data: &[i16], _| {
+                enqueue_i16_samples(data, channels, &sender, &dropped_sample_count)
+            },
+            err_callback,
+            None,
+        )
+        .map_err(map_cpal_build_error)
+}
+
+fn build_u16_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    sender: SyncSender<i16>,
+    dropped_sample_count: Arc<AtomicU64>,
+    err_callback: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, AppError> {
+    device
+        .build_input_stream(
+            config,
+            move |data: &[u16], _| {
+                enqueue_u16_samples(data, channels, &sender, &dropped_sample_count)
+            },
+            err_callback,
+            None,
+        )
+        .map_err(map_cpal_build_error)
+}
+
+fn build_f32_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    sender: SyncSender<i16>,
+    dropped_sample_count: Arc<AtomicU64>,
+    err_callback: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, AppError> {
+    device
+        .build_input_stream(
+            config,
+            move |data: &[f32], _| {
+                enqueue_f32_samples(data, channels, &sender, &dropped_sample_count)
+            },
+            err_callback,
+            None,
+        )
+        .map_err(map_cpal_build_error)
+}
+
+fn enqueue_i16_samples(
+    samples: &[i16],
+    channels: usize,
+    sender: &SyncSender<i16>,
+    dropped_sample_count: &AtomicU64,
+) {
+    for frame in samples.chunks(channels.max(1)) {
+        let sum = frame.iter().map(|sample| i64::from(*sample)).sum::<i64>();
+        enqueue_sample(
+            (sum / frame.len() as i64) as i16,
+            sender,
+            dropped_sample_count,
+        );
+    }
+}
+
+fn enqueue_u16_samples(
+    samples: &[u16],
+    channels: usize,
+    sender: &SyncSender<i16>,
+    dropped_sample_count: &AtomicU64,
+) {
+    for frame in samples.chunks(channels.max(1)) {
+        let sum = frame
+            .iter()
+            .map(|sample| i64::from(*sample) - 32_768)
+            .sum::<i64>();
+        enqueue_sample(
+            (sum / frame.len() as i64) as i16,
+            sender,
+            dropped_sample_count,
+        );
+    }
+}
+
+fn enqueue_f32_samples(
+    samples: &[f32],
+    channels: usize,
+    sender: &SyncSender<i16>,
+    dropped_sample_count: &AtomicU64,
+) {
+    for frame in samples.chunks(channels.max(1)) {
+        let average = frame.iter().copied().sum::<f32>() / frame.len() as f32;
+        let sample = (average.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        enqueue_sample(sample, sender, dropped_sample_count);
+    }
+}
+
+fn enqueue_sample(sample: i16, sender: &SyncSender<i16>, dropped_sample_count: &AtomicU64) {
+    match sender.try_send(sample) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            dropped_sample_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn select_input_device(
+    host: &cpal::Host,
+    device_id: Option<&str>,
+) -> Result<cpal::Device, AppError> {
+    match device_id {
+        None => host.default_input_device().ok_or_else(|| {
+            audio_error(
+                "audio_input_device_not_found",
+                "No default microphone input device is available.",
+                None,
+            )
+        }),
+        Some(id) => cpal::DeviceId::from_str(id)
+            .map_err(map_cpal_device_id_error)
+            .and_then(|device_id| {
+                host.device_by_id(&device_id).ok_or_else(|| {
+                    audio_error(
+                        "audio_input_device_not_found",
+                        "Requested microphone input device was not found.",
+                        Some(format!("device_id={id}")),
+                    )
+                })
+            }),
+    }
+}
+
+pub(crate) fn current_time_ms() -> Result<u64, AppError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| {
+            audio_error(
+                "system_time_error",
+                "System clock is before the Unix epoch.",
+                Some(error.to_string()),
+            )
+        })
+}
+
+fn map_cpal_devices_error(error: cpal::DevicesError) -> AppError {
+    audio_error(
+        "audio_devices_unavailable",
+        "Could not enumerate microphone input devices.",
+        Some(error.to_string()),
+    )
+}
+
+fn map_cpal_device_name_error(error: cpal::DeviceNameError) -> AppError {
+    audio_error(
+        "audio_device_name_unavailable",
+        "Could not read microphone input device name.",
+        Some(error.to_string()),
+    )
+}
+
+fn map_cpal_device_id_error(error: cpal::DeviceIdError) -> AppError {
+    audio_error(
+        "invalid_audio_device_id",
+        "Audio device id is not valid.",
+        Some(error.to_string()),
+    )
+}
+
+fn map_cpal_config_error(error: cpal::DefaultStreamConfigError) -> AppError {
+    audio_error(
+        "audio_input_config_unavailable",
+        "Could not read the default microphone input configuration.",
+        Some(error.to_string()),
+    )
+}
+
+fn map_cpal_build_error(error: cpal::BuildStreamError) -> AppError {
+    audio_error(
+        "audio_stream_build_failed",
+        "Could not build the microphone input stream.",
+        Some(error.to_string()),
+    )
+}
+
+fn map_cpal_play_error(error: cpal::PlayStreamError) -> AppError {
+    audio_error(
+        "audio_stream_start_failed",
+        "Could not start the microphone input stream.",
+        Some(error.to_string()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::sync_channel;
+
+    use super::*;
+
+    #[test]
+    fn enqueue_samples_drops_when_bounded_channel_is_full() {
+        let (sender, receiver) = sync_channel(1);
+        let dropped_sample_count = AtomicU64::new(0);
+
+        enqueue_i16_samples(&[10, 20, 30], 1, &sender, &dropped_sample_count);
+
+        assert_eq!(receiver.try_recv().expect("first sample is retained"), 10);
+        assert_eq!(dropped_sample_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn enqueue_samples_downmixes_stereo_to_mono() {
+        let (sender, receiver) = sync_channel(2);
+        let dropped_sample_count = AtomicU64::new(0);
+
+        enqueue_i16_samples(&[10, 30, -20, 20], 2, &sender, &dropped_sample_count);
+
+        assert_eq!(receiver.try_recv().expect("first mono sample"), 20);
+        assert_eq!(receiver.try_recv().expect("second mono sample"), 0);
+        assert_eq!(dropped_sample_count.load(Ordering::Relaxed), 0);
+    }
+}

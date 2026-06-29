@@ -1,0 +1,33 @@
+.DS_Store
+*.log
+
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Tauri/Rust build output
+target/
+.build/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local databases and generated recordings
+*.sqlite
+*.sqlite3
+*.db
+*.wav
+*.m4a
+
+# Editor and cache folders
+.idea/
+.vscode/
+.cache/
+.serena/

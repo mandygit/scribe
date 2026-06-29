@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Resonance",
+  "version": "0.1.0",
+  "identifier": "com.resonance.meetingcoach",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "bun run build",
+    "beforeBundleCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Resonance",
+        "width": 980,
+        "height": 700,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Productivity",
+    "copyright": "Copyright © 2026 Resonance",
+    "shortDescription": "Private local meeting coach for macOS.",
+    "longDescription": "Resonance captures local meeting audio, transcribes with whisper.cpp, and produces communication coaching reports locally by default.",
+    "externalBin": [
+      "binaries/resonance-system-audio-capture"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "infoPlist": "Info.plist",
+      "hardenedRuntime": true
+    },
+    "targets": "all"
+  }
+}
