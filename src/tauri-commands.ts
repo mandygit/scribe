@@ -60,7 +60,7 @@ export const isTauriRuntime = (): boolean => {
 const assertTauriRuntime = (): void => {
   if (!isTauriRuntime()) {
     throw new Error(
-      'Open Resonance from the native window with `bun run tauri dev`; this page cannot reach the recording commands from a normal browser tab.',
+      'Open Scribe from the native window with `bun run tauri dev`; this page cannot reach the recording commands from a normal browser tab.',
     );
   }
 };

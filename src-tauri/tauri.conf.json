@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Resonance",
+  "productName": "Scribe",
   "version": "0.1.0",
   "identifier": "com.resonance.meetingcoach",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Resonance",
+        "title": "Scribe",
         "width": 980,
         "height": 700,
         "minWidth": 760,
@@ -29,10 +29,17 @@
   },
   "bundle": {
     "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "category": "Productivity",
-    "copyright": "Copyright © 2026 Resonance",
-    "shortDescription": "Private local meeting coach for macOS.",
-    "longDescription": "Resonance captures local meeting audio, transcribes with whisper.cpp, and produces communication coaching reports locally by default.",
+    "copyright": "Copyright © 2026 Scribe",
+    "shortDescription": "Private on-device meeting notes and dictation for macOS.",
+    "longDescription": "Scribe records meetings on device, transcribes them with whisper.cpp, and writes concise notes with a local model — your audio never leaves your Mac.",
     "externalBin": [
       "binaries/resonance-system-audio-capture"
     ],

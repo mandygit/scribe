@@ -155,7 +155,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true" />
-          <span className="brand-name">Resonance</span>
+          <span className="brand-name">Scribe</span>
         </div>
 
         <button
@@ -221,7 +221,7 @@ export default function App() {
           {!tauri && (
             <div className="banner error">
               <Icon name="alert" />
-              Open Resonance from the desktop app to record and process meetings.
+              Open Scribe from the desktop app to record and process meetings.
             </div>
           )}
           {error && (
@@ -589,7 +589,7 @@ function SettingsView({
 
       <section className="settings-group">
         <h2>Transcription</h2>
-        <p className="hint">Point Resonance at your local whisper.cpp binary and model.</p>
+        <p className="hint">Point Scribe at your local whisper.cpp binary and model.</p>
         <div className="field">
           <div>
             <div className="field-label">whisper-cli path</div>
