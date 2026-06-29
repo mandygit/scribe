@@ -26,6 +26,7 @@ use persistence::{
 };
 use rules::{MetricsSummary, RuleTranscriptSegment};
 use serde::Serialize;
+use summarizer::{LmStudioClient, LmStudioLifecycle, LmStudioSummarizer, DEFAULT_SUMMARIZER_MODEL};
 use tauri::{AppHandle, Emitter, Manager, State};
 use transcription::{
     TranscriptEventSink, TranscriptSegment, TranscriptStreamEvent, TranscriptStreamSummary,
@@ -41,6 +42,7 @@ pub mod nudges;
 pub mod path_detection;
 pub mod persistence;
 pub mod rules;
+pub mod summarizer;
 pub mod transcription;
 
 struct AppState {
@@ -119,6 +121,8 @@ pub struct MeetingHistoryDetail {
     meeting: MeetingHistoryItem,
     transcript_segments: Vec<TranscriptSegment>,
     transcript_truncated: bool,
+    summary: Option<MeetingSummary>,
+    summary_generated_at_ms: Option<u64>,
     audio_file_path: Option<String>,
     system_audio_file_path: Option<String>,
     pipeline_failure: Option<PipelineFailureRecord>,
@@ -238,6 +242,18 @@ fn get_meeting_history_detail(
     transcript_segments.truncate(HISTORY_DETAIL_TRANSCRIPT_LIMIT as usize);
     let transcript_segment_count = repository.count_transcript_segments(&meeting_id_value)?;
     let pipeline_failure = repository.get_pipeline_failure(&meeting_id_value)?;
+    let stored_summary = repository.get_meeting_summary(&meeting_id_value)?;
+    let summary = stored_summary
+        .as_ref()
+        .map(|record| {
+            serde_json::from_str::<MeetingSummary>(&record.body_json).map_err(|error| AppError {
+                code: "summary_decode_failed".to_string(),
+                message: "Stored meeting notes could not be decoded.".to_string(),
+                details: Some(error.to_string()),
+            })
+        })
+        .transpose()?;
+    let summary_generated_at_ms = stored_summary.as_ref().map(|record| record.generated_at_ms);
     let history_item = MeetingHistoryItem {
         meeting_id: meeting.id,
         title: meeting.title,
@@ -288,6 +304,8 @@ fn get_meeting_history_detail(
         meeting: history_item,
         transcript_segments: segments,
         transcript_truncated,
+        summary,
+        summary_generated_at_ms,
         audio_file_path,
         system_audio_file_path,
         pipeline_failure,
@@ -413,6 +431,101 @@ fn calculate_metrics(
     let meeting_id_value = MeetingId::new(meeting_id);
     let repository = state.repository.lock().map_err(map_lock_error)?;
     calculate_metrics_for_meeting_resilient(&repository, &meeting_id_value, current_time_ms()?)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingNotesResult {
+    meeting_id: MeetingId,
+    summary: MeetingSummary,
+    generated_at_ms: u64,
+}
+
+#[tauri::command]
+fn summarize_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    model: Option<String>,
+) -> Result<MeetingNotesResult, AppError> {
+    validate_recording_file_stem(&meeting_id)?;
+    let meeting_id_value = MeetingId::new(meeting_id);
+
+    let segments = {
+        let repository = state.repository.lock().map_err(map_lock_error)?;
+        let records = repository.list_transcript_segments(&meeting_id_value)?;
+        records
+            .into_iter()
+            .map(|record| AnalysisTranscriptSegment {
+                sequence_number: record.sequence_number,
+                speaker_label: record.speaker_label,
+                speaker_role: analysis::TranscriptSpeakerRole::User,
+                text: record.text,
+                started_at_ms: record.started_at_ms,
+                ended_at_ms: record.ended_at_ms,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if segments.is_empty() {
+        return Err(AppError {
+            code: "transcript_not_found".to_string(),
+            message: "Transcribe this meeting before generating notes.".to_string(),
+            details: Some(format!("meeting_id={}", meeting_id_value.as_str())),
+        });
+    }
+
+    let model = model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_SUMMARIZER_MODEL.to_string());
+
+    let generated_at_ms = current_time_ms()?;
+    let summary = match run_lm_studio_summary(segments, model) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let repository = state.repository.lock().map_err(map_lock_error)?;
+            persist_pipeline_failure(
+                &repository,
+                &meeting_id_value,
+                ProcessingStage::Analyzing,
+                &error,
+                generated_at_ms,
+            )?;
+            return Err(error);
+        }
+    };
+
+    let body_json = serde_json::to_string(&summary).map_err(|error| AppError {
+        code: "summary_serialization_failed".to_string(),
+        message: "Could not serialize the generated meeting notes.".to_string(),
+        details: Some(error.to_string()),
+    })?;
+    {
+        let repository = state.repository.lock().map_err(map_lock_error)?;
+        repository.upsert_meeting_summary(&meeting_id_value, &body_json, generated_at_ms)?;
+        clear_pipeline_failure_after_success(&repository, &meeting_id_value);
+    }
+
+    Ok(MeetingNotesResult {
+        meeting_id: meeting_id_value,
+        summary,
+        generated_at_ms,
+    })
+}
+
+/// Runs the LM Studio summary lifecycle: start the server, load the model,
+/// summarize, then unload to free RAM regardless of the outcome.
+fn run_lm_studio_summary(
+    segments: Vec<AnalysisTranscriptSegment>,
+    model: String,
+) -> Result<MeetingSummary, AppError> {
+    let lifecycle = LmStudioLifecycle::resolve(None)?;
+    lifecycle.ensure_running()?;
+    lifecycle.load(&model)?;
+    let summarizer = LmStudioSummarizer::new(LmStudioClient::default(), model);
+    let result = summarizer.summarize(&segments, false);
+    lifecycle.unload_all();
+    result
 }
 
 #[tauri::command]
@@ -602,6 +715,7 @@ pub fn run() {
             stop_recording,
             transcribe_meeting,
             calculate_metrics,
+            summarize_meeting,
             update_transcriber_settings,
             update_audio_processing_settings,
             update_privacy_settings,

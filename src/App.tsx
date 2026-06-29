@@ -11,9 +11,11 @@ import {
   listMeetingHistory,
   type MeetingHistoryDetail,
   type MeetingHistoryItem,
+  type MeetingSummary,
   type ResonanceSettings,
   startRecording,
   stopRecording,
+  summarizeMeeting,
   transcribeMeeting,
   updateAudioProcessingSettings,
   updatePrivacySettings,
@@ -48,6 +50,7 @@ export default function App() {
   const [detail, setDetail] = useState<MeetingHistoryDetail | null>(null);
   const [phase, setPhase] = useState<RecordPhase>('idle');
   const [elapsed, setElapsed] = useState(0);
+  const [summarizing, setSummarizing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
 
@@ -86,6 +89,19 @@ export default function App() {
       setDetail(await getMeetingHistoryDetail(meetingId));
     } catch (cause) {
       setError(messageFromUnknownError(cause, 'Could not open this meeting.'));
+    }
+  }, []);
+
+  const handleSummarize = useCallback(async (meetingId: string) => {
+    setError(null);
+    setSummarizing(true);
+    try {
+      await summarizeMeeting(meetingId);
+      setDetail(await getMeetingHistoryDetail(meetingId));
+    } catch (cause) {
+      setError(messageFromUnknownError(cause, 'Could not generate notes. Is LM Studio installed?'));
+    } finally {
+      setSummarizing(false);
     }
   }, []);
 
@@ -218,7 +234,13 @@ export default function App() {
           {view === 'settings' ? (
             <SettingsView settings={settings} devices={devices} onSettings={setSettings} onError={setError} />
           ) : detail ? (
-            <MeetingDetailView detail={detail} processing={phase === 'transcribing'} />
+            <MeetingDetailView
+              detail={detail}
+              processing={phase === 'transcribing'}
+              summarizing={summarizing}
+              canSummarize={tauri}
+              onSummarize={() => void handleSummarize(detail.meeting.meetingId)}
+            />
           ) : (
             <EmptyState recording={isRecording} />
           )}
@@ -248,6 +270,7 @@ const ICON_PATHS: Record<string, string> = {
   notes: 'M5 5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2zM9 7h6M9 11h6M9 15h4',
   sparkles: 'M12 3l1.8 5L19 10l-5.2 2L12 17l-1.8-5L5 10l5.2-2zM18 16l.7 2 .3 2 .3-2 .7-2 .7-.3-.7-.3z',
   stop: 'M7 7a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1z',
+  refresh: 'M20 11a8 8 0 0 0-13.7-5L4 8M4 4v4h4M4 13a8 8 0 0 0 13.7 5L20 16M20 20v-4h-4',
   loader: 'M12 3a9 9 0 1 0 9 9',
 };
 
@@ -294,9 +317,23 @@ function EmptyState({ recording }: { recording: boolean }) {
   );
 }
 
-function MeetingDetailView({ detail, processing }: { detail: MeetingHistoryDetail; processing: boolean }) {
-  const { meeting, transcriptSegments } = detail;
+function MeetingDetailView({
+  detail,
+  processing,
+  summarizing,
+  canSummarize,
+  onSummarize,
+}: {
+  detail: MeetingHistoryDetail;
+  processing: boolean;
+  summarizing: boolean;
+  canSummarize: boolean;
+  onSummarize: () => void;
+}) {
+  const { meeting, transcriptSegments, summary } = detail;
   const segmentCount = transcriptSegments.length;
+  const hasTranscript = segmentCount > 0;
+
   return (
     <div>
       <div className="meeting-header">
@@ -308,16 +345,37 @@ function MeetingDetailView({ detail, processing }: { detail: MeetingHistoryDetai
             <span>·</span> {meeting.transcriptSegmentCount} segments
           </p>
         </div>
+        {summary && hasTranscript && (
+          <button type="button" className="ghost-btn" disabled={summarizing} onClick={onSummarize}>
+            {summarizing ? <Spinner /> : <Icon name="refresh" />} Regenerate
+          </button>
+        )}
       </div>
 
-      <div className="pending">
-        {processing ? <Spinner /> : <Icon name="sparkles" />}
-        <span className="label">
-          {processing
-            ? 'Transcribing the recording…'
-            : 'Notes will appear here once the on-device summarizer is wired up. The transcript is ready below.'}
-        </span>
-      </div>
+      {summary ? (
+        <NotesView summary={summary} />
+      ) : processing ? (
+        <div className="pending">
+          <Spinner />
+          <span className="label">Transcribing the recording…</span>
+        </div>
+      ) : hasTranscript ? (
+        <div className="pending">
+          <Icon name="sparkles" />
+          <span className="label" style={{ flex: 1 }}>
+            Generate on-device notes from this transcript with Gemma.
+          </span>
+          <button type="button" className="primary-btn" disabled={!canSummarize || summarizing} onClick={onSummarize}>
+            {summarizing ? <Spinner /> : <Icon name="sparkles" />}
+            {summarizing ? 'Summarizing…' : 'Generate notes'}
+          </button>
+        </div>
+      ) : (
+        <div className="pending">
+          <Icon name="sparkles" />
+          <span className="label">Transcribe this meeting first to generate notes.</span>
+        </div>
+      )}
 
       <h2 className="section-title">Transcript</h2>
       {segmentCount === 0 ? (
@@ -340,6 +398,58 @@ function MeetingDetailView({ detail, processing }: { detail: MeetingHistoryDetai
           Transcript truncated.
         </p>
       )}
+    </div>
+  );
+}
+
+function NotesView({ summary }: { summary: MeetingSummary }) {
+  return (
+    <div>
+      <div className="notes">
+        {summary.executiveSummary && <p className="tldr">{summary.executiveSummary}</p>}
+        {summary.decisions.length > 0 && (
+          <>
+            <h2>Decisions</h2>
+            <ul>
+              {summary.decisions.map((decision) => (
+                <li key={decision}>{decision}</li>
+              ))}
+            </ul>
+          </>
+        )}
+        {summary.openQuestions.length > 0 && (
+          <>
+            <h2>Open questions</h2>
+            <ul>
+              {summary.openQuestions.map((question) => (
+                <li key={question}>{question}</li>
+              ))}
+            </ul>
+          </>
+        )}
+      </div>
+
+      {summary.actionItems.length > 0 && (
+        <>
+          <h2 className="section-title">Action items</h2>
+          <div className="action-list">
+            {summary.actionItems.map((item) => (
+              <div className="action-item" key={`${item.owner ?? 'unassigned'}-${item.task}`}>
+                {item.owner && <span className="owner-chip">{item.owner}</span>}
+                <span className="task">{item.task}</span>
+                {item.due && <span className="due">{item.due}</span>}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div className="provenance">
+        <span />
+        <span className="on-device">
+          <span className="seed" /> Summarized by Gemma · on device
+        </span>
+      </div>
     </div>
   );
 }

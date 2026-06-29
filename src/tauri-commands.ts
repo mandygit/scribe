@@ -6,6 +6,7 @@ import type {
   LiveNudgeEvent,
   MeetingHistoryDetail,
   MeetingHistoryPage,
+  MeetingNotesResult,
   MeetingTrendsResult,
   MetricsCalculationResult,
   PrivacySettingsUpdateResult,
@@ -25,9 +26,12 @@ export type {
   AppStatus,
   AudioDevice,
   LiveNudgeEvent,
+  MeetingActionItem,
   MeetingHistoryDetail,
   MeetingHistoryItem,
   MeetingHistoryPage,
+  MeetingNotesResult,
+  MeetingSummary,
   MeetingTrendPoint,
   MeetingTrendsResult,
   MetricsCalculationResult,
@@ -102,6 +106,9 @@ export const transcribeMeeting = async (meetingId: string): Promise<Transcriptio
 
 export const calculateMetrics = async (meetingId: string): Promise<MetricsCalculationResult> =>
   invokeNative<MetricsCalculationResult>('calculate_metrics', { meetingId });
+
+export const summarizeMeeting = async (meetingId: string, model?: string): Promise<MeetingNotesResult> =>
+  invokeNative<MeetingNotesResult>('summarize_meeting', { meetingId, model: model ?? null });
 
 export const updateAudioProcessingSettings = async (
   enableSystemAudio: boolean,

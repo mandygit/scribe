@@ -134,6 +134,12 @@ pub struct ImportedMeetingSummaryRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummaryRecord {
+    pub body_json: String,
+    pub generated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePracticeRecording {
     pub id: PracticeRecordingId,
     pub title: Option<String>,
@@ -926,6 +932,46 @@ impl SqliteRepository {
             .map_err(map_db_error)
     }
 
+    /// Inserts or replaces the on-device notes for a recorded meeting.
+    pub fn upsert_meeting_summary(
+        &self,
+        meeting_id: &MeetingId,
+        body_json: &str,
+        generated_at_ms: u64,
+    ) -> Result<(), AppError> {
+        self.connection
+            .execute(
+                "INSERT INTO meeting_summaries (meeting_id, body_json, generated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(meeting_id) DO UPDATE SET
+                    body_json = excluded.body_json,
+                    generated_at_ms = excluded.generated_at_ms",
+                params![meeting_id.as_str(), body_json, to_db_i64(generated_at_ms)?],
+            )
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    /// Returns the stored notes for a recorded meeting, if any.
+    pub fn get_meeting_summary(
+        &self,
+        meeting_id: &MeetingId,
+    ) -> Result<Option<MeetingSummaryRecord>, AppError> {
+        self.connection
+            .query_row(
+                "SELECT body_json, generated_at_ms FROM meeting_summaries WHERE meeting_id = ?1",
+                params![meeting_id.as_str()],
+                |row| {
+                    Ok(MeetingSummaryRecord {
+                        body_json: row.get(0)?,
+                        generated_at_ms: from_db_u64(row.get(1)?)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_db_error)
+    }
+
     pub fn create_practice_recording(
         &self,
         recording: &CreatePracticeRecording,
@@ -1687,6 +1733,13 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 source_file_path TEXT NOT NULL,
                 extracted_audio_file_path TEXT NOT NULL,
                 speaking_improvements_source TEXT NOT NULL DEFAULT 'none',
+                body_json TEXT NOT NULL,
+                generated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS meeting_summaries (
+                meeting_id TEXT PRIMARY KEY,
                 body_json TEXT NOT NULL,
                 generated_at_ms INTEGER NOT NULL,
                 FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE

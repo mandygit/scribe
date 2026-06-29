@@ -184,9 +184,17 @@ export interface MeetingHistoryDetail {
   meeting: MeetingHistoryItem;
   transcriptSegments: TranscriptSegment[];
   transcriptTruncated: boolean;
+  summary: MeetingSummary | null;
+  summaryGeneratedAtMs: number | null;
   audioFilePath: string | null;
   systemAudioFilePath: string | null;
   pipelineFailure: PipelineFailureRecord | null;
+}
+
+export interface MeetingNotesResult {
+  meetingId: MeetingId;
+  summary: MeetingSummary;
+  generatedAtMs: number;
 }
 
 export interface MeetingTrendPoint {
