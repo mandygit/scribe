@@ -442,7 +442,7 @@ pub struct MeetingNotesResult {
 }
 
 #[tauri::command]
-fn summarize_meeting(
+async fn summarize_meeting(
     state: State<'_, AppState>,
     meeting_id: String,
     model: Option<String>,
@@ -480,7 +480,16 @@ fn summarize_meeting(
         .unwrap_or_else(|| DEFAULT_SUMMARIZER_MODEL.to_string());
 
     let generated_at_ms = current_time_ms()?;
-    let summary = match run_lm_studio_summary(segments, model) {
+    // Run the blocking model load + summary off the main thread so the webview
+    // UI stays responsive (a synchronous command would freeze it for ~1 minute).
+    let summary_result = tauri::async_runtime::spawn_blocking(move || run_lm_studio_summary(segments, model))
+        .await
+        .map_err(|error| AppError {
+            code: "summary_task_failed".to_string(),
+            message: "The summarization task did not finish.".to_string(),
+            details: Some(error.to_string()),
+        })?;
+    let summary = match summary_result {
         Ok(summary) => summary,
         Err(error) => {
             let repository = state.repository.lock().map_err(map_lock_error)?;

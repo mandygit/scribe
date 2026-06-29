@@ -352,14 +352,7 @@ function MeetingDetailView({
         )}
       </div>
 
-      {summary ? (
-        <NotesView summary={summary} />
-      ) : processing ? (
-        <div className="pending">
-          <Spinner />
-          <span className="label">Transcribing the recording…</span>
-        </div>
-      ) : summarizing ? (
+      {summarizing ? (
         <div className="pending">
           <Spinner />
           <span className="label" style={{ flex: 1 }}>
@@ -369,6 +362,13 @@ function MeetingDetailView({
               Loading the model can take up to a minute the first time.
             </span>
           </span>
+        </div>
+      ) : summary ? (
+        <NotesView summary={summary} />
+      ) : processing ? (
+        <div className="pending">
+          <Spinner />
+          <span className="label">Transcribing the recording…</span>
         </div>
       ) : hasTranscript ? (
         <div className="pending">
