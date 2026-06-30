@@ -43,6 +43,20 @@ impl DictationHotkey {
         self.recording_since_ms.is_some()
     }
 
+    /// Marks a dictation as started at `now_ms` from outside the press flow (the
+    /// pill's toggle button), so a subsequent hotkey press correctly stops it.
+    pub fn mark_recording_started(&mut self, now_ms: u64) {
+        self.recording_since_ms = Some(now_ms);
+        self.pending_press_ms = None;
+    }
+
+    /// Marks the dictation stopped from outside the press flow (the pill's toggle
+    /// button), so a subsequent hotkey press starts a fresh dictation.
+    pub fn mark_recording_stopped(&mut self) {
+        self.recording_since_ms = None;
+        self.pending_press_ms = None;
+    }
+
     /// Records a hotkey press at `now_ms` and returns the action to take.
     pub fn on_press(&mut self, now_ms: u64) -> HotkeyAction {
         if let Some(started_ms) = self.recording_since_ms {
@@ -128,6 +142,29 @@ mod tests {
         // relative to the stop press.
         assert_eq!(hotkey.on_press(5_200), HotkeyAction::None);
         assert!(!hotkey.is_recording());
+    }
+
+    #[test]
+    fn pill_start_then_hotkey_press_stops() {
+        // Started via the pill toggle, the tracker must treat the next hotkey
+        // press (after the minimum recording time) as a stop.
+        let mut hotkey = DictationHotkey::new();
+        hotkey.mark_recording_started(1_000);
+        assert!(hotkey.is_recording());
+        assert_eq!(hotkey.on_press(5_000), HotkeyAction::StopRecording);
+        assert!(!hotkey.is_recording());
+    }
+
+    #[test]
+    fn pill_stop_then_hotkey_needs_fresh_double_press() {
+        // Stopped via the pill toggle, a lone hotkey press must not restart; a
+        // fresh double-press is required.
+        let mut hotkey = DictationHotkey::new();
+        hotkey.mark_recording_started(1_000);
+        hotkey.mark_recording_stopped();
+        assert!(!hotkey.is_recording());
+        assert_eq!(hotkey.on_press(2_000), HotkeyAction::None);
+        assert_eq!(hotkey.on_press(2_200), HotkeyAction::StartRecording);
     }
 
     #[test]

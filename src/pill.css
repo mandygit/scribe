@@ -9,6 +9,7 @@
   --dpill-idle: rgba(244, 243, 238, 0.5);
   --dpill-listening: #e0533f;
   --dpill-transcribing: #4a86e8;
+  --dpill-polish: #c96442;
 }
 
 /* Page-level rules are scoped to .pill-view (added to <html> only in pill mode).
@@ -96,6 +97,32 @@
 .dpill[data-state="listening"] .dpill__label,
 .dpill[data-state="transcribing"] .dpill__label {
   color: var(--dpill-text);
+}
+
+/* Polish toggle: a small chip that fills in when on. Pushed to the right edge. */
+.dpill__polish {
+  margin-left: auto;
+  padding: 3px 9px;
+  border: 0.5px solid rgba(255, 255, 255, 0.16);
+  border-radius: 11px;
+  background: transparent;
+  color: var(--dpill-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.dpill__polish:hover {
+  color: var(--dpill-text);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.dpill__polish.is-on {
+  background: var(--dpill-polish);
+  border-color: transparent;
+  color: #fff;
 }
 
 @keyframes dpill-pulse {

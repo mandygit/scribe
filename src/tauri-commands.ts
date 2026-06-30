@@ -21,6 +21,9 @@ import type {
 export const TRANSCRIPT_SEGMENT_EVENT = 'resonance://transcript-segment';
 export const TRANSCRIPT_STREAM_COMPLETE_EVENT = 'resonance://transcript-stream-complete';
 export const LIVE_NUDGE_EVENT = 'resonance://live-nudge';
+export const DICTATION_STATE_EVENT = 'resonance://dictation-state';
+
+export type DictationState = 'idle' | 'listening' | 'transcribing';
 
 export type {
   AppStatus,
@@ -148,6 +151,13 @@ export const updateDictationSettings = async (
 
 export const sendCompletionNotification = async (title: string, body: string): Promise<void> =>
   invokeNative<void>('send_completion_notification', { title, body });
+
+export const toggleDictation = async (): Promise<void> => invokeNative<void>('toggle_dictation');
+
+export const listenToDictationState = async (onState: (state: DictationState) => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen<{ state: DictationState }>(DICTATION_STATE_EVENT, (event) => onState(event.payload.state));
+};
 
 export const listenToTranscriptStream = async (listeners: TranscriptStreamListeners): Promise<UnlistenFn> => {
   assertTauriRuntime();

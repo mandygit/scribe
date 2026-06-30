@@ -596,6 +596,41 @@ fn play_cue(sound_file: &str) {
     let _ = Command::new("afplay").arg(sound_file).spawn();
 }
 
+/// Event the dictation pill listens to so it can reflect the current state
+/// (`idle` → `listening` → `transcribing` → `idle`).
+const DICTATION_STATE_EVENT: &str = "resonance://dictation-state";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationStateEvent {
+    state: &'static str,
+}
+
+/// Broadcasts the current dictation state to the pill window. Fire-and-forget:
+/// a failed emit must never disrupt the dictation flow itself.
+fn emit_dictation_state(app: &AppHandle, state: &'static str) {
+    let _ = app.emit(DICTATION_STATE_EVENT, DictationStateEvent { state });
+}
+
+/// Shows or hides the dictation pill panel on the main thread (AppKit calls must
+/// run there). Hiding it hands key focus back to the user's previously-active
+/// window so a synthesised paste lands in their field; `order_front_regardless`
+/// brings the pill back without making it the key window again.
+#[cfg(target_os = "macos")]
+fn set_pill_visible(app: &AppHandle, visible: bool) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        use tauri_nspanel::ManagerExt;
+        if let Ok(panel) = app.get_webview_panel(DICTATION_PILL_WINDOW) {
+            if visible {
+                panel.order_front_regardless();
+            } else {
+                panel.order_out(None);
+            }
+        }
+    });
+}
+
 /// Shows or clears a "listening" indicator in the menu bar by setting the tray
 /// title, so the user can see when dictation is recording even with the main
 /// window hidden.
@@ -615,16 +650,18 @@ const DICTATION_PILL_WINDOW: &str = "pill";
 
 /// Logical size of the dictation pill and the gap kept above the Dock.
 #[cfg(desktop)]
-const PILL_WIDTH: f64 = 200.0;
+const PILL_WIDTH: f64 = 240.0;
 #[cfg(desktop)]
 const PILL_HEIGHT: f64 = 40.0;
 #[cfg(desktop)]
 const PILL_BOTTOM_MARGIN: f64 = 8.0;
 
 /// Creates the floating dictation pill: a small, transparent, always-on-top bar
-/// pinned to the bottom-center of the primary screen. It is built `focusable(false)`
-/// so clicking it never steals key focus from the user's real app — otherwise the
-/// Cmd+V paste at the end of dictation would land in the pill instead of their app.
+/// pinned to the bottom-center of the primary screen. On macOS it is converted to
+/// a non-activating panel (see `make_pill_non_activating`) so clicking it never
+/// activates Scribe; `accept_first_mouse` lets the mic button fire on the first
+/// click even though the panel isn't the key window (otherwise the first click is
+/// swallowed just to focus the webview).
 #[cfg(desktop)]
 fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
     use tauri::{WebviewUrl, WebviewWindowBuilder};
@@ -644,6 +681,7 @@ fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
     .resizable(false)
     .focusable(false)
     .focused(false)
+    .accept_first_mouse(true)
     .visible(true)
     .build()?;
 
@@ -674,6 +712,52 @@ fn position_pill_bottom_center(pill: &tauri::WebviewWindow) {
         - pill_size.height as i32
         - margin;
     let _ = pill.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+/// Converts the dictation pill window into a non-activating NSPanel. A normal
+/// macOS window activates its owning app when clicked, which would raise Scribe's
+/// main window over the pill and steal focus from whatever app the user is
+/// dictating into. The non-activating panel style mask lets the pill receive
+/// clicks without ever activating the app. Best-effort: logs and returns if the
+/// window is missing or the swizzle fails.
+#[cfg(target_os = "macos")]
+// tauri-nspanel's public API is built on the older `cocoa` crate, which is now
+// deprecated in favour of objc2-app-kit; the plugin still requires these types.
+#[allow(deprecated)]
+fn make_pill_non_activating(app: &AppHandle) {
+    use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
+    use tauri_nspanel::WebviewWindowExt;
+
+    let Some(window) = app.get_webview_window(DICTATION_PILL_WINDOW) else {
+        eprintln!("dictation pill: window missing, cannot convert to panel");
+        return;
+    };
+    let panel = match window.to_panel() {
+        Ok(panel) => panel,
+        Err(error) => {
+            eprintln!("dictation pill: to_panel failed: {error}");
+            return;
+        }
+    };
+
+    // Float above ordinary windows.
+    const NS_FLOATING_WINDOW_LEVEL: i32 = 4;
+    panel.set_level(NS_FLOATING_WINDOW_LEVEL);
+
+    // NSWindowStyleMaskNonactivatingPanel — a click must not activate Scribe (the
+    // app stays in the background; only its key window changes). The pill is
+    // borderless, so this is the only style bit it needs. The pill still briefly
+    // takes *key* focus on click, so the dictation flow re-activates the user's
+    // previous app before pasting (see `start_dictation_session` / inject).
+    const NS_NONACTIVATING_PANEL: i32 = 1 << 7;
+    panel.set_style_mask(NS_NONACTIVATING_PANEL);
+
+    // Keep the pill visible across spaces and alongside other apps' full-screen
+    // windows, matching its always-on-top intent.
+    panel.set_collection_behaviour(
+        NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
+    );
 }
 
 /// Maps a persisted dictation-hotkey token to a registrable global shortcut. The
@@ -716,9 +800,95 @@ fn register_dictation_hotkey(app: &AppHandle, token: &str) -> Result<(), AppErro
         })
 }
 
+/// Starts a dictation session: begins microphone capture and signals the
+/// listening state to the UI and menu bar. Shared by the hotkey handler and the
+/// pill's toggle command. On failure it resets the hotkey press tracker so a
+/// failed start can never leave it stuck thinking a dictation is in flight.
+fn start_dictation_session(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    match begin_dictation(&state) {
+        Ok(()) => {
+            eprintln!("dictation: listening…");
+            set_recording_indicator(app, true);
+            emit_dictation_state(app, "listening");
+            play_cue(DICTATION_START_SOUND);
+        }
+        Err(error) => {
+            eprintln!("dictation start failed: {} ({})", error.message, error.code);
+            if let Ok(mut tracker) = state.dictation_hotkey.lock() {
+                *tracker = DictationHotkey::new();
+            }
+            emit_dictation_state(app, "idle");
+        }
+    }
+}
+
+/// Stops the in-flight dictation and runs transcribe → optional polish → inject
+/// off the main thread, signalling the transcribing state up front and idle when
+/// done. Shared by the hotkey handler and the pill's toggle command.
+fn stop_and_process_dictation(app: &AppHandle) {
+    eprintln!("dictation: transcribing…");
+    set_recording_indicator(app, false);
+    emit_dictation_state(app, "transcribing");
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let outcome = stop_dictation_capture(&state).and_then(|(wav_path, settings)| {
+            let mut text = transcribe_dictation_wav(&wav_path, &settings)?;
+            if settings.dictation_polish_enabled && !text.trim().is_empty() {
+                // Polish with Apple Intelligence, but fall back to the raw
+                // transcript if it is unavailable or returns nothing.
+                match dictation::polish_text(&text) {
+                    Ok(polished) if !polished.trim().is_empty() => text = polished,
+                    Ok(_) => {}
+                    Err(error) => eprintln!(
+                        "dictation: polish failed ({}), inserting raw text",
+                        error.code
+                    ),
+                }
+            }
+            // Before pasting, hand key focus back to the user's app: clicking the
+            // pill can make it the key window (dropping the user's field as first
+            // responder), so a synthesised Cmd+V would land nowhere. Hiding the
+            // always-on-top pill returns key to the previously-active window;
+            // after the paste, bring the pill back without re-keying it. Skipped
+            // for empty transcripts (inject is a no-op then).
+            #[cfg(target_os = "macos")]
+            let restore_pill = !text.trim().is_empty();
+            #[cfg(target_os = "macos")]
+            if restore_pill {
+                set_pill_visible(&app, false);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            let inject_result = dictation::inject_text(&text);
+            #[cfg(target_os = "macos")]
+            if restore_pill {
+                // Let the paste land before the pill floats back over the app.
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                set_pill_visible(&app, true);
+            }
+            inject_result?;
+            Ok(text)
+        });
+        match outcome {
+            Ok(text) if text.trim().is_empty() => {
+                eprintln!("dictation: no speech detected, nothing inserted");
+            }
+            Ok(text) => {
+                // Log only the length, not the dictated text itself.
+                eprintln!("dictation: inserted {} characters", text.chars().count());
+                play_cue(DICTATION_DONE_SOUND);
+            }
+            Err(error) => {
+                eprintln!("dictation stop failed: {} ({})", error.message, error.code);
+            }
+        }
+        emit_dictation_state(&app, "idle");
+    });
+}
+
 /// Handles one dictation hotkey press: advances the Wispr-style press tracker and
-/// starts or stops dictation. Stop work (transcribe + inject) runs off the main
-/// thread so the hotkey callback never blocks.
+/// starts or stops dictation via the shared session helpers.
 fn on_dictation_hotkey_press(app: &AppHandle) {
     let state = app.state::<AppState>();
     let now_ms = match current_time_ms() {
@@ -738,65 +908,33 @@ fn on_dictation_hotkey_press(app: &AppHandle) {
 
     match action {
         HotkeyAction::None => {}
-        HotkeyAction::StartRecording => match begin_dictation(&state) {
-            Ok(()) => {
-                eprintln!("dictation: listening…");
-                set_recording_indicator(app, true);
-                play_cue(DICTATION_START_SOUND);
-            }
-            Err(error) => {
-                eprintln!(
-                    "dictation hotkey start failed: {} ({})",
-                    error.message, error.code
-                );
-                // Reset the tracker so the failed start doesn't leave it "recording".
-                if let Ok(mut tracker) = state.dictation_hotkey.lock() {
-                    *tracker = DictationHotkey::new();
-                }
-            }
-        },
-        HotkeyAction::StopRecording => {
-            eprintln!("dictation: transcribing…");
-            set_recording_indicator(app, false);
-            let app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                let state = app.state::<AppState>();
-                let outcome = stop_dictation_capture(&state).and_then(|(wav_path, settings)| {
-                    let mut text = transcribe_dictation_wav(&wav_path, &settings)?;
-                    if settings.dictation_polish_enabled && !text.trim().is_empty() {
-                        // Polish with Apple Intelligence, but fall back to the raw
-                        // transcript if it is unavailable or returns nothing.
-                        match dictation::polish_text(&text) {
-                            Ok(polished) if !polished.trim().is_empty() => text = polished,
-                            Ok(_) => {}
-                            Err(error) => eprintln!(
-                                "dictation: polish failed ({}), inserting raw text",
-                                error.code
-                            ),
-                        }
-                    }
-                    dictation::inject_text(&text)?;
-                    Ok(text)
-                });
-                match outcome {
-                    Ok(text) if text.trim().is_empty() => {
-                        eprintln!("dictation: no speech detected, nothing inserted");
-                    }
-                    Ok(text) => {
-                        // Log only the length, not the dictated text itself.
-                        eprintln!("dictation: inserted {} characters", text.chars().count());
-                        play_cue(DICTATION_DONE_SOUND);
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "dictation hotkey stop failed: {} ({})",
-                            error.message, error.code
-                        );
-                    }
-                }
-            });
-        }
+        HotkeyAction::StartRecording => start_dictation_session(app),
+        HotkeyAction::StopRecording => stop_and_process_dictation(app),
     }
+}
+
+/// Toggles dictation from the pill's mic button: starts if idle, otherwise stops
+/// and processes. Keeps the hotkey press tracker in sync so a later hotkey press
+/// behaves correctly no matter which control started the dictation.
+#[tauri::command]
+fn toggle_dictation(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
+    let is_recording = {
+        let recorder = state.dictation.lock().map_err(map_lock_error)?;
+        recorder.is_recording()
+    };
+    if is_recording {
+        if let Ok(mut tracker) = state.dictation_hotkey.lock() {
+            tracker.mark_recording_stopped();
+        }
+        stop_and_process_dictation(&app);
+    } else {
+        let now_ms = current_time_ms()?;
+        if let Ok(mut tracker) = state.dictation_hotkey.lock() {
+            tracker.mark_recording_started(now_ms);
+        }
+        start_dictation_session(&app);
+    }
+    Ok(())
 }
 
 /// Injects dictated text into the focused app via clipboard paste. Runs off the
@@ -1047,8 +1185,12 @@ fn stop_recording(state: State<'_, AppState>) -> Result<RecordingMetadata, AppEr
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    // The NSPanel plugin is macOS-only; it backs the non-activating dictation pill.
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    builder
         .invoke_handler(tauri::generate_handler![
             get_app_status,
             list_meeting_history,
@@ -1062,6 +1204,7 @@ pub fn run() {
             summarize_meeting,
             start_dictation,
             stop_dictation,
+            toggle_dictation,
             inject_dictation_text,
             polish_dictation,
             update_dictation_settings,
@@ -1164,6 +1307,11 @@ pub fn run() {
                 if let Err(error) = create_dictation_pill(app.handle()) {
                     eprintln!("dictation_pill_create_failed: {error}");
                 }
+                // On macOS, convert it to a non-activating NSPanel so a click never
+                // activates Scribe (which would raise the main window over the pill
+                // and steal focus). focusable(false) alone does not prevent that.
+                #[cfg(target_os = "macos")]
+                make_pill_non_activating(app.handle());
             }
 
             #[cfg(desktop)]

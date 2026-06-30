@@ -28,5 +28,10 @@ tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-pn
 tauri-plugin-global-shortcut = "2"
 tempfile = "3.27.0"
 
+# macOS-only: the dictation pill is converted to a non-activating NSPanel so
+# clicking it never activates Scribe or steals focus from the user's app.
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2" }
+
 [profile.dev]
 debug = 1
