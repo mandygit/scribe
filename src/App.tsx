@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import './styles.css';
 import { DICTATION_HOTKEYS } from './contracts';
 import { messageFromUnknownError } from './error-utils';
 import { formatClock, formatDate, formatDuration, meetingTitle } from './format';

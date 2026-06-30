@@ -1,0 +1,111 @@
+/* Dictation pill window. The window itself is transparent; only the .dpill bar
+   paints, so it reads as a small free-floating capsule — like Wispr Flow. Classes
+   are namespaced (dpill*) so they never collide with the app's own .pill. */
+
+:root {
+  --dpill-bg: rgba(28, 27, 23, 0.78);
+  --dpill-text: #f4f3ee;
+  --dpill-muted: rgba(244, 243, 238, 0.62);
+  --dpill-idle: rgba(244, 243, 238, 0.5);
+  --dpill-listening: #e0533f;
+  --dpill-transcribing: #4a86e8;
+}
+
+/* Page-level rules are scoped to .pill-view (added to <html> only in pill mode).
+   This entry's CSS is bundled globally by Vite, so without the scope these would
+   leak into the main window and break its layout. */
+.pill-view,
+.pill-view body,
+.pill-view #root {
+  height: 100%;
+  margin: 0;
+  background: transparent;
+}
+
+.pill-view body {
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+.pill-view #root {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Auto-width capsule: stays only as wide as its content so the footprint is
+   minimal when idle and grows naturally for the listening/transcribing states. */
+.dpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 11px 0 6px;
+  border-radius: 15px;
+  background: var(--dpill-bg);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+  border: 0.5px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.32);
+  color: var(--dpill-text);
+}
+
+.dpill__mic {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+}
+
+.dpill__mic:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.dpill__mic-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dpill-idle);
+  transition: background 0.15s ease;
+}
+
+.dpill[data-state="listening"] .dpill__mic-dot {
+  background: var(--dpill-listening);
+  animation: dpill-pulse 1.2s ease-in-out infinite;
+}
+
+.dpill[data-state="transcribing"] .dpill__mic-dot {
+  background: var(--dpill-transcribing);
+}
+
+.dpill__label {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--dpill-muted);
+  white-space: nowrap;
+}
+
+.dpill[data-state="listening"] .dpill__label,
+.dpill[data-state="transcribing"] .dpill__label {
+  color: var(--dpill-text);
+}
+
+@keyframes dpill-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.7);
+  }
+}

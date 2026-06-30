@@ -608,6 +608,74 @@ fn set_recording_indicator(app: &AppHandle, recording: bool) {
     }
 }
 
+/// Label of the always-on dictation pill window (the small floating bar pinned to
+/// the bottom-center of the screen).
+#[cfg(desktop)]
+const DICTATION_PILL_WINDOW: &str = "pill";
+
+/// Logical size of the dictation pill and the gap kept above the Dock.
+#[cfg(desktop)]
+const PILL_WIDTH: f64 = 200.0;
+#[cfg(desktop)]
+const PILL_HEIGHT: f64 = 40.0;
+#[cfg(desktop)]
+const PILL_BOTTOM_MARGIN: f64 = 8.0;
+
+/// Creates the floating dictation pill: a small, transparent, always-on-top bar
+/// pinned to the bottom-center of the primary screen. It is built `focusable(false)`
+/// so clicking it never steals key focus from the user's real app — otherwise the
+/// Cmd+V paste at the end of dictation would land in the pill instead of their app.
+#[cfg(desktop)]
+fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let pill = WebviewWindowBuilder::new(
+        app,
+        DICTATION_PILL_WINDOW,
+        WebviewUrl::App("index.html?view=pill".into()),
+    )
+    .title("Scribe Dictation")
+    .inner_size(PILL_WIDTH, PILL_HEIGHT)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .shadow(false)
+    .resizable(false)
+    .focusable(false)
+    .focused(false)
+    .visible(true)
+    .build()?;
+
+    position_pill_bottom_center(&pill);
+    Ok(())
+}
+
+/// Pins the pill to the bottom-center of the primary monitor's work area —
+/// the visible region that already excludes the Dock and menu bar — lifted a
+/// little further by [`PILL_BOTTOM_MARGIN`] so it floats clear of the Dock
+/// rather than being clipped behind it. Positions in physical pixels so it
+/// lands correctly on Retina displays. Best-effort: leaves the pill at its
+/// default position if monitor info is unavailable.
+#[cfg(desktop)]
+fn position_pill_bottom_center(pill: &tauri::WebviewWindow) {
+    let Ok(Some(monitor)) = pill.primary_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let work_area = monitor.work_area();
+    let Ok(pill_size) = pill.outer_size() else {
+        return;
+    };
+    let margin = (PILL_BOTTOM_MARGIN * scale) as i32;
+    let x = work_area.position.x
+        + (work_area.size.width as i32 - pill_size.width as i32) / 2;
+    let y = work_area.position.y + work_area.size.height as i32
+        - pill_size.height as i32
+        - margin;
+    let _ = pill.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
 /// Maps a persisted dictation-hotkey token to a registrable global shortcut. The
 /// set is deliberately small and vetted to avoid the bare F-keys (media keys on
 /// Mac laptops) and F5 (Apple Dictation). Returns None for an unknown token.
@@ -1087,6 +1155,15 @@ pub fn run() {
                         }
                     })
                     .build(app)?;
+            }
+
+            #[cfg(desktop)]
+            {
+                // Floating dictation pill, pinned bottom-center. Built non-focusable
+                // so it can be clicked without stealing focus from the user's app.
+                if let Err(error) = create_dictation_pill(app.handle()) {
+                    eprintln!("dictation_pill_create_failed: {error}");
+                }
             }
 
             #[cfg(desktop)]
