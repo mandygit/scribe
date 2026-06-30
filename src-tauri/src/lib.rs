@@ -12,7 +12,7 @@ use audio::{
     AudioDevice, CpalCaptureBackend, RecordingManager, RecordingMetadata, RecordingStarted,
     ScreenCaptureKitSystemAudioBackend,
 };
-use dictation::DictationRecorder;
+use dictation::{DictationHotkey, DictationRecorder, HotkeyAction};
 use domain::{
     AnalyzerProvider, AppError, MeetingId, MeetingLifecycleState, ProcessingStage, ReportId,
     ResonanceSettings,
@@ -51,6 +51,7 @@ struct AppState {
     repository: Mutex<SqliteRepository>,
     recordings: Mutex<RecordingManager<CpalCaptureBackend, ScreenCaptureKitSystemAudioBackend>>,
     dictation: Mutex<DictationRecorder<CpalCaptureBackend>>,
+    dictation_hotkey: Mutex<DictationHotkey>,
     echo_cancellation: SpeexEchoCancellationBackend,
 }
 
@@ -525,19 +526,18 @@ async fn summarize_meeting(
     })
 }
 
-/// Starts a push-to-talk dictation capture. Returns immediately; the matching
-/// `stop_dictation` call transcribes the clip.
-#[tauri::command]
-fn start_dictation(state: State<'_, AppState>) -> Result<(), AppError> {
+/// Starts a push-to-talk dictation capture to a temporary WAV. Shared by the
+/// `start_dictation` command and the global hotkey.
+fn begin_dictation(state: &AppState) -> Result<(), AppError> {
     let wav_path = dictation::new_dictation_wav_path()?;
     let mut recorder = state.dictation.lock().map_err(map_lock_error)?;
     recorder.start(wav_path, None)
 }
 
-/// Stops the in-flight dictation capture, transcribes the clip off the main
-/// thread, deletes the temporary WAV, and returns the raw transcript.
-#[tauri::command]
-async fn stop_dictation(state: State<'_, AppState>) -> Result<String, AppError> {
+/// Stops the in-flight capture and resolves the transcriber settings, returning
+/// the clip path and settings so the (blocking) transcription can run without
+/// holding any locks.
+fn stop_dictation_capture(state: &AppState) -> Result<(PathBuf, ResonanceSettings), AppError> {
     let wav_path = {
         let mut recorder = state.dictation.lock().map_err(map_lock_error)?;
         recorder.finish()?
@@ -546,21 +546,135 @@ async fn stop_dictation(state: State<'_, AppState>) -> Result<String, AppError> 
         let repository = state.repository.lock().map_err(map_lock_error)?;
         load_effective_settings(&repository)?
     };
+    Ok((wav_path, settings))
+}
 
-    let transcribe_path = wav_path.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let transcriber = WhisperShellTranscriber::from_settings(&settings)?;
-        dictation::transcribe_clip(&transcriber, &transcribe_path)
-    })
-    .await
-    .map_err(|error| AppError {
-        code: "dictation_transcription_task_failed".to_string(),
-        message: "The dictation transcription task did not finish.".to_string(),
-        details: Some(error.to_string()),
-    })?;
-
-    let _ = fs::remove_file(&wav_path);
+/// Transcribes a dictation clip and deletes the temporary WAV afterwards. Blocks,
+/// so callers run it off the main thread.
+fn transcribe_dictation_wav(
+    wav_path: &Path,
+    settings: &ResonanceSettings,
+) -> Result<String, AppError> {
+    let result = WhisperShellTranscriber::from_settings(settings)
+        .and_then(|transcriber| dictation::transcribe_clip(&transcriber, wav_path));
+    let _ = fs::remove_file(wav_path);
     result
+}
+
+/// Starts a push-to-talk dictation capture. Returns immediately; the matching
+/// `stop_dictation` call transcribes the clip.
+#[tauri::command]
+fn start_dictation(state: State<'_, AppState>) -> Result<(), AppError> {
+    begin_dictation(&state)
+}
+
+/// Stops the in-flight dictation capture, transcribes the clip off the main
+/// thread, deletes the temporary WAV, and returns the raw transcript.
+#[tauri::command]
+async fn stop_dictation(state: State<'_, AppState>) -> Result<String, AppError> {
+    let (wav_path, settings) = stop_dictation_capture(&state)?;
+    tauri::async_runtime::spawn_blocking(move || transcribe_dictation_wav(&wav_path, &settings))
+        .await
+        .map_err(|error| AppError {
+            code: "dictation_transcription_task_failed".to_string(),
+            message: "The dictation transcription task did not finish.".to_string(),
+            details: Some(error.to_string()),
+        })?
+}
+
+/// Audible dictation feedback: a tick when listening starts and a chime when the
+/// text is inserted. Paired with the menu-bar indicator in case sound is off.
+const DICTATION_START_SOUND: &str = "/System/Library/Sounds/Tink.aiff";
+const DICTATION_DONE_SOUND: &str = "/System/Library/Sounds/Glass.aiff";
+
+/// Id of the menu-bar tray icon, used both to build it and to flip its title to a
+/// recording indicator during dictation.
+const TRAY_ICON_ID: &str = "resonance";
+
+/// Plays a short macOS system sound as fire-and-forget dictation feedback.
+fn play_cue(sound_file: &str) {
+    let _ = Command::new("afplay").arg(sound_file).spawn();
+}
+
+/// Shows or clears a "listening" indicator in the menu bar by setting the tray
+/// title, so the user can see when dictation is recording even with the main
+/// window hidden.
+fn set_recording_indicator(app: &AppHandle, recording: bool) {
+    if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
+        let title = if recording { Some("● Rec") } else { None };
+        let _ = tray.set_title(title);
+    }
+}
+
+/// Handles one dictation hotkey press: advances the Wispr-style press tracker and
+/// starts or stops dictation. Stop work (transcribe + inject) runs off the main
+/// thread so the hotkey callback never blocks.
+fn on_dictation_hotkey_press(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let now_ms = match current_time_ms() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("dictation hotkey: clock error: {}", error.message);
+            return;
+        }
+    };
+    let action = match state.dictation_hotkey.lock() {
+        Ok(mut tracker) => tracker.on_press(now_ms),
+        Err(_) => {
+            eprintln!("dictation hotkey: press tracker lock poisoned");
+            return;
+        }
+    };
+
+    match action {
+        HotkeyAction::None => {}
+        HotkeyAction::StartRecording => match begin_dictation(&state) {
+            Ok(()) => {
+                eprintln!("dictation: listening…");
+                set_recording_indicator(app, true);
+                play_cue(DICTATION_START_SOUND);
+            }
+            Err(error) => {
+                eprintln!(
+                    "dictation hotkey start failed: {} ({})",
+                    error.message, error.code
+                );
+                // Reset the tracker so the failed start doesn't leave it "recording".
+                if let Ok(mut tracker) = state.dictation_hotkey.lock() {
+                    *tracker = DictationHotkey::new();
+                }
+            }
+        },
+        HotkeyAction::StopRecording => {
+            eprintln!("dictation: transcribing…");
+            set_recording_indicator(app, false);
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = app.state::<AppState>();
+                let outcome = stop_dictation_capture(&state).and_then(|(wav_path, settings)| {
+                    let text = transcribe_dictation_wav(&wav_path, &settings)?;
+                    dictation::inject_text(&text)?;
+                    Ok(text)
+                });
+                match outcome {
+                    Ok(text) if text.trim().is_empty() => {
+                        eprintln!("dictation: no speech detected, nothing inserted");
+                    }
+                    Ok(text) => {
+                        // Log only the length, not the dictated text itself.
+                        eprintln!("dictation: inserted {} characters", text.chars().count());
+                        play_cue(DICTATION_DONE_SOUND);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "dictation hotkey stop failed: {} ({})",
+                            error.message, error.code
+                        );
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// Injects dictated text into the focused app via clipboard paste. Runs off the
@@ -838,6 +952,7 @@ pub fn run() {
                     ScreenCaptureKitSystemAudioBackend::new(),
                 )),
                 dictation: Mutex::new(DictationRecorder::new(CpalCaptureBackend::new())),
+                dictation_hotkey: Mutex::new(DictationHotkey::new()),
                 echo_cancellation: SpeexEchoCancellationBackend,
             });
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
@@ -854,7 +969,7 @@ pub fn run() {
                     tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))
                         .expect("embedded tray icon should be a valid PNG");
 
-                TrayIconBuilder::with_id("resonance")
+                TrayIconBuilder::with_id(TRAY_ICON_ID)
                     .icon(tray_icon)
                     .icon_as_template(true)
                     .menu(&menu)
@@ -884,6 +999,30 @@ pub fn run() {
                         }
                     })
                     .build(app)?;
+            }
+
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_global_shortcut::{
+                    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+                };
+
+                // Default dictation hotkey: double-press Cmd+Shift+D to start
+                // listening, single press to stop (Wispr-style). Avoids the F-keys
+                // (all media keys on Mac laptops) and Apple Dictation's F5.
+                // Configurable later from Settings.
+                let shortcut =
+                    Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyD);
+                if let Err(error) =
+                    app.global_shortcut()
+                        .on_shortcut(shortcut, |app, _shortcut, event| {
+                            if event.state == ShortcutState::Pressed {
+                                on_dictation_hotkey_press(app);
+                            }
+                        })
+                {
+                    eprintln!("could not register the dictation hotkey (Cmd+Shift+D): {error}");
+                }
             }
 
             Ok(())

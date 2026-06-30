@@ -80,15 +80,24 @@ pub fn transcribe_clip<T: Transcriber>(
 }
 
 /// Collapses whisper's per-segment output into a single dictation string,
-/// trimming each segment and dropping the blank ones whisper emits for silence.
+/// trimming each segment and dropping both blanks and whisper's non-speech
+/// annotations so silence never gets typed into the focused app.
 pub fn transcript_to_text(output: &TranscriptionOutput) -> String {
     output
         .segments
         .iter()
         .map(|segment| segment.text.trim())
-        .filter(|text| !text.is_empty())
+        .filter(|text| !text.is_empty() && !is_non_speech_marker(text))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// True when a segment is one of whisper's non-speech annotations rather than
+/// dictated words. Whisper wraps these wholly in brackets or parentheses, e.g.
+/// `[BLANK_AUDIO]`, `[ Silence ]`, `[Music]`, `(wind blowing)`.
+fn is_non_speech_marker(text: &str) -> bool {
+    (text.starts_with('[') && text.ends_with(']'))
+        || (text.starts_with('(') && text.ends_with(')'))
 }
 
 fn dictation_already_recording() -> AppError {
@@ -204,6 +213,27 @@ mod tests {
             ],
         };
         assert_eq!(transcript_to_text(&output), "Hello there general kinobi");
+    }
+
+    #[test]
+    fn transcript_text_drops_whisper_non_speech_markers() {
+        let output = TranscriptionOutput {
+            segments: vec![
+                segment("[BLANK_AUDIO]"),
+                segment("Send the deck"),
+                segment("[ Silence ]"),
+                segment("(wind blowing)"),
+            ],
+        };
+        assert_eq!(transcript_to_text(&output), "Send the deck");
+    }
+
+    #[test]
+    fn transcript_text_is_empty_for_pure_silence() {
+        let output = TranscriptionOutput {
+            segments: vec![segment("[BLANK_AUDIO]")],
+        };
+        assert_eq!(transcript_to_text(&output), "");
     }
 
     #[test]

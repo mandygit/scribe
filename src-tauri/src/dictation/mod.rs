@@ -9,9 +9,11 @@ use std::process::{Command, Stdio};
 use crate::domain::AppError;
 
 pub mod capture;
+pub mod hotkey;
 pub mod inject;
 
 pub use capture::{new_dictation_wav_path, transcribe_clip, DictationRecorder};
+pub use hotkey::{DictationHotkey, HotkeyAction};
 pub use inject::inject_text;
 
 fn polish_helper_unavailable() -> AppError {
