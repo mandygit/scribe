@@ -1,6 +1,11 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="#C96442"/>
-  <g fill="#ffffff">
+  <!-- macOS icon grid: the rounded-square body is inset to 824x824 within the
+       1024 canvas (~100px transparent margin all around) so it renders at the
+       same visual size as other Dock icons at every Dock-size setting. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#C96442"/>
+  <!-- Soundwave bars, scaled to 0.8 about the canvas center to sit inside the
+       inset body with matching proportions. -->
+  <g fill="#ffffff" transform="translate(512 512) scale(0.8) translate(-512 -512)">
     <rect x="272" y="422" width="64" height="180" rx="32"/>
     <rect x="376" y="332" width="64" height="360" rx="32"/>
     <rect x="480" y="252" width="64" height="520" rx="32"/>
