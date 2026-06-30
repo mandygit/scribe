@@ -27,7 +27,16 @@ export interface ResonanceSettings {
   transcriberModelPath: string | null;
   speakerEmbeddingModelPath: string | null;
   speakerSegmentationModelPath: string | null;
+  dictationHotkey: string;
+  dictationPolishEnabled: boolean;
 }
+
+/** Selectable dictation hotkeys, matching the Rust allowlist. */
+export const DICTATION_HOTKEYS = [
+  { value: 'cmd+shift+d', label: '⌘⇧D (double-press)' },
+  { value: 'ctrl+option+d', label: '⌃⌥D (double-press)' },
+  { value: 'cmd+shift+space', label: '⌘⇧Space (double-press)' },
+] as const;
 
 export interface RetentionCleanupSummary {
   deletedAudioFileCount: number;

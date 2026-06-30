@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { DICTATION_HOTKEYS } from './contracts';
 import { messageFromUnknownError } from './error-utils';
 import { formatClock, formatDate, formatDuration, meetingTitle } from './format';
 import {
@@ -18,6 +19,7 @@ import {
   summarizeMeeting,
   transcribeMeeting,
   updateAudioProcessingSettings,
+  updateDictationSettings,
   updatePrivacySettings,
   updateTranscriberSettings,
 } from './tauri-commands';
@@ -35,6 +37,8 @@ const FALLBACK_SETTINGS: ResonanceSettings = {
   transcriberModelPath: null,
   speakerEmbeddingModelPath: null,
   speakerSegmentationModelPath: null,
+  dictationHotkey: 'cmd+shift+d',
+  dictationPolishEnabled: false,
 };
 
 type View = 'meetings' | 'settings';
@@ -516,6 +520,22 @@ function SettingsView({
     [onError, onSettings, settings.enableEchoCancellation, settings.enableSystemAudio],
   );
 
+  const saveDictation = useCallback(
+    async (next: Partial<Pick<ResonanceSettings, 'dictationHotkey' | 'dictationPolishEnabled'>>) => {
+      onError(null);
+      try {
+        const updated = await updateDictationSettings(
+          next.dictationHotkey ?? settings.dictationHotkey,
+          next.dictationPolishEnabled ?? settings.dictationPolishEnabled,
+        );
+        onSettings(updated);
+      } catch (cause) {
+        onError(messageFromUnknownError(cause, 'Could not update dictation settings.'));
+      }
+    },
+    [onError, onSettings, settings.dictationHotkey, settings.dictationPolishEnabled],
+  );
+
   const saveRetention = useCallback(
     async (days: number) => {
       onError(null);
@@ -598,6 +618,39 @@ function SettingsView({
           <Toggle
             on={settings.enableEchoCancellation}
             onClick={() => void saveAudio({ enableEchoCancellation: !settings.enableEchoCancellation })}
+          />
+        </div>
+      </section>
+
+      <section className="settings-group">
+        <h2>Dictation</h2>
+        <p className="hint">Double-press the hotkey to start dictating, press it once to stop and insert.</p>
+        <div className="field">
+          <div>
+            <div className="field-label">Hotkey</div>
+            <p className="field-desc">
+              Inserts dictation into whatever app is focused. Needs Accessibility permission.
+            </p>
+          </div>
+          <select
+            value={settings.dictationHotkey}
+            onChange={(event) => void saveDictation({ dictationHotkey: event.target.value })}
+          >
+            {DICTATION_HOTKEYS.map((hotkey) => (
+              <option key={hotkey.value} value={hotkey.value}>
+                {hotkey.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <div>
+            <div className="field-label">Polish with Apple Intelligence</div>
+            <p className="field-desc">Clean up grammar and filler before inserting. Off inserts the raw transcript.</p>
+          </div>
+          <Toggle
+            on={settings.dictationPolishEnabled}
+            onClick={() => void saveDictation({ dictationPolishEnabled: !settings.dictationPolishEnabled })}
           />
         </div>
       </section>

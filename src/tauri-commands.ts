@@ -140,6 +140,12 @@ export const updateTranscriberSettings = async (
     speakerSegmentationModelPath,
   });
 
+export const updateDictationSettings = async (
+  dictationHotkey: string,
+  dictationPolishEnabled: boolean,
+): Promise<ResonanceSettings> =>
+  invokeNative<ResonanceSettings>('update_dictation_settings', { dictationHotkey, dictationPolishEnabled });
+
 export const sendCompletionNotification = async (title: string, body: string): Promise<void> =>
   invokeNative<void>('send_completion_notification', { title, body });
 

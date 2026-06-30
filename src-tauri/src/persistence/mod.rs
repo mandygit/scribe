@@ -9,7 +9,7 @@ use crate::domain::{
     SummaryId,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const CURRENT_SCHEMA_VERSION: i64 = 13;
 const SETTINGS_ID: &str = "default";
 const VOICE_PROFILE_ID: &str = "default";
 
@@ -1570,7 +1570,9 @@ impl SqliteRepository {
                     transcriber_bin_path,
                     transcriber_model_path,
                     speaker_embedding_model_path,
-                    speaker_segmentation_model_path
+                    speaker_segmentation_model_path,
+                    dictation_hotkey,
+                    dictation_polish_enabled
                 FROM settings
                 WHERE id = ?1",
                 params![SETTINGS_ID],
@@ -1603,8 +1605,10 @@ impl SqliteRepository {
                     transcriber_model_path,
                     speaker_embedding_model_path,
                     speaker_segmentation_model_path,
+                    dictation_hotkey,
+                    dictation_polish_enabled,
                     updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                 ON CONFLICT(id) DO UPDATE SET
                     microphone_device_id = excluded.microphone_device_id,
                     enable_system_audio = excluded.enable_system_audio,
@@ -1618,6 +1622,8 @@ impl SqliteRepository {
                     transcriber_model_path = excluded.transcriber_model_path,
                     speaker_embedding_model_path = excluded.speaker_embedding_model_path,
                     speaker_segmentation_model_path = excluded.speaker_segmentation_model_path,
+                    dictation_hotkey = excluded.dictation_hotkey,
+                    dictation_polish_enabled = excluded.dictation_polish_enabled,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     SETTINGS_ID,
@@ -1633,6 +1639,8 @@ impl SqliteRepository {
                     settings.transcriber_model_path.as_deref(),
                     settings.speaker_embedding_model_path.as_deref(),
                     settings.speaker_segmentation_model_path.as_deref(),
+                    settings.dictation_hotkey.as_str(),
+                    bool_to_db(settings.dictation_polish_enabled),
                     to_db_i64(updated_at_ms)?,
                 ],
             )
@@ -1771,6 +1779,8 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 transcriber_model_path TEXT,
                 speaker_embedding_model_path TEXT,
                 speaker_segmentation_model_path TEXT,
+                dictation_hotkey TEXT NOT NULL DEFAULT 'cmd+shift+d',
+                dictation_polish_enabled INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1)),
                 updated_at_ms INTEGER NOT NULL
             );
 
@@ -1900,6 +1910,16 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         "speaking_improvements_source",
         "TEXT NOT NULL DEFAULT 'none'",
     )?;
+    ensure_settings_column(
+        connection,
+        "dictation_hotkey",
+        "TEXT NOT NULL DEFAULT 'cmd+shift+d'",
+    )?;
+    ensure_settings_column(
+        connection,
+        "dictation_polish_enabled",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))",
+    )?;
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (2)",
@@ -1963,6 +1983,12 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (12)",
+            [],
+        )
+        .map_err(map_db_error)?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO schema_versions(version) VALUES (13)",
             [],
         )
         .map_err(map_db_error)?;
@@ -2047,9 +2073,11 @@ fn validate_migration_column_type(column_type: &str) -> Result<(), AppError> {
         "TEXT"
         | "INTEGER"
         | "TEXT NOT NULL DEFAULT 'none'"
+        | "TEXT NOT NULL DEFAULT 'cmd+shift+d'"
         | "INTEGER NOT NULL DEFAULT 1 CHECK (enable_system_audio IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 1 CHECK (enable_echo_cancellation IN (0, 1))"
-        | "INTEGER NOT NULL DEFAULT 0 CHECK (cloud_video_review_enabled IN (0, 1))" => Ok(()),
+        | "INTEGER NOT NULL DEFAULT 0 CHECK (cloud_video_review_enabled IN (0, 1))"
+        | "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))" => Ok(()),
         _ => Err(invalid_migration_sql("column_type")),
     }
 }
@@ -2350,6 +2378,8 @@ fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResonanceSettings>
         transcriber_model_path: row.get(9)?,
         speaker_embedding_model_path: row.get(10)?,
         speaker_segmentation_model_path: row.get(11)?,
+        dictation_hotkey: row.get(12)?,
+        dictation_polish_enabled: db_to_bool(row.get(13)?, 13)?,
     })
 }
 
@@ -3239,6 +3269,8 @@ mod tests {
             transcriber_model_path: Some("/models/base.bin".to_string()),
             speaker_embedding_model_path: Some("/models/speaker.onnx".to_string()),
             speaker_segmentation_model_path: Some("/models/segmentation.onnx".to_string()),
+            dictation_hotkey: "ctrl+option+d".to_string(),
+            dictation_polish_enabled: true,
         };
         let updated_settings = ResonanceSettings {
             microphone_device_id: Some("microphone-2".to_string()),
@@ -3253,6 +3285,8 @@ mod tests {
             transcriber_model_path: Some("/models/small-q5_1.bin".to_string()),
             speaker_embedding_model_path: Some("/models/speaker-v2.onnx".to_string()),
             speaker_segmentation_model_path: Some("/models/segmentation-v2.onnx".to_string()),
+            dictation_hotkey: "cmd+shift+space".to_string(),
+            dictation_polish_enabled: false,
         };
 
         test_repository

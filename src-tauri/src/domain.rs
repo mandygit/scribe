@@ -171,7 +171,15 @@ pub struct ResonanceSettings {
     pub transcriber_model_path: Option<String>,
     pub speaker_embedding_model_path: Option<String>,
     pub speaker_segmentation_model_path: Option<String>,
+    /// Canonical token for the system-wide dictation hotkey (e.g. `cmd+shift+d`).
+    pub dictation_hotkey: String,
+    /// When true, dictation runs Apple Intelligence polish before inserting;
+    /// otherwise the raw transcript is inserted.
+    pub dictation_polish_enabled: bool,
 }
+
+/// Default token for the dictation hotkey: double-press Cmd+Shift+D.
+pub const DEFAULT_DICTATION_HOTKEY: &str = "cmd+shift+d";
 
 impl Default for ResonanceSettings {
     fn default() -> Self {
@@ -188,6 +196,8 @@ impl Default for ResonanceSettings {
             transcriber_model_path: None,
             speaker_embedding_model_path: None,
             speaker_segmentation_model_path: None,
+            dictation_hotkey: DEFAULT_DICTATION_HOTKEY.to_string(),
+            dictation_polish_enabled: false,
         }
     }
 }

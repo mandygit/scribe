@@ -601,9 +601,51 @@ fn play_cue(sound_file: &str) {
 /// window hidden.
 fn set_recording_indicator(app: &AppHandle, recording: bool) {
     if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
-        let title = if recording { Some("● Rec") } else { None };
-        let _ = tray.set_title(title);
+        // Clear with an empty string rather than None: on macOS set_title(None)
+        // can leave the previous title in place, so the indicator would hang.
+        let title = if recording { "● Rec" } else { "" };
+        let _ = tray.set_title(Some(title));
     }
+}
+
+/// Maps a persisted dictation-hotkey token to a registrable global shortcut. The
+/// set is deliberately small and vetted to avoid the bare F-keys (media keys on
+/// Mac laptops) and F5 (Apple Dictation). Returns None for an unknown token.
+#[cfg(desktop)]
+fn dictation_shortcut_for(token: &str) -> Option<tauri_plugin_global_shortcut::Shortcut> {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    let (modifiers, code) = match token {
+        "cmd+shift+d" => (Modifiers::SUPER | Modifiers::SHIFT, Code::KeyD),
+        "ctrl+option+d" => (Modifiers::CONTROL | Modifiers::ALT, Code::KeyD),
+        "cmd+shift+space" => (Modifiers::SUPER | Modifiers::SHIFT, Code::Space),
+        _ => return None,
+    };
+    Some(Shortcut::new(Some(modifiers), code))
+}
+
+/// Registers (or re-registers) the dictation hotkey, replacing any previously
+/// registered one so a settings change takes effect immediately.
+#[cfg(desktop)]
+fn register_dictation_hotkey(app: &AppHandle, token: &str) -> Result<(), AppError> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+    let shortcut = dictation_shortcut_for(token).ok_or_else(|| AppError {
+        code: "dictation_hotkey_unsupported".to_string(),
+        message: format!("Unsupported dictation hotkey: {token}"),
+        details: None,
+    })?;
+    let global_shortcut = app.global_shortcut();
+    let _ = global_shortcut.unregister_all();
+    global_shortcut
+        .on_shortcut(shortcut, |app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                on_dictation_hotkey_press(app);
+            }
+        })
+        .map_err(|error| AppError {
+            code: "dictation_hotkey_register_failed".to_string(),
+            message: "Could not register the dictation hotkey.".to_string(),
+            details: Some(error.to_string()),
+        })
 }
 
 /// Handles one dictation hotkey press: advances the Wispr-style press tracker and
@@ -652,7 +694,19 @@ fn on_dictation_hotkey_press(app: &AppHandle) {
             tauri::async_runtime::spawn_blocking(move || {
                 let state = app.state::<AppState>();
                 let outcome = stop_dictation_capture(&state).and_then(|(wav_path, settings)| {
-                    let text = transcribe_dictation_wav(&wav_path, &settings)?;
+                    let mut text = transcribe_dictation_wav(&wav_path, &settings)?;
+                    if settings.dictation_polish_enabled && !text.trim().is_empty() {
+                        // Polish with Apple Intelligence, but fall back to the raw
+                        // transcript if it is unavailable or returns nothing.
+                        match dictation::polish_text(&text) {
+                            Ok(polished) if !polished.trim().is_empty() => text = polished,
+                            Ok(_) => {}
+                            Err(error) => eprintln!(
+                                "dictation: polish failed ({}), inserting raw text",
+                                error.code
+                            ),
+                        }
+                    }
                     dictation::inject_text(&text)?;
                     Ok(text)
                 });
@@ -699,6 +753,39 @@ async fn polish_dictation(text: String) -> Result<String, AppError> {
             message: "The dictation polish task did not finish.".to_string(),
             details: Some(error.to_string()),
         })?
+}
+
+/// Persists the dictation hotkey + polish preference and re-registers the hotkey
+/// so the change takes effect immediately.
+#[tauri::command]
+fn update_dictation_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dictation_hotkey: String,
+    dictation_polish_enabled: bool,
+) -> Result<ResonanceSettings, AppError> {
+    #[cfg(desktop)]
+    if dictation_shortcut_for(&dictation_hotkey).is_none() {
+        return Err(AppError {
+            code: "dictation_hotkey_unsupported".to_string(),
+            message: format!("Unsupported dictation hotkey: {dictation_hotkey}"),
+            details: None,
+        });
+    }
+
+    let updated = {
+        let repository = state.repository.lock().map_err(map_lock_error)?;
+        let mut settings = repository.get_settings()?;
+        settings.dictation_hotkey = dictation_hotkey;
+        settings.dictation_polish_enabled = dictation_polish_enabled;
+        repository.upsert_settings(&settings, current_time_ms()?)?;
+        hydrate_settings_with_local_defaults(settings)
+    };
+
+    #[cfg(desktop)]
+    register_dictation_hotkey(&app, &updated.dictation_hotkey)?;
+
+    Ok(updated)
 }
 
 /// Runs the LM Studio summary lifecycle: start the server, load the model,
@@ -909,6 +996,7 @@ pub fn run() {
             stop_dictation,
             inject_dictation_text,
             polish_dictation,
+            update_dictation_settings,
             update_transcriber_settings,
             update_audio_processing_settings,
             update_privacy_settings,
@@ -1003,25 +1091,12 @@ pub fn run() {
 
             #[cfg(desktop)]
             {
-                use tauri_plugin_global_shortcut::{
-                    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
-                };
-
-                // Default dictation hotkey: double-press Cmd+Shift+D to start
-                // listening, single press to stop (Wispr-style). Avoids the F-keys
-                // (all media keys on Mac laptops) and Apple Dictation's F5.
-                // Configurable later from Settings.
-                let shortcut =
-                    Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyD);
+                // Register the saved dictation hotkey (double-press to start, single
+                // press to stop). Configurable from Settings.
                 if let Err(error) =
-                    app.global_shortcut()
-                        .on_shortcut(shortcut, |app, _shortcut, event| {
-                            if event.state == ShortcutState::Pressed {
-                                on_dictation_hotkey_press(app);
-                            }
-                        })
+                    register_dictation_hotkey(app.handle(), &hydrated_settings.dictation_hotkey)
                 {
-                    eprintln!("could not register the dictation hotkey (Cmd+Shift+D): {error}");
+                    eprintln!("{}: {}", error.code, error.message);
                 }
             }
 
@@ -2135,6 +2210,18 @@ mod tests {
             apple_script_string_literal("Score \"81\"\\100\nready"),
             "\"Score \\\"81\\\"\\\\100 ready\""
         );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn dictation_shortcut_mapping_accepts_known_tokens_only() {
+        assert!(super::dictation_shortcut_for("cmd+shift+d").is_some());
+        assert!(super::dictation_shortcut_for("ctrl+option+d").is_some());
+        assert!(super::dictation_shortcut_for("cmd+shift+space").is_some());
+        // Unknown / unsafe tokens are rejected so the update command can validate.
+        assert!(super::dictation_shortcut_for("cmd+space").is_none());
+        assert!(super::dictation_shortcut_for("f5").is_none());
+        assert!(super::dictation_shortcut_for("").is_none());
     }
 
     #[test]
