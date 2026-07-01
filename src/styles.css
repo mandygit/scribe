@@ -74,7 +74,18 @@ button {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  overflow-y: auto;
+  /* The sidebar itself never scrolls; only the recent list does, so the Settings
+     button below stays pinned and visible no matter how long the list grows. */
+  overflow: hidden;
+}
+
+/* Recent section grows to fill the space between the record button and the
+   pinned footer; its meeting list scrolls internally. */
+.sidebar-recent {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .brand {
@@ -145,6 +156,13 @@ button {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  /* Scrolls within the sidebar so the footer stays put; the negative margin +
+     padding keep the scrollbar off the items without clipping their hover state. */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0 -4px;
+  padding: 0 4px;
 }
 .meeting-item {
   text-align: left;

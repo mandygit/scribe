@@ -184,7 +184,7 @@ export default function App() {
           )}
         </button>
 
-        <div>
+        <div className="sidebar-recent">
           <p className="nav-label">Recent</p>
           <div className="meeting-list">
             {history.length === 0 && (
