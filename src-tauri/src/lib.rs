@@ -858,13 +858,15 @@ fn stop_and_process_dictation(app: &AppHandle) {
             #[cfg(target_os = "macos")]
             if restore_pill {
                 set_pill_visible(&app, false);
-                std::thread::sleep(std::time::Duration::from_millis(150));
+                // Brief: just long enough for key focus to return to the user's
+                // window before the synthesised paste fires.
+                std::thread::sleep(std::time::Duration::from_millis(70));
             }
             let inject_result = dictation::inject_text(&text);
             #[cfg(target_os = "macos")]
             if restore_pill {
-                // Let the paste land before the pill floats back over the app.
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                // inject_text already waited for the paste keystroke, so the pill
+                // can float back immediately.
                 set_pill_visible(&app, true);
             }
             inject_result?;
