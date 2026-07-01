@@ -34,6 +34,33 @@
   --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
 }
 
+:root[data-theme="dark"] {
+  /* Charcoal surfaces — dark theme */
+  --surface-0: #1e1d1b;
+  --surface-1: #262523;
+  --surface-2: #2e2c29;
+
+  --text-primary: #f0efe9;
+  --text-secondary: #b8b5ac;
+  --text-muted: #837f74;
+
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.15);
+
+  --accent: #5b8ff0;
+  --bg-accent: rgba(91, 143, 240, 0.16);
+  --text-accent: #8fb2f5;
+
+  --brand: #e08161;
+  --bg-brand: rgba(224, 129, 97, 0.16);
+  --text-brand: #e8a488;
+
+  --danger: #e0685e;
+  --bg-danger: rgba(224, 104, 94, 0.16);
+  --text-danger: #ec8e86;
+  --success: #3fb083;
+}
+
 * {
   box-sizing: border-box;
 }

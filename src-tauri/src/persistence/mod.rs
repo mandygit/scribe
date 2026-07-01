@@ -6,10 +6,10 @@ use serde::Serialize;
 use crate::domain::{
     AnalyzerProvider, AppError, DictationSessionId, MeetingId, MetricId, PracticeAnnotationId,
     PracticeRecordingId, PracticeReviewReportId, ProcessingStage, ReportId, ResonanceSettings,
-    Score, SegmentId, SummarizerProvider, SummaryId,
+    Score, SegmentId, SummarizerProvider, SummaryId, ThemePreference,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 const SETTINGS_ID: &str = "default";
 const VOICE_PROFILE_ID: &str = "default";
 
@@ -1767,7 +1767,8 @@ impl SqliteRepository {
                     summarizer_provider,
                     summarizer_host,
                     summarizer_port,
-                    summarizer_model
+                    summarizer_model,
+                    theme_preference
                 FROM settings
                 WHERE id = ?1",
                 params![SETTINGS_ID],
@@ -1806,8 +1807,9 @@ impl SqliteRepository {
                     summarizer_host,
                     summarizer_port,
                     summarizer_model,
+                    theme_preference,
                     updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                 ON CONFLICT(id) DO UPDATE SET
                     microphone_device_id = excluded.microphone_device_id,
                     enable_system_audio = excluded.enable_system_audio,
@@ -1827,6 +1829,7 @@ impl SqliteRepository {
                     summarizer_host = excluded.summarizer_host,
                     summarizer_port = excluded.summarizer_port,
                     summarizer_model = excluded.summarizer_model,
+                    theme_preference = excluded.theme_preference,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     SETTINGS_ID,
@@ -1848,6 +1851,7 @@ impl SqliteRepository {
                     settings.summarizer_host.as_str(),
                     i64::from(settings.summarizer_port),
                     settings.summarizer_model.as_deref(),
+                    theme_preference_to_db(settings.theme_preference),
                     to_db_i64(updated_at_ms)?,
                 ],
             )
@@ -2160,6 +2164,11 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         "INTEGER NOT NULL DEFAULT 1234",
     )?;
     ensure_settings_column(connection, "summarizer_model", "TEXT")?;
+    ensure_settings_column(
+        connection,
+        "theme_preference",
+        "TEXT NOT NULL DEFAULT 'system'",
+    )?;
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (2)",
@@ -2241,6 +2250,12 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (15)",
+            [],
+        )
+        .map_err(map_db_error)?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO schema_versions(version) VALUES (16)",
             [],
         )
         .map_err(map_db_error)?;
@@ -2332,6 +2347,7 @@ fn validate_migration_column_type(column_type: &str) -> Result<(), AppError> {
         | "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))"
         | "TEXT NOT NULL DEFAULT 'lm_studio'"
         | "TEXT NOT NULL DEFAULT '127.0.0.1'"
+        | "TEXT NOT NULL DEFAULT 'system'"
         | "INTEGER NOT NULL DEFAULT 1234" => Ok(()),
         _ => Err(invalid_migration_sql("column_type")),
     }
@@ -2651,6 +2667,7 @@ fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResonanceSettings>
         summarizer_host: row.get(15)?,
         summarizer_port: from_db_u16(row.get(16)?, 16)?,
         summarizer_model: row.get(17)?,
+        theme_preference: theme_preference_from_db(row.get::<_, String>(18)?, 18)?,
     })
 }
 
@@ -2789,6 +2806,27 @@ fn summarizer_provider_to_db(provider: SummarizerProvider) -> &'static str {
         SummarizerProvider::LmStudio => "lm_studio",
         SummarizerProvider::Ollama => "ollama",
         SummarizerProvider::Custom => "custom",
+    }
+}
+
+fn theme_preference_to_db(preference: ThemePreference) -> &'static str {
+    match preference {
+        ThemePreference::System => "system",
+        ThemePreference::Light => "light",
+        ThemePreference::Dark => "dark",
+    }
+}
+
+fn theme_preference_from_db(value: String, column: usize) -> rusqlite::Result<ThemePreference> {
+    match value.as_str() {
+        "system" => Ok(ThemePreference::System),
+        "light" => Ok(ThemePreference::Light),
+        "dark" => Ok(ThemePreference::Dark),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            format!("unknown theme preference: {value}").into(),
+        )),
     }
 }
 
@@ -3638,6 +3676,7 @@ mod tests {
             summarizer_host: "127.0.0.1".to_string(),
             summarizer_port: 11434,
             summarizer_model: Some("llama3.2".to_string()),
+            theme_preference: ThemePreference::Dark,
         };
         let updated_settings = ResonanceSettings {
             microphone_device_id: Some("microphone-2".to_string()),
@@ -3658,6 +3697,7 @@ mod tests {
             summarizer_host: "192.168.1.50".to_string(),
             summarizer_port: 8080,
             summarizer_model: Some("custom-model".to_string()),
+            theme_preference: ThemePreference::Light,
         };
 
         test_repository

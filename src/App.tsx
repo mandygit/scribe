@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './styles.css';
-import { DICTATION_HOTKEYS, PERMISSION_ROWS, SUMMARIZER_PROVIDERS } from './contracts';
+import { DICTATION_HOTKEYS, PERMISSION_ROWS, SUMMARIZER_PROVIDERS, THEME_PREFERENCES } from './contracts';
 import { messageFromUnknownError } from './error-utils';
 import { formatClock, formatDate, formatDuration, meetingTitle } from './format';
 import { copySummaryToClipboard } from './summary-clipboard';
@@ -38,6 +38,7 @@ import {
   updatePrivacySettings,
   updateMeetingTitle,
   updateSummarizerSettings,
+  updateThemePreference,
   updateTranscriberSettings,
 } from './tauri-commands';
 
@@ -62,6 +63,7 @@ const FALLBACK_SETTINGS: ResonanceSettings = {
   summarizerHost: '127.0.0.1',
   summarizerPort: 1234,
   summarizerModel: null,
+  themePreference: 'system',
 };
 
 type View = 'meetings' | 'trends' | 'dictation' | 'settings';
@@ -162,6 +164,21 @@ export default function App() {
       await refreshHistory();
     })();
   }, [tauri, refreshHistory]);
+
+  useEffect(() => {
+    const applyResolvedTheme = (query: MediaQueryList | MediaQueryListEvent) => {
+      const resolved =
+        settings.themePreference === 'system'
+          ? (query.matches ? 'dark' : 'light')
+          : settings.themePreference;
+      document.documentElement.dataset.theme = resolved;
+    };
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    applyResolvedTheme(media);
+    if (settings.themePreference !== 'system') return;
+    media.addEventListener('change', applyResolvedTheme);
+    return () => media.removeEventListener('change', applyResolvedTheme);
+  }, [settings.themePreference]);
 
   useEffect(() => {
     if (view === 'dictation') {
@@ -1231,6 +1248,18 @@ function SettingsView({
     }
   }, [settings.summarizerPort, settings.summarizerProvider, summarizerHostInput, summarizerPortInput]);
 
+  const saveTheme = useCallback(
+    async (themePreference: ResonanceSettings['themePreference']) => {
+      onError(null);
+      try {
+        onSettings(await updateThemePreference(themePreference));
+      } catch (cause) {
+        onError(messageFromUnknownError(cause, 'Could not update appearance.'));
+      }
+    },
+    [onError, onSettings],
+  );
+
   const saveRetention = useCallback(
     async (days: number) => {
       onError(null);
@@ -1274,6 +1303,29 @@ function SettingsView({
           <p className="meeting-sub">Everything stays on this Mac.</p>
         </div>
       </div>
+
+      <section className="settings-group">
+        <h2>Appearance</h2>
+        <p className="hint">Choose how Scribe looks, or follow your Mac's system setting.</p>
+        <div className="field">
+          <div>
+            <div className="field-label">Theme</div>
+            <p className="field-desc">System matches your Mac's light/dark setting automatically.</p>
+          </div>
+          <select
+            value={settings.themePreference}
+            onChange={(event) =>
+              void saveTheme(event.target.value as ResonanceSettings['themePreference'])
+            }
+          >
+            {THEME_PREFERENCES.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      </section>
 
       <section className="settings-group">
         <h2>Audio capture</h2>

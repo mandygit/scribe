@@ -52,6 +52,7 @@ export type {
   RecordingStarted,
   ResonanceSettings,
   SummarizerProvider,
+  ThemePreference,
   TranscriptionResult,
   TranscriptSegment,
   TranscriptStreamEvent,
@@ -142,6 +143,11 @@ export const updateAudioProcessingSettings = async (
   enableEchoCancellation: boolean,
 ): Promise<ResonanceSettings> =>
   invokeNative<ResonanceSettings>('update_audio_processing_settings', { enableSystemAudio, enableEchoCancellation });
+
+export const updateThemePreference = async (
+  themePreference: ResonanceSettings['themePreference'],
+): Promise<ResonanceSettings> =>
+  invokeNative<ResonanceSettings>('update_theme_preference', { themePreference });
 
 export const updatePrivacySettings = async (
   rawAudioRetentionDays: number,

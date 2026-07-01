@@ -17,6 +17,8 @@ export type AnalyzerProvider = 'localOllama' | 'cloudOpenAi' | 'cloudClaude';
 
 export type SummarizerProvider = 'lmStudio' | 'ollama' | 'custom';
 
+export type ThemePreference = 'system' | 'light' | 'dark';
+
 export interface ResonanceSettings {
   microphoneDeviceId: string | null;
   enableSystemAudio: boolean;
@@ -36,7 +38,15 @@ export interface ResonanceSettings {
   summarizerHost: string;
   summarizerPort: number;
   summarizerModel: string | null;
+  themePreference: ThemePreference;
 }
+
+/** Selectable appearance preferences shown in Settings. */
+export const THEME_PREFERENCES = [
+  { value: 'system', label: 'System' },
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+] as const satisfies ReadonlyArray<{ value: ThemePreference; label: string }>;
 
 /** Provider presets: default host/port to prefill when a dev switches providers. */
 export const SUMMARIZER_PROVIDERS = [

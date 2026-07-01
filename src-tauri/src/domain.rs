@@ -173,6 +173,16 @@ pub enum SummarizerProvider {
     Custom,
 }
 
+/// The user's UI appearance preference. `System` follows the OS light/dark
+/// setting; `Light`/`Dark` pin the app regardless of the OS setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResonanceSettings {
@@ -200,6 +210,8 @@ pub struct ResonanceSettings {
     /// Model name/id to request. When unset, falls back to
     /// [`crate::summarizer::DEFAULT_SUMMARIZER_MODEL`] for the LM Studio provider.
     pub summarizer_model: Option<String>,
+    /// UI appearance preference; defaults to following the OS setting.
+    pub theme_preference: ThemePreference,
 }
 
 /// Default token for the dictation hotkey: double-press Cmd+Shift+D.
@@ -230,6 +242,7 @@ impl Default for ResonanceSettings {
             summarizer_host: DEFAULT_SUMMARIZER_HOST.to_string(),
             summarizer_port: DEFAULT_SUMMARIZER_PORT,
             summarizer_model: None,
+            theme_preference: ThemePreference::System,
         }
     }
 }

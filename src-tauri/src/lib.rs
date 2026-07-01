@@ -15,7 +15,7 @@ use audio::{
 use dictation::{DictationHotkey, DictationRecorder, HotkeyAction};
 use domain::{
     AnalyzerProvider, AppError, DictationSessionId, MeetingId, MeetingLifecycleState,
-    ProcessingStage, ReportId, ResonanceSettings, SummarizerProvider,
+    ProcessingStage, ReportId, ResonanceSettings, SummarizerProvider, ThemePreference,
 };
 use nudges::{
     LiveNudgeEvent, LiveNudgePipeline, NudgeEventSink, NudgeTranscriptEventSink, LIVE_NUDGE_EVENT,
@@ -1355,6 +1355,18 @@ fn update_audio_processing_settings(
 }
 
 #[tauri::command]
+fn update_theme_preference(
+    state: State<'_, AppState>,
+    theme_preference: ThemePreference,
+) -> Result<ResonanceSettings, AppError> {
+    let repository = state.repository.lock().map_err(map_lock_error)?;
+    let mut settings = repository.get_settings()?;
+    settings.theme_preference = theme_preference;
+    repository.upsert_settings(&settings, current_time_ms()?)?;
+    Ok(hydrate_settings_with_local_defaults(settings))
+}
+
+#[tauri::command]
 fn update_privacy_settings(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1531,6 +1543,7 @@ pub fn run() {
             open_permission_settings,
             update_transcriber_settings,
             update_audio_processing_settings,
+            update_theme_preference,
             update_privacy_settings,
             send_completion_notification
         ])
