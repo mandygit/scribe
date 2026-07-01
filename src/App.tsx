@@ -27,6 +27,7 @@ import {
   openPermissionSettings,
   type PermissionsSnapshot,
   type ResonanceSettings,
+  sendCompletionNotification,
   startRecording,
   stopRecording,
   summarizeMeeting,
@@ -64,7 +65,7 @@ const FALLBACK_SETTINGS: ResonanceSettings = {
 type View = 'meetings' | 'trends' | 'dictation' | 'settings';
 const DICTATION_HISTORY_LIMIT = 50;
 const TRENDS_LIMIT = 20;
-type RecordPhase = 'idle' | 'recording' | 'stopping' | 'transcribing';
+type RecordPhase = 'idle' | 'recording' | 'stopping';
 
 export default function App() {
   const tauri = useMemo(() => isTauriRuntime(), []);
@@ -84,7 +85,9 @@ export default function App() {
   const [permissions, setPermissions] = useState<PermissionsSnapshot | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: () => void } | null>(null);
+  const [transcribingMeetingId, setTranscribingMeetingId] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
+  const detailMeetingIdRef = useRef<string | null>(null);
 
   const refreshPermissions = useCallback(async () => {
     if (!tauri) return;
@@ -176,6 +179,10 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    detailMeetingIdRef.current = detail?.meeting.meetingId ?? null;
+  }, [detail]);
+
   const requestConfirm = useCallback((message: string, onConfirm: () => void) => {
     setConfirmDialog({ message, onConfirm });
   }, []);
@@ -257,21 +264,47 @@ export default function App() {
     }
   }, [settings.microphoneDeviceId, startTimer]);
 
+  // Transcribing a long meeting can take much longer than the meeting
+  // itself (a slow local whisper-cli run), so it happens in the background
+  // instead of blocking the record button / "stop" flow on it.
+  const transcribeInBackground = useCallback(
+    async (meetingId: string) => {
+      setTranscribingMeetingId(meetingId);
+      try {
+        await transcribeMeeting(meetingId);
+        await refreshHistory();
+        if (detailMeetingIdRef.current === meetingId) {
+          await openMeeting(meetingId);
+        }
+        try {
+          await sendCompletionNotification('Transcription ready', 'Your meeting transcript has finished processing.');
+        } catch {
+          /* notification is best-effort */
+        }
+      } catch (cause) {
+        setError(messageFromUnknownError(cause, 'Transcription failed.'));
+        await refreshHistory();
+      } finally {
+        setTranscribingMeetingId((current) => (current === meetingId ? null : current));
+      }
+    },
+    [openMeeting, refreshHistory],
+  );
+
   const handleStop = useCallback(async () => {
     setPhase('stopping');
     stopTimer();
     try {
       const recording = await stopRecording();
-      setPhase('transcribing');
-      await transcribeMeeting(recording.meetingId);
       await refreshHistory();
       await openMeeting(recording.meetingId);
+      void transcribeInBackground(recording.meetingId);
     } catch (cause) {
-      setError(messageFromUnknownError(cause, 'Recording stopped, but processing failed.'));
+      setError(messageFromUnknownError(cause, 'Could not stop recording.'));
     } finally {
       setPhase('idle');
     }
-  }, [openMeeting, refreshHistory, stopTimer]);
+  }, [openMeeting, refreshHistory, stopTimer, transcribeInBackground]);
 
   const dismissOnboarding = useCallback(() => {
     window.localStorage.setItem(PERMISSIONS_ONBOARDING_SEEN_KEY, 'true');
@@ -279,7 +312,7 @@ export default function App() {
   }, []);
 
   const isRecording = phase === 'recording';
-  const isBusy = phase === 'stopping' || phase === 'transcribing';
+  const isBusy = phase === 'stopping';
 
   return (
     <div className="app">
@@ -314,7 +347,7 @@ export default function App() {
         >
           {isBusy ? (
             <>
-              <Spinner /> {phase === 'transcribing' ? 'Transcribing…' : 'Stopping…'}
+              <Spinner /> Stopping…
             </>
           ) : isRecording ? (
             <>
@@ -345,7 +378,9 @@ export default function App() {
                 <button type="button" className="mi-open" onClick={() => void openMeeting(item.meetingId)}>
                   <p className="mi-title">{meetingTitle(item)}</p>
                   <p className="mi-meta">
-                    {formatDate(item.startedAtMs)} · {formatDuration(item.durationMs)}
+                    {transcribingMeetingId === item.meetingId
+                      ? 'Transcribing…'
+                      : `${formatDate(item.startedAtMs)} · ${formatDuration(item.durationMs)}`}
                   </p>
                 </button>
                 <button
@@ -423,7 +458,7 @@ export default function App() {
           ) : detail ? (
             <MeetingDetailView
               detail={detail}
-              processing={phase === 'transcribing'}
+              processing={transcribingMeetingId === detail.meeting.meetingId}
               summarizing={summarizing}
               canSummarize={tauri}
               onSummarize={() => void handleSummarize(detail.meeting.meetingId)}

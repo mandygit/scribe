@@ -57,7 +57,6 @@ struct AppState {
     recordings: Mutex<RecordingManager<CpalCaptureBackend, ScreenCaptureKitSystemAudioBackend>>,
     dictation: Mutex<DictationRecorder<CpalCaptureBackend>>,
     dictation_hotkey: Mutex<DictationHotkey>,
-    echo_cancellation: SpeexEchoCancellationBackend,
 }
 
 fn load_effective_settings(repository: &SqliteRepository) -> Result<ResonanceSettings, AppError> {
@@ -178,7 +177,11 @@ pub struct DictationSessionPage {
 
 const DEFAULT_HISTORY_LIMIT: u32 = 10;
 const MAX_HISTORY_LIMIT: u32 = 50;
-const HISTORY_DETAIL_TRANSCRIPT_LIMIT: u32 = 200;
+// 200 segments (~40-50 minutes of normal conversation) was cutting off
+// longer meetings silently in the detail view; 5000 covers meetings well
+// past a full day of continuous speech while still bounding worst-case
+// render cost.
+const HISTORY_DETAIL_TRANSCRIPT_LIMIT: u32 = 5000;
 const DEFAULT_TRENDS_LIMIT: u32 = 12;
 const MAX_TRENDS_LIMIT: u32 = 50;
 const MAX_RAW_AUDIO_RETENTION_DAYS: u16 = 365;
@@ -479,7 +482,7 @@ fn start_recording(
 }
 
 #[tauri::command]
-fn transcribe_meeting(
+async fn transcribe_meeting(
     app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
@@ -493,19 +496,52 @@ fn transcribe_meeting(
         ensure_transcript_is_empty(&repository, &meeting_id_value)?;
         (settings, metadata)
     };
-    let audio_path =
-        select_transcription_audio_path(&settings, &metadata, &state.echo_cancellation);
     let transcriber = WhisperShellTranscriber::from_settings(&settings)?;
     let now_ms = current_time_ms()?;
+
+    // whisper-cli (and the AEC pass ahead of it) can run for as long as the
+    // meeting itself. Run both off the async runtime so this command doesn't
+    // tie up the invoke thread for the whole duration, the way it used to
+    // when "stop meeting" awaited this synchronously.
+    let transcription_output = tauri::async_runtime::spawn_blocking(move || {
+        let audio_path = select_transcription_audio_path(
+            &settings,
+            &metadata,
+            &SpeexEchoCancellationBackend::default(),
+        );
+        transcribe_audio_with_retry(&transcriber, std::path::Path::new(&audio_path))
+    })
+    .await
+    .map_err(|error| AppError {
+        code: "transcription_task_failed".to_string(),
+        message: "The transcription task did not finish.".to_string(),
+        details: Some(error.to_string()),
+    })?;
+
     let result = {
         let repository = state.repository.lock().map_err(map_lock_error)?;
-        transcribe_meeting_with_transcriber_path(
-            &repository,
-            meeting_id_value.clone(),
-            std::path::Path::new(&audio_path),
-            &transcriber,
-            now_ms,
-        )?
+        match transcription_output {
+            Ok(output) => {
+                let persisted = persist_transcription_output(
+                    &repository,
+                    meeting_id_value.clone(),
+                    output,
+                    now_ms,
+                )?;
+                clear_pipeline_failure_after_success(&repository, &meeting_id_value);
+                persisted
+            }
+            Err(error) => {
+                persist_pipeline_failure(
+                    &repository,
+                    &meeting_id_value,
+                    ProcessingStage::Transcribing,
+                    &error,
+                    now_ms,
+                )?;
+                return Err(error);
+            }
+        }
     };
     let transcript_sink = TauriTranscriptEventSink { app: &app };
     let nudge_sink = TauriNudgeEventSink { app: &app };
@@ -1519,7 +1555,6 @@ pub fn run() {
                 )),
                 dictation: Mutex::new(DictationRecorder::new(CpalCaptureBackend::new())),
                 dictation_hotkey: Mutex::new(DictationHotkey::new()),
-                echo_cancellation: SpeexEchoCancellationBackend,
             });
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
 
@@ -1618,6 +1653,7 @@ fn transcribe_meeting_with_transcriber<T: transcription::Transcriber>(
     )
 }
 
+#[cfg(test)]
 fn transcribe_meeting_with_transcriber_path<T: transcription::Transcriber>(
     repository: &SqliteRepository,
     meeting_id: MeetingId,
