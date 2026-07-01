@@ -3,6 +3,7 @@ import './styles.css';
 import { DICTATION_HOTKEYS, PERMISSION_ROWS, SUMMARIZER_PROVIDERS } from './contracts';
 import { messageFromUnknownError } from './error-utils';
 import { formatClock, formatDate, formatDuration, meetingTitle } from './format';
+import { copySummaryToClipboard } from './summary-clipboard';
 import {
   type AppStatus,
   type AudioDevice,
@@ -498,6 +499,8 @@ const ICON_PATHS: Record<string, string> = {
   activity: 'M3 12h4l2-7 4 14 2-7h6',
   trend: 'M3 17l6-6 4 4 8-8M15 7h6v6',
   trash: 'M5 7h14M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m2 0-.8 12.2a2 2 0 0 1-2 1.8H7.8a2 2 0 0 1-2-1.8L5 7h14z',
+  copy: 'M10 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2zM4 16V4a2 2 0 0 1 2-2h10',
+  check: 'M5 12l5 5L19 7',
 };
 
 function Icon({ name, size = 16 }: { name: keyof typeof ICON_PATHS | string; size?: number }) {
@@ -790,6 +793,18 @@ function MeetingDetailView({
   const { meeting, transcriptSegments, summary } = detail;
   const segmentCount = transcriptSegments.length;
   const hasTranscript = segmentCount > 0;
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
+
+  const handleCopy = useCallback(async () => {
+    if (!summary) return;
+    try {
+      await copySummaryToClipboard(summary);
+      setCopyState('copied');
+    } catch {
+      setCopyState('error');
+    }
+    window.setTimeout(() => setCopyState('idle'), 2000);
+  }, [summary]);
 
   return (
     <div>
@@ -803,6 +818,12 @@ function MeetingDetailView({
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          {summary && hasTranscript && (
+            <button type="button" className="ghost-btn" onClick={() => void handleCopy()}>
+              <Icon name={copyState === 'copied' ? 'check' : 'copy'} />
+              {copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy failed' : 'Copy'}
+            </button>
+          )}
           {summary && hasTranscript && (
             <button type="button" className="ghost-btn" disabled={summarizing} onClick={onSummarize}>
               {summarizing ? <Spinner /> : <Icon name="refresh" />} Regenerate
