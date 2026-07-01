@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::analysis::{AnalysisTranscriptSegment, MeetingActionItem, MeetingSummary, MeetingSummarizer};
 use crate::domain::{AppError, SummarizerProvider};
 
-pub const DEFAULT_SUMMARIZER_MODEL: &str = "google/gemma-4-26b-a4b-qat";
+pub const DEFAULT_SUMMARIZER_MODEL: &str = "qwen3-14b-mlx";
 const LM_STUDIO_HOST: &str = "127.0.0.1";
 const LM_STUDIO_PORT: u16 = 1234;
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -118,17 +118,26 @@ fn chunk_transcript(segments: &[AnalysisTranscriptSegment], target_chars: usize)
     chunks
 }
 
+// Qwen3's chat template enables a "thinking" pass by default, which adds
+// pure latency for this deterministic extraction task (and eats into the
+// per-request timeout). "/no_think" is Qwen3's documented in-prompt switch
+// to skip it, independent of whether the serving backend exposes an
+// enable_thinking API flag.
+const NO_THINK_DIRECTIVE: &str = "\n\n/no_think";
+
 fn single_shot_prompt(transcript: &str) -> String {
     format!(
         "Summarize this meeting for someone who missed it.\n\
 Return exactly one strict JSON object matching this schema and no Markdown:\n{SUMMARY_SCHEMA}\n\
 Use null for an unknown owner or due date. Keep action item tasks concrete.\n\n\
-Transcript:\n{transcript}"
+Transcript:\n{transcript}{NO_THINK_DIRECTIVE}"
     )
 }
 
 fn map_prompt(chunk: &str) -> String {
-    format!("Condense this portion of a meeting into terse bullet notes.\n\nTranscript:\n{chunk}")
+    format!(
+        "Condense this portion of a meeting into terse bullet notes.\n\nTranscript:\n{chunk}{NO_THINK_DIRECTIVE}"
+    )
 }
 
 fn reduce_prompt(digests: &str) -> String {
@@ -136,7 +145,7 @@ fn reduce_prompt(digests: &str) -> String {
         "Combine these section notes from one meeting into a single set of meeting notes.\n\
 Return exactly one strict JSON object matching this schema and no Markdown:\n{SUMMARY_SCHEMA}\n\
 Merge duplicates, use null for an unknown owner or due date, and keep tasks concrete.\n\n\
-Section notes:\n{digests}"
+Section notes:\n{digests}{NO_THINK_DIRECTIVE}"
     )
 }
 
