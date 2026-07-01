@@ -9,6 +9,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "package:mac": "tauri build --bundles app",
+    "package:mac:dmg": "tauri build --bundles dmg",
     "test:frontend": "bun test tests/frontend",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri"

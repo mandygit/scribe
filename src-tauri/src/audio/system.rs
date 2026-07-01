@@ -203,6 +203,29 @@ fn helper_unavailable() -> AppError {
     )
 }
 
+/// Read-only Screen Recording status check: runs the helper's `--check-only`
+/// mode, which calls only `CGPreflightScreenCaptureAccess()` and never
+/// `CGRequestScreenCaptureAccess()`. The latter triggers the system prompt
+/// and returns immediately, before the user answers it -- calling it from an
+/// automatic background check (e.g. on every app launch) would silently
+/// re-fire the system dialog every time regardless of the user's previous
+/// answer. Real capture attempts (recording a meeting, or an explicit "Grant"
+/// action) still go through the normal request-capable path.
+pub fn check_screen_recording_permission() -> Result<bool, AppError> {
+    let helper_path = system_audio_helper_path()?;
+    let status = Command::new(&helper_path)
+        .arg("--check-only")
+        .status()
+        .map_err(|error| {
+            audio_error(
+                "system_audio_permission_check_failed",
+                "Could not run the ScreenCaptureKit permission check.",
+                Some(format!("helper={}, error={error}", helper_path.display())),
+            )
+        })?;
+    Ok(status.success())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +239,19 @@ mod tests {
                 env!("RESONANCE_SYSTEM_AUDIO_HELPER_NAME"),
                 env!("RESONANCE_SYSTEM_AUDIO_HELPER_TARGET")
             )));
+        }
+    }
+
+    #[test]
+    fn check_screen_recording_permission_never_hangs_or_errors() {
+        // Regression test for the bug where the onboarding's automatic status
+        // check called CGRequestScreenCaptureAccess() (which prompts) instead
+        // of CGPreflightScreenCaptureAccess() (read-only) -- this must return
+        // promptly with a plain bool, whatever the current OS grant state is,
+        // and never block on user interaction.
+        if cfg!(target_os = "macos") {
+            let result = check_screen_recording_permission();
+            assert!(result.is_ok(), "check-only mode must not error: {result:?}");
         }
     }
 }

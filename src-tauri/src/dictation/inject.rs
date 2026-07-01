@@ -95,6 +95,40 @@ fn paste_with_keystroke() -> Result<(), AppError> {
     })
 }
 
+/// Checks (and, the first time it's called, prompts for) the Accessibility
+/// permission via a read-only System Events query — no clipboard writes, no
+/// synthesized keystrokes, nothing visible in the focused app. Used to prime
+/// permissions during onboarding without performing a real paste, since
+/// `inject_text` is a no-op for blank input and would otherwise paste whatever
+/// is on the clipboard into the user's focused app for non-blank input.
+pub fn probe_accessibility() -> Result<(), AppError> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "System Events" to get name of first process whose frontmost is true"#)
+        .output()
+        .map_err(|error| AppError {
+            code: "dictation_accessibility_probe_failed".to_string(),
+            message: "Could not start osascript to check the Accessibility permission.".to_string(),
+            details: Some(error.to_string()),
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let code = if is_accessibility_denied(&stderr) {
+        "dictation_accessibility_permission_required"
+    } else {
+        "dictation_accessibility_probe_failed"
+    };
+    Err(AppError {
+        code: code.to_string(),
+        message: "The Accessibility permission has not been granted.".to_string(),
+        details: if stderr.is_empty() { None } else { Some(stderr) },
+    })
+}
+
 /// Recognises the System Events errors that mean the Accessibility permission
 /// has not been granted, across the macOS version wording variants.
 fn is_accessibility_denied(stderr: &str) -> bool {

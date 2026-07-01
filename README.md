@@ -179,6 +179,7 @@ bun run tauri dev
 | `bun run lint:fix` | Apply Biome-safe formatting/import fixes. |
 | `bun run build` | Type-check and build the frontend. |
 | `bun run package:mac` | Build a local macOS `.app` bundle. |
+| `bun run package:mac:dmg` | Build a `.dmg` for handing to other Macs. See `docs/distributing.md`. |
 | `cd src-tauri && cargo test` | Run Rust tests. |
 | `cd src-tauri && cargo check --features speaker-matching-sherpa` | Validate the optional speaker matching build. |
 

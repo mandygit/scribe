@@ -165,11 +165,13 @@ button {
   padding: 0 4px;
 }
 .meeting-item {
-  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 2px;
   width: 100%;
   border: 0.5px solid transparent;
   background: transparent;
-  padding: 8px 10px;
+  padding: 2px;
   border-radius: var(--radius);
   transition: background 0.12s ease;
 }
@@ -179,6 +181,14 @@ button {
 .meeting-item.is-active {
   background: var(--surface-2);
   border-color: var(--border);
+}
+.meeting-item .mi-open {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 6px 8px;
 }
 .meeting-item .mi-title {
   font-size: 13px;
@@ -197,6 +207,28 @@ button {
   font-size: 11px;
   color: var(--text-muted);
   margin: 0;
+}
+.mi-delete {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.meeting-item:hover .mi-delete,
+.dictation-item:hover .mi-delete {
+  opacity: 1;
+}
+.mi-delete:hover {
+  background: var(--bg-danger);
+  color: var(--text-danger);
 }
 
 .sidebar-foot {
@@ -462,6 +494,163 @@ button {
 .primary-btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+.primary-btn.is-danger {
+  background: var(--danger);
+}
+
+/* ---------- Dictation ---------- */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 28px;
+}
+.stat-card {
+  padding: 14px 16px;
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-1);
+}
+.stat-value {
+  font-size: 22px;
+  font-weight: 500;
+  margin: 0 0 2px;
+  font-variant-numeric: tabular-nums;
+}
+.stat-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.dictation-list {
+  display: flex;
+  flex-direction: column;
+}
+.dictation-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 0.5px solid var(--border);
+  font-size: 13px;
+}
+.dictation-item .di-time {
+  flex: 1;
+  color: var(--text-primary);
+}
+.dictation-item .di-metric {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  min-width: 70px;
+  text-align: right;
+}
+
+/* ---------- Permissions onboarding ---------- */
+.onboarding-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(28, 27, 23, 0.35);
+  padding: 24px;
+}
+.onboarding-card {
+  width: 100%;
+  max-width: 480px;
+  padding: 28px;
+  border-radius: var(--radius-card);
+  background: var(--surface-2);
+  border: 0.5px solid var(--border);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+}
+.onboarding-card h1 {
+  font-size: 20px;
+  font-weight: 500;
+  margin: 0 0 6px;
+}
+.confirm-card {
+  max-width: 380px;
+}
+.confirm-message {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  margin: 0;
+}
+.permission-list {
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+}
+.permission-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 0.5px solid var(--border);
+}
+.permission-status {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.permission-status.is-granted {
+  background: var(--bg-accent);
+  color: var(--text-accent);
+}
+.permission-status.is-denied {
+  background: var(--bg-danger);
+  color: var(--text-danger);
+}
+.onboarding-actions {
+  margin-top: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* ---------- Trends ---------- */
+.trend-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.trend-card {
+  padding: 14px 16px;
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-1);
+}
+.trend-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.trend-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  margin-top: 2px;
+}
+.sparkline {
+  display: block;
+  width: 100%;
+  height: 56px;
+}
+.sparkline-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 18px 0;
 }
 
 /* ---------- Settings ---------- */

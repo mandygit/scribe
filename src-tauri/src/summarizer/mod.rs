@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::analysis::{AnalysisTranscriptSegment, MeetingActionItem, MeetingSummary, MeetingSummarizer};
-use crate::domain::AppError;
+use crate::domain::{AppError, SummarizerProvider};
 
 pub const DEFAULT_SUMMARIZER_MODEL: &str = "google/gemma-4-26b-a4b-qat";
 const LM_STUDIO_HOST: &str = "127.0.0.1";
@@ -240,58 +240,139 @@ impl Default for LmStudioClient {
 
 impl ChatCompletion for LmStudioClient {
     fn complete(&self, model: &str, system: &str, user: &str) -> Result<String, AppError> {
-        let body = serde_json::json!({
-            "model": model,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user },
-            ],
-            "temperature": 0.2,
-            "stream": false,
-        })
-        .to_string();
-
-        let response = post(&self.host, self.port, CHAT_PATH, body.as_bytes())?;
-        let value: Value = serde_json::from_slice(&response).map_err(|error| {
-            summarizer_error(
-                "lm_studio_invalid_json",
-                "LM Studio returned a response that could not be parsed.",
-                Some(error.to_string()),
-            )
-        })?;
-        value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                summarizer_error(
-                    "lm_studio_missing_content",
-                    "LM Studio response did not contain assistant content.",
-                    None,
-                )
-            })
+        let response = post(&self.host, self.port, CHAT_PATH, &chat_request_body(model, system, user))?;
+        parse_chat_content(&response)
     }
 }
 
-fn post(host: &str, port: u16, path: &str, body: &[u8]) -> Result<Vec<u8>, AppError> {
-    let address = format!("{host}:{port}")
-        .parse::<std::net::SocketAddr>()
-        .map_err(|error| summarizer_error("lm_studio_bad_address", "Invalid LM Studio address.", Some(error.to_string())))?;
-    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(map_transport_error)?;
-    stream.set_read_timeout(Some(REQUEST_TIMEOUT)).map_err(map_transport_error)?;
-    stream.set_write_timeout(Some(REQUEST_TIMEOUT)).map_err(map_transport_error)?;
+/// Generic OpenAI-compatible chat client for a local model server other than
+/// LM Studio (Ollama's `/v1/chat/completions`, or any other OpenAI-compatible
+/// endpoint a dev points Scribe at). Shares the wire format with
+/// [`LmStudioClient`] but skips LM Studio's `lms` CLI-driven server/model
+/// lifecycle, since other servers don't have an equivalent local start/load
+/// step — the model is expected to already be reachable.
+pub struct OpenAiCompatibleClient {
+    pub host: String,
+    pub port: u16,
+}
 
+impl ChatCompletion for OpenAiCompatibleClient {
+    fn complete(&self, model: &str, system: &str, user: &str) -> Result<String, AppError> {
+        let response = post(&self.host, self.port, CHAT_PATH, &chat_request_body(model, system, user))?;
+        parse_chat_content(&response)
+    }
+}
+
+fn chat_request_body(model: &str, system: &str, user: &str) -> Vec<u8> {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        "temperature": 0.2,
+        "stream": false,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn parse_chat_content(response: &[u8]) -> Result<String, AppError> {
+    let value: Value = serde_json::from_slice(response).map_err(|error| {
+        summarizer_error(
+            "summarizer_invalid_json",
+            "The model server returned a response that could not be parsed.",
+            Some(error.to_string()),
+        )
+    })?;
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            summarizer_error(
+                "summarizer_missing_content",
+                "The model server's response did not contain assistant content.",
+                None,
+            )
+        })
+}
+
+/// Lists model ids/names available on a local summarizer server, for
+/// populating a model picker in Settings. LM Studio and Custom endpoints speak
+/// the OpenAI-compatible `/v1/models` list endpoint; Ollama has its own
+/// `/api/tags` shape.
+pub fn list_models(provider: SummarizerProvider, host: &str, port: u16) -> Result<Vec<String>, AppError> {
+    let response = match provider {
+        SummarizerProvider::Ollama => get(host, port, "/api/tags")?,
+        SummarizerProvider::LmStudio | SummarizerProvider::Custom => get(host, port, "/v1/models")?,
+    };
+    let value = parse_models_json(&response)?;
+    Ok(extract_model_names(provider, &value))
+}
+
+fn parse_models_json(response: &[u8]) -> Result<Value, AppError> {
+    serde_json::from_slice(response).map_err(|error| {
+        summarizer_error(
+            "summarizer_invalid_json",
+            "The model server returned a response that could not be parsed.",
+            Some(error.to_string()),
+        )
+    })
+}
+
+/// Pulls model ids/names out of a parsed models-list response. Split out from
+/// [`list_models`] so the two response shapes (Ollama's `/api/tags` vs the
+/// OpenAI-compatible `/v1/models`) can be unit tested without a real server.
+fn extract_model_names(provider: SummarizerProvider, value: &Value) -> Vec<String> {
+    let (array_key, name_key) = match provider {
+        SummarizerProvider::Ollama => ("models", "name"),
+        SummarizerProvider::LmStudio | SummarizerProvider::Custom => ("data", "id"),
+    };
+    value
+        .get(array_key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get(name_key).and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn post(host: &str, port: u16, path: &str, body: &[u8]) -> Result<Vec<u8>, AppError> {
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\n\
 Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(request.as_bytes()).map_err(map_transport_error)?;
-    stream.write_all(body).map_err(map_transport_error)?;
+    let mut framed = request.into_bytes();
+    framed.extend_from_slice(body);
+    send_request(host, port, &framed)
+}
+
+fn get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, AppError> {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    send_request(host, port, request.as_bytes())
+}
+
+/// Sends a fully-framed HTTP/1.1 request and returns the parsed response body,
+/// shared by [`post`] and [`get`].
+fn send_request(host: &str, port: u16, framed_request: &[u8]) -> Result<Vec<u8>, AppError> {
+    let address = format!("{host}:{port}")
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| summarizer_error("summarizer_bad_address", "Invalid model server address.", Some(error.to_string())))?;
+    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(map_transport_error)?;
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT)).map_err(map_transport_error)?;
+    stream.set_write_timeout(Some(REQUEST_TIMEOUT)).map_err(map_transport_error)?;
+
+    stream.write_all(framed_request).map_err(map_transport_error)?;
     stream.flush().map_err(map_transport_error)?;
 
     let mut raw = Vec::new();
@@ -304,8 +385,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
         raw.extend_from_slice(&buffer[..read]);
         if raw.len() > MAX_RESPONSE_BYTES {
             return Err(summarizer_error(
-                "lm_studio_response_too_large",
-                "LM Studio response exceeded the size limit.",
+                "summarizer_response_too_large",
+                "The model server's response exceeded the size limit.",
                 None,
             ));
         }
@@ -314,7 +395,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     let separator = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| summarizer_error("lm_studio_no_headers", "LM Studio response had no header terminator.", None))?;
+        .ok_or_else(|| summarizer_error("summarizer_no_headers", "The model server's response had no header terminator.", None))?;
     let header_text = String::from_utf8_lossy(&raw[..separator]);
     let status_ok = header_text
         .lines()
@@ -330,8 +411,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
 
     if !status_ok {
         return Err(summarizer_error(
-            "lm_studio_http_error",
-            "LM Studio returned a non-success status. Is the server running and the model loaded?",
+            "summarizer_http_error",
+            "The model server returned a non-success status. Is it running and the model loaded?",
             Some(header_text.lines().next().unwrap_or("").to_string()),
         ));
     }
@@ -407,8 +488,8 @@ impl LmStudioLifecycle {
 
 fn map_transport_error(error: std::io::Error) -> AppError {
     summarizer_error(
-        "lm_studio_unavailable",
-        "Could not reach LM Studio on 127.0.0.1:1234. Start the LM Studio server and try again.",
+        "summarizer_unavailable",
+        "Could not reach the local model server. Make sure it's running and try again.",
         Some(error.to_string()),
     )
 }
@@ -515,5 +596,33 @@ mod tests {
         let summarizer = LmStudioSummarizer::new(chat, "test-model");
         let error = summarizer.summarize(&[], false).expect_err("empty transcript errors");
         assert_eq!(error.code, "summary_empty_transcript");
+    }
+
+    #[test]
+    fn extracts_model_ids_from_openai_compatible_models_list() {
+        let value: Value = serde_json::from_str(
+            r#"{"data":[{"id":"google/gemma-4-26b-a4b-qat"},{"id":"llama-3.2-3b"}]}"#,
+        )
+        .expect("valid json");
+        let names = extract_model_names(SummarizerProvider::LmStudio, &value);
+        assert_eq!(names, vec!["google/gemma-4-26b-a4b-qat", "llama-3.2-3b"]);
+
+        let names = extract_model_names(SummarizerProvider::Custom, &value);
+        assert_eq!(names, vec!["google/gemma-4-26b-a4b-qat", "llama-3.2-3b"]);
+    }
+
+    #[test]
+    fn extracts_model_names_from_ollama_tags_list() {
+        let value: Value = serde_json::from_str(r#"{"models":[{"name":"llama3.2:latest"},{"name":"mistral:7b"}]}"#)
+            .expect("valid json");
+        let names = extract_model_names(SummarizerProvider::Ollama, &value);
+        assert_eq!(names, vec!["llama3.2:latest", "mistral:7b"]);
+    }
+
+    #[test]
+    fn extract_model_names_tolerates_missing_or_malformed_fields() {
+        let value: Value = serde_json::from_str(r#"{"unexpected":"shape"}"#).expect("valid json");
+        assert!(extract_model_names(SummarizerProvider::LmStudio, &value).is_empty());
+        assert!(extract_model_names(SummarizerProvider::Ollama, &value).is_empty());
     }
 }

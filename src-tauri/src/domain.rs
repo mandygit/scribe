@@ -46,6 +46,12 @@ new_string_id!(SummaryId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
+pub struct DictationSessionId(String);
+
+new_string_id!(DictationSessionId);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct PracticeRecordingId(String);
 
 new_string_id!(PracticeRecordingId);
@@ -156,6 +162,17 @@ pub enum AnalyzerProvider {
     CloudClaude,
 }
 
+/// Which local model server backs meeting-notes summarization. Distinct from
+/// [`AnalyzerProvider`], which governs an unrelated cloud-vs-local toggle for
+/// the practice-recording coaching feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SummarizerProvider {
+    LmStudio,
+    Ollama,
+    Custom,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResonanceSettings {
@@ -176,10 +193,21 @@ pub struct ResonanceSettings {
     /// When true, dictation runs Apple Intelligence polish before inserting;
     /// otherwise the raw transcript is inserted.
     pub dictation_polish_enabled: bool,
+    /// Which local model server to summarize meetings with.
+    pub summarizer_provider: SummarizerProvider,
+    pub summarizer_host: String,
+    pub summarizer_port: u16,
+    /// Model name/id to request. When unset, falls back to
+    /// [`crate::summarizer::DEFAULT_SUMMARIZER_MODEL`] for the LM Studio provider.
+    pub summarizer_model: Option<String>,
 }
 
 /// Default token for the dictation hotkey: double-press Cmd+Shift+D.
 pub const DEFAULT_DICTATION_HOTKEY: &str = "cmd+shift+d";
+
+/// Default LM Studio host/port, matching `summarizer::LmStudioClient`'s default.
+pub const DEFAULT_SUMMARIZER_HOST: &str = "127.0.0.1";
+pub const DEFAULT_SUMMARIZER_PORT: u16 = 1234;
 
 impl Default for ResonanceSettings {
     fn default() -> Self {
@@ -198,6 +226,10 @@ impl Default for ResonanceSettings {
             speaker_segmentation_model_path: None,
             dictation_hotkey: DEFAULT_DICTATION_HOTKEY.to_string(),
             dictation_polish_enabled: false,
+            summarizer_provider: SummarizerProvider::LmStudio,
+            summarizer_host: DEFAULT_SUMMARIZER_HOST.to_string(),
+            summarizer_port: DEFAULT_SUMMARIZER_PORT,
+            summarizer_model: None,
         }
     }
 }

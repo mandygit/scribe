@@ -1,19 +1,31 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './styles.css';
-import { DICTATION_HOTKEYS } from './contracts';
+import { DICTATION_HOTKEYS, PERMISSION_ROWS, SUMMARIZER_PROVIDERS } from './contracts';
 import { messageFromUnknownError } from './error-utils';
 import { formatClock, formatDate, formatDuration, meetingTitle } from './format';
 import {
   type AppStatus,
   type AudioDevice,
+  checkPermissions,
+  type DictationSessionRecord,
+  type DictationStatsSummary,
+  deleteDictationSession,
+  deleteMeeting,
   getAppStatus,
+  getDictationStatsSummary,
   getMeetingHistoryDetail,
   isTauriRuntime,
   listAudioDevices,
+  listDictationSessions,
   listMeetingHistory,
+  listMeetingTrends,
+  listSummarizerModels,
   type MeetingHistoryDetail,
   type MeetingHistoryItem,
   type MeetingSummary,
+  type MeetingTrendPoint,
+  openPermissionSettings,
+  type PermissionsSnapshot,
   type ResonanceSettings,
   startRecording,
   stopRecording,
@@ -22,8 +34,11 @@ import {
   updateAudioProcessingSettings,
   updateDictationSettings,
   updatePrivacySettings,
+  updateSummarizerSettings,
   updateTranscriberSettings,
 } from './tauri-commands';
+
+const PERMISSIONS_ONBOARDING_SEEN_KEY = 'scribe-permissions-onboarding-seen';
 
 const FALLBACK_SETTINGS: ResonanceSettings = {
   microphoneDeviceId: null,
@@ -40,9 +55,15 @@ const FALLBACK_SETTINGS: ResonanceSettings = {
   speakerSegmentationModelPath: null,
   dictationHotkey: 'cmd+shift+d',
   dictationPolishEnabled: false,
+  summarizerProvider: 'lmStudio',
+  summarizerHost: '127.0.0.1',
+  summarizerPort: 1234,
+  summarizerModel: null,
 };
 
-type View = 'meetings' | 'settings';
+type View = 'meetings' | 'trends' | 'dictation' | 'settings';
+const DICTATION_HISTORY_LIMIT = 50;
+const TRENDS_LIMIT = 20;
 type RecordPhase = 'idle' | 'recording' | 'stopping' | 'transcribing';
 
 export default function App() {
@@ -57,7 +78,22 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0);
   const [summarizing, setSummarizing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dictationStats, setDictationStats] = useState<DictationStatsSummary | null>(null);
+  const [dictationSessions, setDictationSessions] = useState<DictationSessionRecord[]>([]);
+  const [trendPoints, setTrendPoints] = useState<MeetingTrendPoint[]>([]);
+  const [permissions, setPermissions] = useState<PermissionsSnapshot | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: () => void } | null>(null);
   const timerRef = useRef<number | null>(null);
+
+  const refreshPermissions = useCallback(async () => {
+    if (!tauri) return;
+    try {
+      setPermissions(await checkPermissions());
+    } catch (cause) {
+      setError(messageFromUnknownError(cause, 'Could not check permissions.'));
+    }
+  }, [tauri]);
 
   const refreshHistory = useCallback(async () => {
     if (!tauri) return;
@@ -66,6 +102,30 @@ export default function App() {
       setHistory(page.items);
     } catch (cause) {
       setError(messageFromUnknownError(cause, 'Could not load meeting history.'));
+    }
+  }, [tauri]);
+
+  const refreshTrends = useCallback(async () => {
+    if (!tauri) return;
+    try {
+      const result = await listMeetingTrends(TRENDS_LIMIT);
+      setTrendPoints(result.points);
+    } catch (cause) {
+      setError(messageFromUnknownError(cause, 'Could not load meeting trends.'));
+    }
+  }, [tauri]);
+
+  const refreshDictation = useCallback(async () => {
+    if (!tauri) return;
+    try {
+      const [stats, page] = await Promise.all([
+        getDictationStatsSummary(),
+        listDictationSessions(DICTATION_HISTORY_LIMIT, 0),
+      ]);
+      setDictationStats(stats);
+      setDictationSessions(page.items);
+    } catch (cause) {
+      setError(messageFromUnknownError(cause, 'Could not load dictation history.'));
     }
   }, [tauri]);
 
@@ -83,9 +143,28 @@ export default function App() {
       } catch {
         /* device list is non-critical */
       }
+      try {
+        const snapshot = await checkPermissions();
+        setPermissions(snapshot);
+        const hasSeenOnboarding = window.localStorage.getItem(PERMISSIONS_ONBOARDING_SEEN_KEY) === 'true';
+        const allGranted = Object.values(snapshot).every((status) => status === 'granted');
+        if (!hasSeenOnboarding && !allGranted) {
+          setShowOnboarding(true);
+        }
+      } catch {
+        /* permission check is best-effort on launch; Settings can retry */
+      }
       await refreshHistory();
     })();
   }, [tauri, refreshHistory]);
+
+  useEffect(() => {
+    if (view === 'dictation') {
+      void refreshDictation();
+    } else if (view === 'trends') {
+      void refreshTrends();
+    }
+  }, [view, refreshDictation, refreshTrends]);
 
   const openMeeting = useCallback(async (meetingId: string) => {
     setSelectedId(meetingId);
@@ -96,6 +175,48 @@ export default function App() {
       setError(messageFromUnknownError(cause, 'Could not open this meeting.'));
     }
   }, []);
+
+  const requestConfirm = useCallback((message: string, onConfirm: () => void) => {
+    setConfirmDialog({ message, onConfirm });
+  }, []);
+
+  const handleDeleteMeeting = useCallback(
+    (meetingId: string) => {
+      requestConfirm('Delete this meeting recording and its transcript and notes? This cannot be undone.', () => {
+        void (async () => {
+          setError(null);
+          try {
+            await deleteMeeting(meetingId);
+            if (selectedId === meetingId) {
+              setSelectedId(null);
+              setDetail(null);
+            }
+            await refreshHistory();
+          } catch (cause) {
+            setError(messageFromUnknownError(cause, 'Could not delete this meeting.'));
+          }
+        })();
+      });
+    },
+    [refreshHistory, requestConfirm, selectedId],
+  );
+
+  const handleDeleteDictationSession = useCallback(
+    (sessionId: string) => {
+      requestConfirm('Delete this dictation session?', () => {
+        void (async () => {
+          setError(null);
+          try {
+            await deleteDictationSession(sessionId);
+            await refreshDictation();
+          } catch (cause) {
+            setError(messageFromUnknownError(cause, 'Could not delete this dictation session.'));
+          }
+        })();
+      });
+    },
+    [refreshDictation, requestConfirm],
+  );
 
   const handleSummarize = useCallback(async (meetingId: string) => {
     setError(null);
@@ -152,11 +273,33 @@ export default function App() {
     }
   }, [openMeeting, refreshHistory, stopTimer]);
 
+  const dismissOnboarding = useCallback(() => {
+    window.localStorage.setItem(PERMISSIONS_ONBOARDING_SEEN_KEY, 'true');
+    setShowOnboarding(false);
+  }, []);
+
   const isRecording = phase === 'recording';
   const isBusy = phase === 'stopping' || phase === 'transcribing';
 
   return (
     <div className="app">
+      {showOnboarding && permissions && (
+        <PermissionsOnboarding
+          permissions={permissions}
+          onRecheck={refreshPermissions}
+          onContinue={dismissOnboarding}
+        />
+      )}
+      {confirmDialog && (
+        <ConfirmDialog
+          message={confirmDialog.message}
+          onCancel={() => setConfirmDialog(null)}
+          onConfirm={() => {
+            confirmDialog.onConfirm();
+            setConfirmDialog(null);
+          }}
+        />
+      )}
       <aside className="sidebar">
         <div className="brand">
           <BrandMark />
@@ -193,24 +336,46 @@ export default function App() {
               </p>
             )}
             {history.map((item) => (
-              <button
+              <div
                 key={item.meetingId}
-                type="button"
                 className={`meeting-item${selectedId === item.meetingId ? ' is-active' : ''}${
                   item.transcriptSegmentCount === 0 ? ' is-muted' : ''
                 }`}
-                onClick={() => void openMeeting(item.meetingId)}
               >
-                <p className="mi-title">{meetingTitle(item)}</p>
-                <p className="mi-meta">
-                  {formatDate(item.startedAtMs)} · {formatDuration(item.durationMs)}
-                </p>
-              </button>
+                <button type="button" className="mi-open" onClick={() => void openMeeting(item.meetingId)}>
+                  <p className="mi-title">{meetingTitle(item)}</p>
+                  <p className="mi-meta">
+                    {formatDate(item.startedAtMs)} · {formatDuration(item.durationMs)}
+                  </p>
+                </button>
+                <button
+                  type="button"
+                  className="mi-delete"
+                  aria-label="Delete meeting"
+                  onClick={() => void handleDeleteMeeting(item.meetingId)}
+                >
+                  <Icon name="trash" size={13} />
+                </button>
+              </div>
             ))}
           </div>
         </div>
 
         <div className="sidebar-foot">
+          <button
+            type="button"
+            className={`nav-btn${view === 'trends' ? ' is-active' : ''}`}
+            onClick={() => setView('trends')}
+          >
+            <Icon name="trend" /> Trends
+          </button>
+          <button
+            type="button"
+            className={`nav-btn${view === 'dictation' ? ' is-active' : ''}`}
+            onClick={() => setView('dictation')}
+          >
+            <Icon name="activity" /> Dictation
+          </button>
           <button
             type="button"
             className={`nav-btn${view === 'settings' ? ' is-active' : ''}`}
@@ -237,7 +402,24 @@ export default function App() {
           )}
 
           {view === 'settings' ? (
-            <SettingsView settings={settings} devices={devices} onSettings={setSettings} onError={setError} />
+            <SettingsView
+              settings={settings}
+              devices={devices}
+              onSettings={setSettings}
+              onError={setError}
+              onReviewPermissions={() => {
+                void refreshPermissions();
+                setShowOnboarding(true);
+              }}
+            />
+          ) : view === 'dictation' ? (
+            <DictationView
+              stats={dictationStats}
+              sessions={dictationSessions}
+              onDelete={(sessionId) => void handleDeleteDictationSession(sessionId)}
+            />
+          ) : view === 'trends' ? (
+            <TrendsView points={trendPoints} />
           ) : detail ? (
             <MeetingDetailView
               detail={detail}
@@ -245,6 +427,7 @@ export default function App() {
               summarizing={summarizing}
               canSummarize={tauri}
               onSummarize={() => void handleSummarize(detail.meeting.meetingId)}
+              onDelete={() => void handleDeleteMeeting(detail.meeting.meetingId)}
             />
           ) : (
             <EmptyState recording={isRecording} />
@@ -277,6 +460,9 @@ const ICON_PATHS: Record<string, string> = {
   stop: 'M7 7a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1z',
   refresh: 'M20 11a8 8 0 0 0-13.7-5L4 8M4 4v4h4M4 13a8 8 0 0 0 13.7 5L20 16M20 20v-4h-4',
   loader: 'M12 3a9 9 0 1 0 9 9',
+  activity: 'M3 12h4l2-7 4 14 2-7h6',
+  trend: 'M3 17l6-6 4 4 8-8M15 7h6v6',
+  trash: 'M5 7h14M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m2 0-.8 12.2a2 2 0 0 1-2 1.8H7.8a2 2 0 0 1-2-1.8L5 7h14z',
 };
 
 function Icon({ name, size = 16 }: { name: keyof typeof ICON_PATHS | string; size?: number }) {
@@ -337,18 +523,234 @@ function EmptyState({ recording }: { recording: boolean }) {
   );
 }
 
+const formatSessionTimestamp = (ms: number): string =>
+  new Date(ms).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+
+function DictationView({
+  stats,
+  sessions,
+  onDelete,
+}: {
+  stats: DictationStatsSummary | null;
+  sessions: DictationSessionRecord[];
+  onDelete: (sessionId: string) => void;
+}) {
+  const hasSessions = sessions.length > 0;
+
+  return (
+    <div>
+      <div className="meeting-header">
+        <div>
+          <h1>Dictation</h1>
+          <p className="meeting-sub">How much you've dictated on this Mac.</p>
+        </div>
+      </div>
+
+      <div className="stat-grid">
+        <StatCard label="Sessions" value={stats ? stats.totalSessions.toLocaleString() : '—'} />
+        <StatCard label="Words dictated" value={stats ? stats.totalWords.toLocaleString() : '—'} />
+        <StatCard
+          label="Avg. pace"
+          value={stats && stats.totalSessions > 0 ? `${Math.round(stats.averageWordsPerMinute)} wpm` : '—'}
+        />
+        <StatCard label="Total time" value={stats ? formatDuration(stats.totalDurationMs) : '—'} />
+      </div>
+
+      <h2 className="section-title">History</h2>
+      {hasSessions ? (
+        <div className="dictation-list">
+          {sessions.map((session) => (
+            <div className="dictation-item" key={session.id}>
+              <span className="di-time">{formatSessionTimestamp(session.startedAtMs)}</span>
+              <span className="di-metric">{formatDuration(session.durationMs)}</span>
+              <span className="di-metric">{session.wordCount} words</span>
+              <span className="di-metric">{Math.round(session.wordsPerMinute)} wpm</span>
+              <button
+                type="button"
+                className="mi-delete"
+                aria-label="Delete dictation session"
+                onClick={() => onDelete(session.id)}
+              >
+                <Icon name="trash" size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="empty" style={{ height: 'auto', padding: '32px 0' }}>
+          <span className="ill">
+            <Icon name="mic" size={26} />
+          </span>
+          <h2>No dictations yet</h2>
+          <p>Double-press your dictation hotkey to start, press it again to insert. Sessions show up here.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="stat-card">
+      <p className="stat-value">{value}</p>
+      <p className="stat-label">{label}</p>
+    </div>
+  );
+}
+
+const SPARKLINE_WIDTH = 600;
+const SPARKLINE_HEIGHT = 64;
+const SPARKLINE_PADDING = 6;
+
+/** A minimal hand-rolled line chart, matching the app's hand-rolled icon style
+ * rather than pulling in a charting dependency for three sparklines. */
+function Sparkline({ values, color }: { values: (number | null)[]; color: string }) {
+  const defined = values
+    .map((value, index) => ({ value, index }))
+    .filter((entry): entry is { value: number; index: number } => entry.value !== null);
+
+  if (defined.length < 2) {
+    return <div className="sparkline-empty">Not enough meetings with this metric yet.</div>;
+  }
+
+  const min = Math.min(...defined.map((entry) => entry.value));
+  const max = Math.max(...defined.map((entry) => entry.value));
+  const span = max - min || 1;
+  const stepX = (SPARKLINE_WIDTH - SPARKLINE_PADDING * 2) / Math.max(values.length - 1, 1);
+
+  const toPoint = (entry: { value: number; index: number }) => {
+    const x = SPARKLINE_PADDING + entry.index * stepX;
+    const y =
+      SPARKLINE_HEIGHT - SPARKLINE_PADDING - ((entry.value - min) / span) * (SPARKLINE_HEIGHT - SPARKLINE_PADDING * 2);
+    return { x, y };
+  };
+
+  // Breaks the line at gaps where a meeting has no value for this metric yet.
+  let path = '';
+  let previousIndex: number | null = null;
+  for (const entry of defined) {
+    const { x, y } = toPoint(entry);
+    const command = previousIndex !== null && entry.index === previousIndex + 1 ? 'L' : 'M';
+    path += `${command}${x},${y} `;
+    previousIndex = entry.index;
+  }
+
+  return (
+    <svg
+      className="sparkline"
+      viewBox={`0 0 ${SPARKLINE_WIDTH} ${SPARKLINE_HEIGHT}`}
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
+      <path d={path} fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
+      {defined.map((entry) => {
+        const { x, y } = toPoint(entry);
+        return <circle key={entry.index} cx={x} cy={y} r={2.5} fill={color} />;
+      })}
+    </svg>
+  );
+}
+
+function TrendCard({
+  label,
+  points,
+  values,
+  format,
+  color,
+}: {
+  label: string;
+  points: MeetingTrendPoint[];
+  values: (number | null)[];
+  format: (value: number) => string;
+  color: string;
+}) {
+  const latest = [...values].reverse().find((value) => value !== null) ?? null;
+  const withData = values.filter((value) => value !== null).length;
+
+  return (
+    <div className="trend-card">
+      <div className="trend-head">
+        <div>
+          <p className="stat-label">{label}</p>
+          <p className="stat-value">{latest !== null ? format(latest) : '—'}</p>
+        </div>
+        <span className="trend-count">
+          {withData} of {points.length} meetings
+        </span>
+      </div>
+      <Sparkline values={values} color={color} />
+    </div>
+  );
+}
+
+function TrendsView({ points }: { points: MeetingTrendPoint[] }) {
+  const hasPoints = points.length > 0;
+
+  return (
+    <div>
+      <div className="meeting-header">
+        <div>
+          <h1>Trends</h1>
+          <p className="meeting-sub">How your speaking has changed across recent meetings.</p>
+        </div>
+      </div>
+
+      {hasPoints ? (
+        <div className="trend-list">
+          <TrendCard
+            label="Overall score"
+            points={points}
+            values={points.map((point) => point.overallScore)}
+            format={(value) => `${Math.round(value)}`}
+            color="var(--accent)"
+          />
+          <TrendCard
+            label="Pace"
+            points={points}
+            values={points.map((point) => point.wordsPerMinute)}
+            format={(value) => `${Math.round(value)} wpm`}
+            color="var(--brand)"
+          />
+          <TrendCard
+            label="Filler words"
+            points={points}
+            values={points.map((point) => point.fillerWordCount)}
+            format={(value) => `${Math.round(value)}`}
+            color="var(--danger)"
+          />
+        </div>
+      ) : (
+        <div className="empty" style={{ height: 'auto', padding: '32px 0' }}>
+          <span className="ill">
+            <Icon name="trend" size={26} />
+          </span>
+          <h2>No trends yet</h2>
+          <p>Record and analyze a few meetings and your pace, filler words, and score will show up here.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MeetingDetailView({
   detail,
   processing,
   summarizing,
   canSummarize,
   onSummarize,
+  onDelete,
 }: {
   detail: MeetingHistoryDetail;
   processing: boolean;
   summarizing: boolean;
   canSummarize: boolean;
   onSummarize: () => void;
+  onDelete: () => void;
 }) {
   const { meeting, transcriptSegments, summary } = detail;
   const segmentCount = transcriptSegments.length;
@@ -365,11 +767,16 @@ function MeetingDetailView({
             <span>·</span> {meeting.transcriptSegmentCount} segments
           </p>
         </div>
-        {summary && hasTranscript && (
-          <button type="button" className="ghost-btn" disabled={summarizing} onClick={onSummarize}>
-            {summarizing ? <Spinner /> : <Icon name="refresh" />} Regenerate
+        <div style={{ display: 'flex', gap: 8 }}>
+          {summary && hasTranscript && (
+            <button type="button" className="ghost-btn" disabled={summarizing} onClick={onSummarize}>
+              {summarizing ? <Spinner /> : <Icon name="refresh" />} Regenerate
+            </button>
+          )}
+          <button type="button" className="ghost-btn" onClick={onDelete}>
+            <Icon name="trash" /> Delete
           </button>
-        )}
+        </div>
       </div>
 
       {summarizing ? (
@@ -491,19 +898,128 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
   );
 }
 
+function PermissionsOnboarding({
+  permissions,
+  onRecheck,
+  onContinue,
+}: {
+  permissions: PermissionsSnapshot;
+  onRecheck: () => void;
+  onContinue: () => void;
+}) {
+  const [openingPane, setOpeningPane] = useState<string | null>(null);
+  const allGranted = Object.values(permissions).every((status) => status === 'granted');
+
+  const openPane = useCallback(async (pane: 'Microphone' | 'ScreenCapture' | 'Accessibility') => {
+    setOpeningPane(pane);
+    try {
+      await openPermissionSettings(pane);
+    } catch {
+      /* best-effort deep link; the settings-group description already explains the manual path */
+    } finally {
+      setOpeningPane(null);
+    }
+  }, []);
+
+  return (
+    <div className="onboarding-overlay">
+      <div className="onboarding-card">
+        <h1>Set up Scribe</h1>
+        <p className="meeting-sub">
+          Scribe records and transcribes entirely on this Mac. It needs a few permissions to work — grant what you can,
+          skip the rest for now.
+        </p>
+        <div className="permission-list">
+          {PERMISSION_ROWS.map((row) => {
+            const status = permissions[row.key];
+            return (
+              <div className="permission-row" key={row.key}>
+                <div>
+                  <div className="field-label">{row.label}</div>
+                  <p className="field-desc">{row.description}</p>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className={`permission-status${status === 'granted' ? ' is-granted' : ' is-denied'}`}>
+                    {status === 'granted' ? 'Granted' : 'Not granted'}
+                  </span>
+                  {status !== 'granted' && (
+                    <button
+                      type="button"
+                      className="ghost-btn"
+                      disabled={openingPane === row.pane}
+                      onClick={() => void openPane(row.pane)}
+                    >
+                      Open Settings
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="onboarding-actions">
+          <button type="button" className="ghost-btn" onClick={onRecheck}>
+            <Icon name="refresh" /> Recheck
+          </button>
+          <button type="button" className="primary-btn" onClick={onContinue}>
+            {allGranted ? 'Continue' : 'Continue without granting everything'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Tauri's webview doesn't reliably implement `window.confirm`, so destructive
+ * actions (delete meeting, delete dictation session) route through this
+ * instead of the native dialog. */
+function ConfirmDialog({
+  message,
+  onCancel,
+  onConfirm,
+}: {
+  message: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="onboarding-overlay">
+      <div className="onboarding-card confirm-card">
+        <p className="confirm-message">{message}</p>
+        <div className="onboarding-actions">
+          <button type="button" className="ghost-btn" onClick={onCancel}>
+            Cancel
+          </button>
+          <button type="button" className="primary-btn is-danger" onClick={onConfirm}>
+            <Icon name="trash" /> Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsView({
   settings,
   devices,
   onSettings,
   onError,
+  onReviewPermissions,
 }: {
   settings: ResonanceSettings;
   devices: AudioDevice[];
   onSettings: (settings: ResonanceSettings) => void;
   onError: (message: string | null) => void;
+  onReviewPermissions: () => void;
 }) {
   const [transcriberBin, setTranscriberBin] = useState(settings.transcriberBinPath ?? '');
   const [transcriberModel, setTranscriberModel] = useState(settings.transcriberModelPath ?? '');
+  const [summarizerHostInput, setSummarizerHostInput] = useState(settings.summarizerHost);
+  const [summarizerPortInput, setSummarizerPortInput] = useState(String(settings.summarizerPort));
+  const [summarizerModelInput, setSummarizerModelInput] = useState(settings.summarizerModel ?? '');
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [detecting, setDetecting] = useState(false);
+  const [detectStatus, setDetectStatus] = useState<string | null>(null);
 
   const saveAudio = useCallback(
     async (next: Partial<Pick<ResonanceSettings, 'enableSystemAudio' | 'enableEchoCancellation'>>) => {
@@ -536,6 +1052,58 @@ function SettingsView({
     },
     [onError, onSettings, settings.dictationHotkey, settings.dictationPolishEnabled],
   );
+
+  const saveSummarizer = useCallback(
+    async (
+      next: Partial<
+        Pick<ResonanceSettings, 'summarizerProvider' | 'summarizerHost' | 'summarizerPort' | 'summarizerModel'>
+      >,
+    ) => {
+      onError(null);
+      try {
+        const updated = await updateSummarizerSettings(
+          next.summarizerProvider ?? settings.summarizerProvider,
+          next.summarizerHost ?? settings.summarizerHost,
+          next.summarizerPort ?? settings.summarizerPort,
+          next.summarizerModel !== undefined ? next.summarizerModel : settings.summarizerModel,
+        );
+        onSettings(updated);
+        setSummarizerHostInput(updated.summarizerHost);
+        setSummarizerPortInput(String(updated.summarizerPort));
+        setSummarizerModelInput(updated.summarizerModel ?? '');
+      } catch (cause) {
+        onError(messageFromUnknownError(cause, 'Could not update the local model settings.'));
+      }
+    },
+    [
+      onError,
+      onSettings,
+      settings.summarizerHost,
+      settings.summarizerModel,
+      settings.summarizerPort,
+      settings.summarizerProvider,
+    ],
+  );
+
+  const detectModels = useCallback(async () => {
+    setDetecting(true);
+    setDetectStatus(null);
+    try {
+      const port = Number(summarizerPortInput) || settings.summarizerPort;
+      const models = await listSummarizerModels(settings.summarizerProvider, summarizerHostInput, port);
+      setModelOptions(models);
+      setDetectStatus(
+        models.length > 0
+          ? `Found ${models.length} model${models.length === 1 ? '' : 's'}.`
+          : 'Connected, but no models were listed — type the model name below.',
+      );
+    } catch (cause) {
+      setModelOptions([]);
+      setDetectStatus(messageFromUnknownError(cause, 'Could not reach that server.'));
+    } finally {
+      setDetecting(false);
+    }
+  }, [settings.summarizerPort, settings.summarizerProvider, summarizerHostInput, summarizerPortInput]);
 
   const saveRetention = useCallback(
     async (days: number) => {
@@ -657,6 +1225,110 @@ function SettingsView({
       </section>
 
       <section className="settings-group">
+        <h2>Local model</h2>
+        <p className="hint">
+          Meeting notes are written by a model running on this Mac — point Scribe at whatever you have installed.
+        </p>
+        <div className="field">
+          <div>
+            <div className="field-label">Provider</div>
+            <p className="field-desc">
+              LM Studio and Ollama are detected automatically; pick Custom for anything else.
+            </p>
+          </div>
+          <select
+            value={settings.summarizerProvider}
+            onChange={(event) => {
+              const provider = event.target.value as ResonanceSettings['summarizerProvider'];
+              const preset = SUMMARIZER_PROVIDERS.find((entry) => entry.value === provider);
+              setModelOptions([]);
+              setDetectStatus(null);
+              if (preset) {
+                setSummarizerHostInput(preset.defaultHost);
+                setSummarizerPortInput(String(preset.defaultPort));
+                void saveSummarizer({
+                  summarizerProvider: provider,
+                  summarizerHost: preset.defaultHost,
+                  summarizerPort: preset.defaultPort,
+                });
+              }
+            }}
+          >
+            {SUMMARIZER_PROVIDERS.map((provider) => (
+              <option key={provider.value} value={provider.value}>
+                {provider.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <div>
+            <div className="field-label">Address</div>
+            <p className="field-desc">Host and port the server is listening on.</p>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="text"
+              value={summarizerHostInput}
+              onChange={(event) => setSummarizerHostInput(event.target.value)}
+              onBlur={() => void saveSummarizer({ summarizerHost: summarizerHostInput })}
+              style={{ minWidth: 140 }}
+            />
+            <span className="field-desc">:</span>
+            <input
+              type="text"
+              value={summarizerPortInput}
+              onChange={(event) => setSummarizerPortInput(event.target.value)}
+              onBlur={() => {
+                const port = Number(summarizerPortInput);
+                if (Number.isInteger(port) && port > 0) {
+                  void saveSummarizer({ summarizerPort: port });
+                }
+              }}
+              style={{ width: 84 }}
+            />
+          </div>
+        </div>
+        <div className="field">
+          <div>
+            <div className="field-label">Model</div>
+            <p className="field-desc">
+              {detectStatus ?? 'Detect the models this server has available, or type a model name.'}
+            </p>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {modelOptions.length > 0 ? (
+              <select
+                value={summarizerModelInput}
+                onChange={(event) => {
+                  setSummarizerModelInput(event.target.value);
+                  void saveSummarizer({ summarizerModel: event.target.value || null });
+                }}
+              >
+                <option value="">Choose a model</option>
+                {modelOptions.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={summarizerModelInput}
+                placeholder="e.g. llama3.2"
+                onChange={(event) => setSummarizerModelInput(event.target.value)}
+                onBlur={() => void saveSummarizer({ summarizerModel: summarizerModelInput.trim() || null })}
+              />
+            )}
+            <button type="button" className="ghost-btn" disabled={detecting} onClick={() => void detectModels()}>
+              {detecting ? <Spinner /> : <Icon name="refresh" />} Detect
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-group">
         <h2>Transcription</h2>
         <p className="hint">Point Scribe at your local whisper.cpp binary and model.</p>
         <div className="field">
@@ -686,6 +1358,16 @@ function SettingsView({
         <div style={{ marginTop: 12 }}>
           <button type="button" className="primary-btn" onClick={() => void saveTranscriber()}>
             Save transcription paths
+          </button>
+        </div>
+      </section>
+
+      <section className="settings-group">
+        <h2>Permissions</h2>
+        <p className="hint">Microphone, Screen Recording, and Accessibility — review status and re-grant if needed.</p>
+        <div style={{ marginTop: 4 }}>
+          <button type="button" className="ghost-btn" onClick={onReviewPermissions}>
+            Review permissions
           </button>
         </div>
       </section>

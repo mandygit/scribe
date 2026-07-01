@@ -3,6 +3,7 @@ export type SegmentId = string;
 export type MetricId = string;
 export type ReportId = string;
 export type SummaryId = string;
+export type DictationSessionId = string;
 
 export interface AppError {
   code: string;
@@ -13,6 +14,8 @@ export interface AppError {
 export type ProcessingStage = 'recording' | 'transcribing' | 'metrics' | 'analyzing';
 
 export type AnalyzerProvider = 'localOllama' | 'cloudOpenAi' | 'cloudClaude';
+
+export type SummarizerProvider = 'lmStudio' | 'ollama' | 'custom';
 
 export interface ResonanceSettings {
   microphoneDeviceId: string | null;
@@ -29,7 +32,23 @@ export interface ResonanceSettings {
   speakerSegmentationModelPath: string | null;
   dictationHotkey: string;
   dictationPolishEnabled: boolean;
+  summarizerProvider: SummarizerProvider;
+  summarizerHost: string;
+  summarizerPort: number;
+  summarizerModel: string | null;
 }
+
+/** Provider presets: default host/port to prefill when a dev switches providers. */
+export const SUMMARIZER_PROVIDERS = [
+  { value: 'lmStudio', label: 'LM Studio', defaultHost: '127.0.0.1', defaultPort: 1234 },
+  { value: 'ollama', label: 'Ollama', defaultHost: '127.0.0.1', defaultPort: 11434 },
+  { value: 'custom', label: 'Custom (OpenAI-compatible)', defaultHost: '127.0.0.1', defaultPort: 8080 },
+] as const satisfies ReadonlyArray<{
+  value: SummarizerProvider;
+  label: string;
+  defaultHost: string;
+  defaultPort: number;
+}>;
 
 /** Selectable dictation hotkeys, matching the Rust allowlist. */
 export const DICTATION_HOTKEYS = [
@@ -239,6 +258,63 @@ export interface TranscriptStreamSummary {
 
 export type NudgeCategory = 'fillerWords' | 'hedging' | 'pace' | 'talkTime';
 export type NudgeSeverity = 'info' | 'caution' | 'urgent';
+
+export interface DictationSessionRecord {
+  id: DictationSessionId;
+  startedAtMs: number;
+  endedAtMs: number;
+  durationMs: number;
+  wordCount: number;
+  wordsPerMinute: number;
+  createdAtMs: number;
+}
+
+export interface DictationSessionPage {
+  items: DictationSessionRecord[];
+  nextOffset: number | null;
+}
+
+export interface DictationStatsSummary {
+  totalSessions: number;
+  totalWords: number;
+  averageWordsPerMinute: number;
+  totalDurationMs: number;
+}
+
+export type PermissionStatus = 'granted' | 'denied';
+
+export interface PermissionsSnapshot {
+  microphone: PermissionStatus;
+  screenRecording: PermissionStatus;
+  accessibility: PermissionStatus;
+}
+
+/** Permission rows for onboarding, in the order they're checked and shown. */
+export const PERMISSION_ROWS = [
+  {
+    key: 'microphone',
+    pane: 'Microphone',
+    label: 'Microphone',
+    description: 'Needed to record your side of a meeting.',
+  },
+  {
+    key: 'screenRecording',
+    pane: 'ScreenCapture',
+    label: 'Screen Recording',
+    description: "Needed to capture other participants' audio. Without it, meetings still record mic-only.",
+  },
+  {
+    key: 'accessibility',
+    pane: 'Accessibility',
+    label: 'Accessibility',
+    description: 'Needed for dictation to insert text into other apps.',
+  },
+] as const satisfies ReadonlyArray<{
+  key: keyof PermissionsSnapshot;
+  pane: 'Microphone' | 'ScreenCapture' | 'Accessibility';
+  label: string;
+  description: string;
+}>;
 
 export interface LiveNudgeEvent {
   id: string;

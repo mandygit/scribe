@@ -4,12 +4,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::domain::{
-    AnalyzerProvider, AppError, MeetingId, MetricId, PracticeAnnotationId, PracticeRecordingId,
-    PracticeReviewReportId, ProcessingStage, ReportId, ResonanceSettings, Score, SegmentId,
-    SummaryId,
+    AnalyzerProvider, AppError, DictationSessionId, MeetingId, MetricId, PracticeAnnotationId,
+    PracticeRecordingId, PracticeReviewReportId, ProcessingStage, ReportId, ResonanceSettings,
+    Score, SegmentId, SummarizerProvider, SummaryId,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 15;
 const SETTINGS_ID: &str = "default";
 const VOICE_PROFILE_ID: &str = "default";
 
@@ -38,6 +38,43 @@ pub struct MeetingRecord {
     pub stopped_at_ms: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// Data needed to create a dictation session summary row. Deliberately carries no
+/// transcript text — only counts and timing, since dictation may include
+/// sensitive content the user never asked to have logged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateDictationSession {
+    pub id: DictationSessionId,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub duration_ms: u64,
+    pub word_count: u32,
+    pub words_per_minute: f64,
+    pub created_at_ms: u64,
+}
+
+/// Persisted dictation session summary returned by repository reads.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationSessionRecord {
+    pub id: DictationSessionId,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub duration_ms: u64,
+    pub word_count: u32,
+    pub words_per_minute: f64,
+    pub created_at_ms: u64,
+}
+
+/// Aggregate dictation stats across all persisted sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationStatsSummary {
+    pub total_sessions: u32,
+    pub total_words: u64,
+    pub average_words_per_minute: f64,
+    pub total_duration_ms: u64,
 }
 
 /// Data needed to create a transcript segment row.
@@ -369,6 +406,102 @@ impl SqliteRepository {
                 read_meeting,
             )
             .optional()
+            .map_err(map_db_error)
+    }
+
+    /// Inserts a dictation session summary and returns the persisted row.
+    pub fn create_dictation_session(
+        &self,
+        session: &CreateDictationSession,
+    ) -> Result<DictationSessionRecord, AppError> {
+        self.connection
+            .execute(
+                "INSERT INTO dictation_sessions (
+                    id,
+                    started_at_ms,
+                    ended_at_ms,
+                    duration_ms,
+                    word_count,
+                    words_per_minute,
+                    created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    session.id.as_str(),
+                    to_db_i64(session.started_at_ms)?,
+                    to_db_i64(session.ended_at_ms)?,
+                    to_db_i64(session.duration_ms)?,
+                    session.word_count,
+                    session.words_per_minute,
+                    to_db_i64(session.created_at_ms)?,
+                ],
+            )
+            .map_err(map_db_error)?;
+
+        Ok(DictationSessionRecord {
+            id: session.id.clone(),
+            started_at_ms: session.started_at_ms,
+            ended_at_ms: session.ended_at_ms,
+            duration_ms: session.duration_ms,
+            word_count: session.word_count,
+            words_per_minute: session.words_per_minute,
+            created_at_ms: session.created_at_ms,
+        })
+    }
+
+    /// Lists dictation session summaries newest-first with bounded pagination.
+    pub fn list_dictation_sessions(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<DictationSessionRecord>, AppError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, started_at_ms, ended_at_ms, duration_ms, word_count, words_per_minute, created_at_ms
+                FROM dictation_sessions
+                ORDER BY started_at_ms DESC, id ASC
+                LIMIT ?1 OFFSET ?2",
+            )
+            .map_err(map_db_error)?;
+
+        let rows = statement
+            .query_map(
+                params![i64::from(limit), i64::from(offset)],
+                read_dictation_session,
+            )
+            .map_err(map_db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_db_error)
+    }
+
+    /// Returns aggregate dictation stats across all persisted sessions.
+    pub fn get_dictation_stats_summary(&self) -> Result<DictationStatsSummary, AppError> {
+        self.connection
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(word_count), 0),
+                    COALESCE(AVG(words_per_minute), 0.0),
+                    COALESCE(SUM(duration_ms), 0)
+                FROM dictation_sessions",
+                [],
+                |row| {
+                    Ok(DictationStatsSummary {
+                        total_sessions: row.get::<_, i64>(0)? as u32,
+                        total_words: row.get::<_, i64>(1)? as u64,
+                        average_words_per_minute: row.get(2)?,
+                        total_duration_ms: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .map_err(map_db_error)
+    }
+
+    /// Deletes a single dictation session summary row. No files on disk are
+    /// tied to a dictation session — it's stats-only.
+    pub fn delete_dictation_session(&self, id: &DictationSessionId) -> Result<bool, AppError> {
+        self.connection
+            .execute("DELETE FROM dictation_sessions WHERE id = ?1", params![id.as_str()])
+            .map(|deleted_rows| deleted_rows > 0)
             .map_err(map_db_error)
     }
 
@@ -1471,6 +1604,18 @@ impl SqliteRepository {
             .map_err(map_db_error)
     }
 
+    /// Deletes a meeting and, via `ON DELETE CASCADE` (enabled in
+    /// `configure_connection`), everything tied to it: transcript segments,
+    /// metrics, reports, audio metadata, pipeline failures, and summaries.
+    /// Does not touch audio files on disk — callers must delete those first,
+    /// since this row is the only record of their paths.
+    pub fn delete_meeting(&self, meeting_id: &MeetingId) -> Result<bool, AppError> {
+        self.connection
+            .execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id.as_str()])
+            .map(|deleted_rows| deleted_rows > 0)
+            .map_err(map_db_error)
+    }
+
     /// Inserts or replaces the singleton local voice profile.
     pub fn upsert_voice_profile(
         &self,
@@ -1572,7 +1717,11 @@ impl SqliteRepository {
                     speaker_embedding_model_path,
                     speaker_segmentation_model_path,
                     dictation_hotkey,
-                    dictation_polish_enabled
+                    dictation_polish_enabled,
+                    summarizer_provider,
+                    summarizer_host,
+                    summarizer_port,
+                    summarizer_model
                 FROM settings
                 WHERE id = ?1",
                 params![SETTINGS_ID],
@@ -1607,8 +1756,12 @@ impl SqliteRepository {
                     speaker_segmentation_model_path,
                     dictation_hotkey,
                     dictation_polish_enabled,
+                    summarizer_provider,
+                    summarizer_host,
+                    summarizer_port,
+                    summarizer_model,
                     updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                 ON CONFLICT(id) DO UPDATE SET
                     microphone_device_id = excluded.microphone_device_id,
                     enable_system_audio = excluded.enable_system_audio,
@@ -1624,6 +1777,10 @@ impl SqliteRepository {
                     speaker_segmentation_model_path = excluded.speaker_segmentation_model_path,
                     dictation_hotkey = excluded.dictation_hotkey,
                     dictation_polish_enabled = excluded.dictation_polish_enabled,
+                    summarizer_provider = excluded.summarizer_provider,
+                    summarizer_host = excluded.summarizer_host,
+                    summarizer_port = excluded.summarizer_port,
+                    summarizer_model = excluded.summarizer_model,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     SETTINGS_ID,
@@ -1641,6 +1798,10 @@ impl SqliteRepository {
                     settings.speaker_segmentation_model_path.as_deref(),
                     settings.dictation_hotkey.as_str(),
                     bool_to_db(settings.dictation_polish_enabled),
+                    summarizer_provider_to_db(settings.summarizer_provider),
+                    settings.summarizer_host.as_str(),
+                    i64::from(settings.summarizer_port),
+                    settings.summarizer_model.as_deref(),
                     to_db_i64(updated_at_ms)?,
                 ],
             )
@@ -1781,6 +1942,10 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 speaker_segmentation_model_path TEXT,
                 dictation_hotkey TEXT NOT NULL DEFAULT 'cmd+shift+d',
                 dictation_polish_enabled INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1)),
+                summarizer_provider TEXT NOT NULL DEFAULT 'lm_studio',
+                summarizer_host TEXT NOT NULL DEFAULT '127.0.0.1',
+                summarizer_port INTEGER NOT NULL DEFAULT 1234,
+                summarizer_model TEXT,
                 updated_at_ms INTEGER NOT NULL
             );
 
@@ -1831,6 +1996,17 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 FOREIGN KEY (practice_recording_id) REFERENCES practice_recordings(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS dictation_sessions (
+                id TEXT PRIMARY KEY,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                word_count INTEGER NOT NULL,
+                words_per_minute REAL NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                CHECK (ended_at_ms >= started_at_ms)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_meetings_recent
                 ON meetings(updated_at_ms DESC, started_at_ms DESC, id ASC);
             CREATE INDEX IF NOT EXISTS idx_transcript_segments_meeting
@@ -1847,6 +2023,8 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 ON practice_recordings(updated_at_ms DESC, recorded_at_ms DESC, id ASC);
             CREATE INDEX IF NOT EXISTS idx_practice_annotations_recording
                 ON practice_timeline_annotations(practice_recording_id, started_at_ms ASC);
+            CREATE INDEX IF NOT EXISTS idx_dictation_sessions_recent
+                ON dictation_sessions(started_at_ms DESC, id ASC);
 
             INSERT OR IGNORE INTO schema_versions(version) VALUES (1);
             ",
@@ -1920,6 +2098,22 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         "dictation_polish_enabled",
         "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))",
     )?;
+    ensure_settings_column(
+        connection,
+        "summarizer_provider",
+        "TEXT NOT NULL DEFAULT 'lm_studio'",
+    )?;
+    ensure_settings_column(
+        connection,
+        "summarizer_host",
+        "TEXT NOT NULL DEFAULT '127.0.0.1'",
+    )?;
+    ensure_settings_column(
+        connection,
+        "summarizer_port",
+        "INTEGER NOT NULL DEFAULT 1234",
+    )?;
+    ensure_settings_column(connection, "summarizer_model", "TEXT")?;
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (2)",
@@ -1989,6 +2183,18 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (13)",
+            [],
+        )
+        .map_err(map_db_error)?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO schema_versions(version) VALUES (14)",
+            [],
+        )
+        .map_err(map_db_error)?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO schema_versions(version) VALUES (15)",
             [],
         )
         .map_err(map_db_error)?;
@@ -2077,7 +2283,10 @@ fn validate_migration_column_type(column_type: &str) -> Result<(), AppError> {
         | "INTEGER NOT NULL DEFAULT 1 CHECK (enable_system_audio IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 1 CHECK (enable_echo_cancellation IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 0 CHECK (cloud_video_review_enabled IN (0, 1))"
-        | "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))" => Ok(()),
+        | "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))"
+        | "TEXT NOT NULL DEFAULT 'lm_studio'"
+        | "TEXT NOT NULL DEFAULT '127.0.0.1'"
+        | "INTEGER NOT NULL DEFAULT 1234" => Ok(()),
         _ => Err(invalid_migration_sql("column_type")),
     }
 }
@@ -2098,6 +2307,18 @@ fn read_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingRecord> {
         stopped_at_ms: optional_from_db_u64(row.get(3)?)?,
         created_at_ms: from_db_u64(row.get(4)?)?,
         updated_at_ms: from_db_u64(row.get(5)?)?,
+    })
+}
+
+fn read_dictation_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictationSessionRecord> {
+    Ok(DictationSessionRecord {
+        id: DictationSessionId::new(row.get::<_, String>(0)?),
+        started_at_ms: from_db_u64(row.get(1)?)?,
+        ended_at_ms: from_db_u64(row.get(2)?)?,
+        duration_ms: from_db_u64(row.get(3)?)?,
+        word_count: from_db_u32(row.get(4)?, 4)?,
+        words_per_minute: row.get(5)?,
+        created_at_ms: from_db_u64(row.get(6)?)?,
     })
 }
 
@@ -2380,6 +2601,10 @@ fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResonanceSettings>
         speaker_segmentation_model_path: row.get(11)?,
         dictation_hotkey: row.get(12)?,
         dictation_polish_enabled: db_to_bool(row.get(13)?, 13)?,
+        summarizer_provider: summarizer_provider_from_db(row.get::<_, String>(14)?, 14)?,
+        summarizer_host: row.get(15)?,
+        summarizer_port: from_db_u16(row.get(16)?, 16)?,
+        summarizer_model: row.get(17)?,
     })
 }
 
@@ -2432,6 +2657,16 @@ fn optional_from_db_u64(value: Option<i64>) -> rusqlite::Result<Option<u64>> {
 
 fn from_db_u32(value: i64, column: usize) -> rusqlite::Result<u32> {
     u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn from_db_u16(value: i64, column: usize) -> rusqlite::Result<u16> {
+    u16::try_from(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             column,
             rusqlite::types::Type::Integer,
@@ -2499,6 +2734,27 @@ fn analyzer_provider_from_db(value: String, column: usize) -> rusqlite::Result<A
             column,
             rusqlite::types::Type::Text,
             format!("unknown analyzer provider: {value}").into(),
+        )),
+    }
+}
+
+fn summarizer_provider_to_db(provider: SummarizerProvider) -> &'static str {
+    match provider {
+        SummarizerProvider::LmStudio => "lm_studio",
+        SummarizerProvider::Ollama => "ollama",
+        SummarizerProvider::Custom => "custom",
+    }
+}
+
+fn summarizer_provider_from_db(value: String, column: usize) -> rusqlite::Result<SummarizerProvider> {
+    match value.as_str() {
+        "lm_studio" => Ok(SummarizerProvider::LmStudio),
+        "ollama" => Ok(SummarizerProvider::Ollama),
+        "custom" => Ok(SummarizerProvider::Custom),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            format!("unknown summarizer provider: {value}").into(),
         )),
     }
 }
@@ -2788,6 +3044,67 @@ mod tests {
                 MeetingId::new("meeting-older"),
             ]
         );
+    }
+
+    #[test]
+    fn delete_meeting_cascades_to_related_rows() {
+        let test_repository = repository();
+        let meeting = create_test_meeting(&test_repository.repository, "meeting-to-delete");
+
+        test_repository
+            .repository
+            .create_transcript_segments(&[CreateTranscriptSegment {
+                id: SegmentId::new("segment-1"),
+                meeting_id: meeting.id.clone(),
+                sequence_number: 0,
+                speaker_label: None,
+                text: "Hello".to_string(),
+                started_at_ms: 0,
+                ended_at_ms: 500,
+                created_at_ms: 500,
+            }])
+            .expect("segment can be created");
+        test_repository
+            .repository
+            .create_metric(&CreateMetric {
+                id: MetricId::new("metric-1"),
+                meeting_id: meeting.id.clone(),
+                name: "word_count".to_string(),
+                value: 10.0,
+                unit: None,
+                created_at_ms: 500,
+            })
+            .expect("metric can be created");
+
+        let deleted = test_repository
+            .repository
+            .delete_meeting(&meeting.id)
+            .expect("meeting can be deleted");
+        assert!(deleted);
+
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting(&meeting.id)
+                .expect("meeting lookup succeeds"),
+            None
+        );
+        assert!(test_repository
+            .repository
+            .list_transcript_segments(&meeting.id)
+            .expect("segments lookup succeeds")
+            .is_empty());
+        assert!(test_repository
+            .repository
+            .list_metrics(&meeting.id)
+            .expect("metrics lookup succeeds")
+            .is_empty());
+
+        let deleted_again = test_repository
+            .repository
+            .delete_meeting(&meeting.id)
+            .expect("deleting a missing meeting does not error");
+        assert!(!deleted_again);
     }
 
     #[test]
@@ -3271,6 +3588,10 @@ mod tests {
             speaker_segmentation_model_path: Some("/models/segmentation.onnx".to_string()),
             dictation_hotkey: "ctrl+option+d".to_string(),
             dictation_polish_enabled: true,
+            summarizer_provider: SummarizerProvider::Ollama,
+            summarizer_host: "127.0.0.1".to_string(),
+            summarizer_port: 11434,
+            summarizer_model: Some("llama3.2".to_string()),
         };
         let updated_settings = ResonanceSettings {
             microphone_device_id: Some("microphone-2".to_string()),
@@ -3287,6 +3608,10 @@ mod tests {
             speaker_segmentation_model_path: Some("/models/segmentation-v2.onnx".to_string()),
             dictation_hotkey: "cmd+shift+space".to_string(),
             dictation_polish_enabled: false,
+            summarizer_provider: SummarizerProvider::Custom,
+            summarizer_host: "192.168.1.50".to_string(),
+            summarizer_port: 8080,
+            summarizer_model: Some("custom-model".to_string()),
         };
 
         test_repository
@@ -3646,6 +3971,140 @@ mod tests {
             .expect_err("missing meeting cannot be marked stopped");
 
         assert_eq!(missing.code, "meeting_not_found");
+    }
+
+    #[test]
+    fn dictation_session_can_be_created_and_listed() {
+        let test_repository = repository();
+
+        let first = test_repository
+            .repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-1"),
+                started_at_ms: 1_000,
+                ended_at_ms: 4_000,
+                duration_ms: 3_000,
+                word_count: 6,
+                words_per_minute: 120.0,
+                created_at_ms: 4_000,
+            })
+            .expect("first session can be created");
+        assert_eq!(first.word_count, 6);
+
+        let second = test_repository
+            .repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-2"),
+                started_at_ms: 5_000,
+                ended_at_ms: 6_000,
+                duration_ms: 1_000,
+                word_count: 2,
+                words_per_minute: 120.0,
+                created_at_ms: 6_000,
+            })
+            .expect("second session can be created");
+
+        let sessions = test_repository
+            .repository
+            .list_dictation_sessions(10, 0)
+            .expect("sessions can be listed");
+        assert_eq!(sessions, vec![second, first]);
+    }
+
+    #[test]
+    fn delete_dictation_session_removes_only_that_row() {
+        let test_repository = repository();
+        test_repository
+            .repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-keep"),
+                started_at_ms: 1_000,
+                ended_at_ms: 2_000,
+                duration_ms: 1_000,
+                word_count: 3,
+                words_per_minute: 90.0,
+                created_at_ms: 2_000,
+            })
+            .expect("first session can be created");
+        test_repository
+            .repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-remove"),
+                started_at_ms: 3_000,
+                ended_at_ms: 4_000,
+                duration_ms: 1_000,
+                word_count: 5,
+                words_per_minute: 150.0,
+                created_at_ms: 4_000,
+            })
+            .expect("second session can be created");
+
+        let deleted = test_repository
+            .repository
+            .delete_dictation_session(&DictationSessionId::new("dictation-remove"))
+            .expect("session can be deleted");
+        assert!(deleted);
+
+        let remaining = test_repository
+            .repository
+            .list_dictation_sessions(10, 0)
+            .expect("sessions can be listed");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, DictationSessionId::new("dictation-keep"));
+
+        let deleted_again = test_repository
+            .repository
+            .delete_dictation_session(&DictationSessionId::new("dictation-remove"))
+            .expect("deleting a missing session does not error");
+        assert!(!deleted_again);
+    }
+
+    #[test]
+    fn dictation_stats_summary_aggregates_sessions() {
+        let test_repository = repository();
+
+        let empty = test_repository
+            .repository
+            .get_dictation_stats_summary()
+            .expect("empty summary can be read");
+        assert_eq!(empty.total_sessions, 0);
+        assert_eq!(empty.total_words, 0);
+        assert_eq!(empty.average_words_per_minute, 0.0);
+        assert_eq!(empty.total_duration_ms, 0);
+
+        test_repository
+            .repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-1"),
+                started_at_ms: 1_000,
+                ended_at_ms: 4_000,
+                duration_ms: 3_000,
+                word_count: 6,
+                words_per_minute: 100.0,
+                created_at_ms: 4_000,
+            })
+            .expect("first session can be created");
+        test_repository
+            .repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-2"),
+                started_at_ms: 5_000,
+                ended_at_ms: 7_000,
+                duration_ms: 2_000,
+                word_count: 4,
+                words_per_minute: 140.0,
+                created_at_ms: 7_000,
+            })
+            .expect("second session can be created");
+
+        let summary = test_repository
+            .repository
+            .get_dictation_stats_summary()
+            .expect("summary can be read");
+        assert_eq!(summary.total_sessions, 2);
+        assert_eq!(summary.total_words, 10);
+        assert_eq!(summary.average_words_per_minute, 120.0);
+        assert_eq!(summary.total_duration_ms, 5_000);
     }
 
     fn repository() -> TestRepository {

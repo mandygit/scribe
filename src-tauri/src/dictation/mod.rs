@@ -12,9 +12,12 @@ pub mod capture;
 pub mod hotkey;
 pub mod inject;
 
-pub use capture::{new_dictation_wav_path, transcribe_clip, DictationRecorder};
+pub use capture::{
+    new_dictation_session_id, new_dictation_wav_path, session_stats, transcribe_clip,
+    DictationRecorder,
+};
 pub use hotkey::{DictationHotkey, HotkeyAction};
-pub use inject::inject_text;
+pub use inject::{inject_text, probe_accessibility};
 
 fn polish_helper_unavailable() -> AppError {
     AppError {

@@ -166,6 +166,16 @@ struct SystemAudioCapture {
     }
 
     private static func run() async throws {
+        // Read-only status check for onboarding: never calls
+        // CGRequestScreenCaptureAccess(), which triggers the system prompt
+        // and returns immediately (before the user answers it) -- calling it
+        // on every silent background check made Scribe re-prompt on every
+        // launch regardless of the user's previous answer. This mode is safe
+        // to run unconditionally and automatically.
+        if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--check-only" {
+            exit(CGPreflightScreenCaptureAccess() ? EXIT_SUCCESS : EXIT_FAILURE)
+        }
+
         guard CommandLine.arguments.count == 2 else {
             throw SystemAudioCaptureError.missingOutputPath
         }

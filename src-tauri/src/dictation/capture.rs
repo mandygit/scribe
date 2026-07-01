@@ -13,6 +13,10 @@ use crate::transcription::{Transcriber, TranscriptionOutput};
 /// within the same millisecond.
 static DICTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic suffix so back-to-back dictation session summary rows never collide
+/// on id even within the same millisecond.
+static DICTATION_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// Builds a unique temporary WAV path for a single dictation clip. The clip is
 /// short-lived: it is transcribed and then deleted, so the system temp dir is the
 /// right home for it.
@@ -20,6 +24,13 @@ pub fn new_dictation_wav_path() -> Result<PathBuf, AppError> {
     let sequence = DICTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stamp = current_time_ms()?;
     Ok(std::env::temp_dir().join(format!("scribe-dictation-{stamp}-{sequence}.wav")))
+}
+
+/// Builds a unique id for a persisted dictation session summary row.
+pub fn new_dictation_session_id() -> Result<String, AppError> {
+    let sequence = DICTATION_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stamp = current_time_ms()?;
+    Ok(format!("dictation-session-{stamp}-{sequence}"))
 }
 
 /// Holds an in-flight push-to-talk microphone capture. Only one dictation can be
@@ -57,16 +68,33 @@ impl<B: AudioCaptureBackend> DictationRecorder<B> {
         Ok(())
     }
 
-    /// Stops the in-flight capture and returns the path to the recorded WAV.
-    /// Errors if no dictation is in flight.
-    pub fn finish(&mut self) -> Result<PathBuf, AppError> {
+    /// Stops the in-flight capture and returns the path to the recorded WAV
+    /// along with when the capture started, so callers can measure session
+    /// duration. Errors if no dictation is in flight.
+    pub fn finish(&mut self) -> Result<(PathBuf, u64), AppError> {
         let capture = self.active.take().ok_or_else(dictation_not_recording)?;
         let ActiveCapture {
-            file_path, handle, ..
+            file_path,
+            started_at_ms,
+            handle,
+            ..
         } = capture;
         handle.stop()?;
-        Ok(file_path)
+        Ok((file_path, started_at_ms))
     }
+}
+
+/// Computes word count and words-per-minute for a finished dictation, given the
+/// final (possibly polished) text and how long the capture ran.
+pub fn session_stats(text: &str, duration_ms: u64) -> (u32, f64) {
+    let word_count = text.split_whitespace().count() as u32;
+    let minutes = duration_ms as f64 / 60_000.0;
+    let words_per_minute = if minutes > 0.0 {
+        word_count as f64 / minutes
+    } else {
+        0.0
+    };
+    (word_count, words_per_minute)
 }
 
 /// Transcribes a recorded dictation clip and flattens it into one insert-ready
@@ -169,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn start_then_finish_returns_the_capture_path() {
+    fn start_then_finish_returns_the_capture_path_and_start_time() {
         let mut recorder = DictationRecorder::new(StubBackend);
         assert!(!recorder.is_recording());
 
@@ -178,8 +206,9 @@ mod tests {
             .expect("start succeeds");
         assert!(recorder.is_recording());
 
-        let path = recorder.finish().expect("finish succeeds");
+        let (path, started_at_ms) = recorder.finish().expect("finish succeeds");
         assert_eq!(path, PathBuf::from("/tmp/scribe-dictation-test.wav"));
+        assert_eq!(started_at_ms, 0);
         assert!(!recorder.is_recording());
     }
 
@@ -241,5 +270,33 @@ mod tests {
         let first = new_dictation_wav_path().expect("first path");
         let second = new_dictation_wav_path().expect("second path");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn distinct_session_ids_do_not_collide() {
+        let first = new_dictation_session_id().expect("first id");
+        let second = new_dictation_session_id().expect("second id");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn session_stats_counts_words_and_computes_wpm() {
+        let (word_count, wpm) = session_stats("Send the deck to the team", 30_000);
+        assert_eq!(word_count, 6);
+        assert!((wpm - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn session_stats_handles_empty_text() {
+        let (word_count, wpm) = session_stats("   ", 5_000);
+        assert_eq!(word_count, 0);
+        assert_eq!(wpm, 0.0);
+    }
+
+    #[test]
+    fn session_stats_guards_zero_duration() {
+        let (word_count, wpm) = session_stats("hello world", 0);
+        assert_eq!(word_count, 2);
+        assert_eq!(wpm, 0.0);
     }
 }

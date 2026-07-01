@@ -19,6 +19,11 @@ struct ActiveRecording {
     meeting_id: String,
     capture: ActiveCapture,
     system_capture: Option<ActiveSystemAudioCapture>,
+    /// Set when system audio was requested but couldn't start (e.g. Screen
+    /// Recording permission denied), so the reason still reaches
+    /// `RecordingMetadata.system_audio_stream_error` at stop time even though
+    /// there was never a live capture to summarize.
+    system_capture_start_error: Option<String>,
 }
 
 impl<B: AudioCaptureBackend, S: SystemAudioCaptureBackend> RecordingManager<B, S> {
@@ -32,6 +37,12 @@ impl<B: AudioCaptureBackend, S: SystemAudioCaptureBackend> RecordingManager<B, S
 
     pub fn is_recording(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// The meeting id currently being recorded, if any — used to block
+    /// deleting a meeting while its audio is still being written.
+    pub fn active_meeting_id(&self) -> Option<&str> {
+        self.active.as_ref().map(|active| active.meeting_id.as_str())
     }
 
     pub fn list_audio_devices(&self) -> Result<Vec<AudioDevice>, AppError> {
@@ -53,10 +64,18 @@ impl<B: AudioCaptureBackend, S: SystemAudioCaptureBackend> RecordingManager<B, S
             ));
         }
 
-        let system_capture = system_audio_file_path
+        // A denied Screen Recording permission (or any other system-audio start
+        // failure) must not block the meeting recording itself: fall back to
+        // mic-only rather than propagating the error, same as any other app
+        // would degrade gracefully instead of refusing to record at all.
+        let (system_capture, system_capture_start_error) = match system_audio_file_path
             .clone()
             .map(|path| self.system_backend.start_capture(path))
-            .transpose()?;
+        {
+            Some(Ok(capture)) => (Some(capture), None),
+            Some(Err(error)) => (None, Some(error.message)),
+            None => (None, None),
+        };
         let capture = match self.backend.start_recording(file_path, device_id) {
             Ok(capture) => capture,
             Err(error) => {
@@ -79,6 +98,7 @@ impl<B: AudioCaptureBackend, S: SystemAudioCaptureBackend> RecordingManager<B, S
             meeting_id,
             capture,
             system_capture,
+            system_capture_start_error,
         });
 
         Ok(started)
@@ -95,6 +115,7 @@ impl<B: AudioCaptureBackend, S: SystemAudioCaptureBackend> RecordingManager<B, S
         let file_path = active.capture.file_path.clone();
         let started_at_ms = active.capture.started_at_ms;
         let sample_rate_hz = active.capture.sample_rate_hz;
+        let system_capture_start_error = active.system_capture_start_error;
         let summary = active.capture.handle.stop()?;
         let system_summary = active.system_capture.map(|capture| {
             let file_path = capture.file_path.clone();
@@ -141,7 +162,9 @@ impl<B: AudioCaptureBackend, S: SystemAudioCaptureBackend> RecordingManager<B, S
             stopped_at_ms,
             dropped_sample_count: summary.dropped_sample_count,
             stream_error: summary.stream_error,
-            system_audio_stream_error: system_summary.and_then(|(_, _, stream_error)| stream_error),
+            system_audio_stream_error: system_summary
+                .and_then(|(_, _, stream_error)| stream_error)
+                .or(system_capture_start_error),
         })
     }
 }
@@ -168,6 +191,9 @@ mod tests {
     struct FakeSystemBackend;
 
     struct FailingBackend;
+
+    #[derive(Default)]
+    struct FailingSystemBackend;
 
     struct CountingSystemBackend {
         stopped_count: Arc<AtomicU64>,
@@ -206,6 +232,16 @@ mod tests {
                 sample_rate_hz: 48_000,
                 handle: Box::new(FakeSystemSession),
             })
+        }
+    }
+
+    impl SystemAudioCaptureBackend for FailingSystemBackend {
+        fn start_capture(&self, _file_path: PathBuf) -> Result<ActiveSystemAudioCapture, AppError> {
+            Err(audio_error(
+                "system_audio_capture_start_failed",
+                "Screen Recording permission was denied.",
+                None,
+            ))
         }
     }
 
@@ -353,5 +389,39 @@ mod tests {
         assert_eq!(error.code, "fake_microphone_failed");
         assert_eq!(stopped_count.load(Ordering::Relaxed), 1);
         assert!(!manager.is_recording());
+    }
+
+    #[test]
+    fn recording_falls_back_to_mic_only_when_system_audio_capture_fails() {
+        let base = std::env::current_dir()
+            .expect("current dir exists")
+            .join("target/test-data/manager-mic-only-fallback");
+        std::fs::create_dir_all(&base).expect("test directory can be created");
+        let mut manager = RecordingManager::new(
+            FakeBackend {
+                starts: Mutex::new(0),
+            },
+            FailingSystemBackend,
+        );
+
+        let started = manager
+            .start_recording(
+                "meeting-fallback".to_string(),
+                base.join("meeting-fallback.wav"),
+                Some(base.join("meeting-fallback.system.m4a")),
+                None,
+            )
+            .expect("mic-only recording still starts when system audio capture fails");
+        assert_eq!(started.system_audio_file_path, None);
+        assert!(manager.is_recording());
+
+        let metadata = manager
+            .stop_recording(260)
+            .expect("mic-only recording can stop");
+        assert_eq!(metadata.system_audio_file_path, None);
+        assert_eq!(metadata.system_audio_stream_error.as_deref(), Some("Screen Recording permission was denied."));
+        // The microphone track itself is unaffected by the system-audio failure.
+        assert_eq!(metadata.duration_ms, 250);
+        assert_eq!(metadata.stream_error, None);
     }
 }

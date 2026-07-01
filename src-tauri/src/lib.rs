@@ -14,20 +14,24 @@ use audio::{
 };
 use dictation::{DictationHotkey, DictationRecorder, HotkeyAction};
 use domain::{
-    AnalyzerProvider, AppError, MeetingId, MeetingLifecycleState, ProcessingStage, ReportId,
-    ResonanceSettings,
+    AnalyzerProvider, AppError, DictationSessionId, MeetingId, MeetingLifecycleState,
+    ProcessingStage, ReportId, ResonanceSettings, SummarizerProvider,
 };
 use nudges::{
     LiveNudgeEvent, LiveNudgePipeline, NudgeEventSink, NudgeTranscriptEventSink, LIVE_NUDGE_EVENT,
 };
 use path_detection::hydrate_settings_with_local_defaults;
 use persistence::{
-    AudioMetadata, CreateMeeting, CreateMetric, CreatePipelineFailure, CreateTranscriptSegment,
-    MeetingHistoryRecord, MeetingTrendRecord, MetricRecord, PipelineFailureRecord, SqliteRepository,
+    AudioMetadata, CreateDictationSession, CreateMeeting, CreateMetric, CreatePipelineFailure,
+    CreateTranscriptSegment, DictationSessionRecord, DictationStatsSummary, MeetingHistoryRecord,
+    MeetingTrendRecord, MetricRecord, PipelineFailureRecord, SqliteRepository,
 };
 use rules::{MetricsSummary, RuleTranscriptSegment};
 use serde::Serialize;
-use summarizer::{LmStudioClient, LmStudioLifecycle, LmStudioSummarizer, DEFAULT_SUMMARIZER_MODEL};
+use summarizer::{
+    list_models as list_summarizer_models_impl, LmStudioClient, LmStudioLifecycle, LmStudioSummarizer,
+    OpenAiCompatibleClient, DEFAULT_SUMMARIZER_MODEL,
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 use transcription::{
     TranscriptEventSink, TranscriptSegment, TranscriptStreamEvent, TranscriptStreamSummary,
@@ -42,6 +46,7 @@ pub mod domain;
 pub mod media_import;
 pub mod nudges;
 pub mod path_detection;
+pub mod permissions;
 pub mod persistence;
 pub mod rules;
 pub mod summarizer;
@@ -164,6 +169,13 @@ pub struct PrivacySettingsUpdateResult {
     cleanup: RetentionCleanupSummary,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationSessionPage {
+    items: Vec<DictationSessionRecord>,
+    next_offset: Option<u32>,
+}
+
 const DEFAULT_HISTORY_LIMIT: u32 = 10;
 const MAX_HISTORY_LIMIT: u32 = 50;
 const HISTORY_DETAIL_TRANSCRIPT_LIMIT: u32 = 200;
@@ -217,6 +229,46 @@ fn list_meeting_history(
             None
         },
     })
+}
+
+#[tauri::command]
+fn list_dictation_sessions(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<DictationSessionPage, AppError> {
+    let requested_limit = limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let offset_value = offset.unwrap_or(0);
+    let fetch_limit = requested_limit + 1;
+    let mut rows = state
+        .repository
+        .lock()
+        .map_err(map_lock_error)?
+        .list_dictation_sessions(fetch_limit, offset_value)?;
+    let has_more = rows.len() > requested_limit as usize;
+    rows.truncate(requested_limit as usize);
+
+    Ok(DictationSessionPage {
+        items: rows,
+        next_offset: if has_more {
+            offset_value.checked_add(requested_limit)
+        } else {
+            None
+        },
+    })
+}
+
+#[tauri::command]
+fn get_dictation_stats_summary(
+    state: State<'_, AppState>,
+) -> Result<DictationStatsSummary, AppError> {
+    state
+        .repository
+        .lock()
+        .map_err(map_lock_error)?
+        .get_dictation_stats_summary()
 }
 
 #[tauri::command]
@@ -314,6 +366,50 @@ fn get_meeting_history_detail(
         system_audio_file_path,
         pipeline_failure,
     })
+}
+
+/// Deletes a meeting: its raw audio files on disk, then the DB row (which
+/// cascades to transcript segments, metrics, reports, and summaries). Refuses
+/// to delete the meeting currently being recorded, since its audio file is
+/// still being written.
+#[tauri::command]
+fn delete_meeting(app: AppHandle, state: State<'_, AppState>, meeting_id: String) -> Result<(), AppError> {
+    validate_recording_file_stem(&meeting_id)?;
+    let meeting_id_value = MeetingId::new(meeting_id.clone());
+
+    {
+        let recordings = state.recordings.lock().map_err(map_lock_error)?;
+        if recordings.active_meeting_id() == Some(meeting_id.as_str()) {
+            return Err(AppError {
+                code: "meeting_currently_recording".to_string(),
+                message: "Cannot delete a meeting while it is being recorded.".to_string(),
+                details: None,
+            });
+        }
+    }
+
+    let app_data_dir = app_data_dir(&app)?;
+    let repository = state.repository.lock().map_err(map_lock_error)?;
+
+    if let Some(metadata) = repository.get_audio_metadata(&meeting_id_value)? {
+        for file_path in retention_file_paths(&metadata) {
+            delete_retained_audio_file(&file_path, &app_data_dir)?;
+        }
+    }
+
+    repository.delete_meeting(&meeting_id_value)?;
+    Ok(())
+}
+
+/// Deletes a single dictation session summary row.
+#[tauri::command]
+fn delete_dictation_session(state: State<'_, AppState>, session_id: String) -> Result<(), AppError> {
+    state
+        .repository
+        .lock()
+        .map_err(map_lock_error)?
+        .delete_dictation_session(&DictationSessionId::new(session_id))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -478,21 +574,43 @@ async fn summarize_meeting(
         });
     }
 
-    let model = model
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_SUMMARIZER_MODEL.to_string());
+    let settings = {
+        let repository = state.repository.lock().map_err(map_lock_error)?;
+        load_effective_settings(&repository)?
+    };
+
+    let model = match model.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        Some(explicit) => explicit,
+        None => match settings.summarizer_model.clone() {
+            Some(configured) => configured,
+            None if matches!(settings.summarizer_provider, SummarizerProvider::LmStudio) => {
+                DEFAULT_SUMMARIZER_MODEL.to_string()
+            }
+            None => {
+                return Err(AppError {
+                    code: "summarizer_model_not_configured".to_string(),
+                    message: "Choose a local model in Settings before generating notes.".to_string(),
+                    details: None,
+                })
+            }
+        },
+    };
+
+    let provider = settings.summarizer_provider;
+    let host = settings.summarizer_host.clone();
+    let port = settings.summarizer_port;
 
     let generated_at_ms = current_time_ms()?;
     // Run the blocking model load + summary off the main thread so the webview
     // UI stays responsive (a synchronous command would freeze it for ~1 minute).
-    let summary_result = tauri::async_runtime::spawn_blocking(move || run_lm_studio_summary(segments, model))
-        .await
-        .map_err(|error| AppError {
-            code: "summary_task_failed".to_string(),
-            message: "The summarization task did not finish.".to_string(),
-            details: Some(error.to_string()),
-        })?;
+    let summary_result =
+        tauri::async_runtime::spawn_blocking(move || run_summary(provider, &host, port, segments, model))
+            .await
+            .map_err(|error| AppError {
+                code: "summary_task_failed".to_string(),
+                message: "The summarization task did not finish.".to_string(),
+                details: Some(error.to_string()),
+            })?;
     let summary = match summary_result {
         Ok(summary) => summary,
         Err(error) => {
@@ -537,8 +655,10 @@ fn begin_dictation(state: &AppState) -> Result<(), AppError> {
 /// Stops the in-flight capture and resolves the transcriber settings, returning
 /// the clip path and settings so the (blocking) transcription can run without
 /// holding any locks.
-fn stop_dictation_capture(state: &AppState) -> Result<(PathBuf, ResonanceSettings), AppError> {
-    let wav_path = {
+fn stop_dictation_capture(
+    state: &AppState,
+) -> Result<(PathBuf, ResonanceSettings, u64), AppError> {
+    let (wav_path, started_at_ms) = {
         let mut recorder = state.dictation.lock().map_err(map_lock_error)?;
         recorder.finish()?
     };
@@ -546,7 +666,60 @@ fn stop_dictation_capture(state: &AppState) -> Result<(PathBuf, ResonanceSetting
         let repository = state.repository.lock().map_err(map_lock_error)?;
         load_effective_settings(&repository)?
     };
-    Ok((wav_path, settings))
+    Ok((wav_path, settings, started_at_ms))
+}
+
+/// Shortest a dictation must run before its stats are worth persisting. Filters
+/// out accidental double-taps rather than real dictations.
+const MIN_DICTATION_DURATION_MS: u64 = 500;
+
+/// Computes word count and words-per-minute for a finished dictation and
+/// persists a stats-only summary row (never the transcript itself). Best-effort:
+/// logs and continues on failure so persistence can never disrupt the inject
+/// flow, and skips near-zero-duration captures that are likely stray taps.
+fn record_dictation_session(state: &AppState, started_at_ms: u64, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let ended_at_ms = match current_time_ms() {
+        Ok(ms) => ms,
+        Err(error) => {
+            eprintln!("dictation: could not timestamp session ({})", error.code);
+            return;
+        }
+    };
+    let duration_ms = ended_at_ms.saturating_sub(started_at_ms);
+    if duration_ms < MIN_DICTATION_DURATION_MS {
+        return;
+    }
+    let (word_count, words_per_minute) = dictation::session_stats(text, duration_ms);
+    let id = match dictation::new_dictation_session_id() {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("dictation: could not id session ({})", error.code);
+            return;
+        }
+    };
+    let record = CreateDictationSession {
+        id: DictationSessionId::new(id),
+        started_at_ms,
+        ended_at_ms,
+        duration_ms,
+        word_count,
+        words_per_minute,
+        created_at_ms: ended_at_ms,
+    };
+    let result = state
+        .repository
+        .lock()
+        .map_err(map_lock_error)
+        .and_then(|repository| repository.create_dictation_session(&record));
+    if let Err(error) = result {
+        eprintln!(
+            "dictation: could not save session stats ({})",
+            error.code
+        );
+    }
 }
 
 /// Transcribes a dictation clip and deletes the temporary WAV afterwards. Blocks,
@@ -572,7 +745,7 @@ fn start_dictation(state: State<'_, AppState>) -> Result<(), AppError> {
 /// thread, deletes the temporary WAV, and returns the raw transcript.
 #[tauri::command]
 async fn stop_dictation(state: State<'_, AppState>) -> Result<String, AppError> {
-    let (wav_path, settings) = stop_dictation_capture(&state)?;
+    let (wav_path, settings, _started_at_ms) = stop_dictation_capture(&state)?;
     tauri::async_runtime::spawn_blocking(move || transcribe_dictation_wav(&wav_path, &settings))
         .await
         .map_err(|error| AppError {
@@ -833,7 +1006,7 @@ fn stop_and_process_dictation(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let outcome = stop_dictation_capture(&state).and_then(|(wav_path, settings)| {
+        let outcome = stop_dictation_capture(&state).and_then(|(wav_path, settings, started_at_ms)| {
             let mut text = transcribe_dictation_wav(&wav_path, &settings)?;
             if settings.dictation_polish_enabled && !text.trim().is_empty() {
                 // Polish with Apple Intelligence, but fall back to the raw
@@ -847,6 +1020,7 @@ fn stop_and_process_dictation(app: &AppHandle) {
                     ),
                 }
             }
+            record_dictation_session(&state, started_at_ms, &text);
             // Before pasting, hand key focus back to the user's app: clicking the
             // pill can make it the key window (dropping the user's field as first
             // responder), so a synthesised Cmd+V would land nowhere. Hiding the
@@ -996,19 +1170,102 @@ fn update_dictation_settings(
     Ok(updated)
 }
 
-/// Runs the LM Studio summary lifecycle: start the server, load the model,
-/// summarize, then unload to free RAM regardless of the outcome.
-fn run_lm_studio_summary(
+/// Runs meeting summarization against whichever local model server the user
+/// configured. LM Studio gets the full lifecycle treatment (start the server,
+/// load the model, summarize, unload to free RAM) via its `lms` CLI; Ollama and
+/// Custom endpoints have no equivalent local start/load step, so they're
+/// expected to already be reachable and just get a direct chat-completion call.
+fn run_summary(
+    provider: SummarizerProvider,
+    host: &str,
+    port: u16,
     segments: Vec<AnalysisTranscriptSegment>,
     model: String,
 ) -> Result<MeetingSummary, AppError> {
-    let lifecycle = LmStudioLifecycle::resolve(None)?;
-    lifecycle.ensure_running()?;
-    lifecycle.load(&model)?;
-    let summarizer = LmStudioSummarizer::new(LmStudioClient::default(), model);
-    let result = summarizer.summarize(&segments, false);
-    lifecycle.unload_all();
-    result
+    match provider {
+        SummarizerProvider::LmStudio => {
+            let lifecycle = LmStudioLifecycle::resolve(None)?;
+            lifecycle.ensure_running()?;
+            lifecycle.load(&model)?;
+            let summarizer = LmStudioSummarizer::new(
+                LmStudioClient { host: host.to_string(), port },
+                model,
+            );
+            let result = summarizer.summarize(&segments, false);
+            lifecycle.unload_all();
+            result
+        }
+        SummarizerProvider::Ollama | SummarizerProvider::Custom => {
+            let summarizer = LmStudioSummarizer::new(
+                OpenAiCompatibleClient { host: host.to_string(), port },
+                model,
+            );
+            summarizer.summarize(&segments, false)
+        }
+    }
+}
+
+/// Persists which local model server to summarize meetings with.
+#[tauri::command]
+fn update_summarizer_settings(
+    state: State<'_, AppState>,
+    summarizer_provider: SummarizerProvider,
+    summarizer_host: String,
+    summarizer_port: u16,
+    summarizer_model: Option<String>,
+) -> Result<ResonanceSettings, AppError> {
+    let repository = state.repository.lock().map_err(map_lock_error)?;
+    let mut settings = repository.get_settings()?;
+    settings.summarizer_provider = summarizer_provider;
+    settings.summarizer_host = summarizer_host;
+    settings.summarizer_port = summarizer_port;
+    settings.summarizer_model = summarizer_model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    repository.upsert_settings(&settings, current_time_ms()?)?;
+    Ok(hydrate_settings_with_local_defaults(settings))
+}
+
+/// Lists model ids/names available on the given local model server, so
+/// Settings can offer a picker instead of asking the user to type a model
+/// name from memory. Errors (server unreachable, endpoint unsupported) are
+/// returned as-is for the frontend to surface inline.
+#[tauri::command]
+async fn list_summarizer_models(
+    summarizer_provider: SummarizerProvider,
+    summarizer_host: String,
+    summarizer_port: u16,
+) -> Result<Vec<String>, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        list_summarizer_models_impl(summarizer_provider, &summarizer_host, summarizer_port)
+    })
+    .await
+    .map_err(|error| AppError {
+        code: "summarizer_models_task_failed".to_string(),
+        message: "The model-listing task did not finish.".to_string(),
+        details: Some(error.to_string()),
+    })?
+}
+
+/// Runs all three onboarding permission probes off the main thread — each
+/// starts (and immediately discards) a short real capture or a read-only
+/// Accessibility query, so this genuinely takes a moment.
+#[tauri::command]
+async fn check_permissions() -> Result<permissions::PermissionsSnapshot, AppError> {
+    tauri::async_runtime::spawn_blocking(permissions::check_permissions)
+        .await
+        .map_err(|error| AppError {
+            code: "permissions_check_task_failed".to_string(),
+            message: "The permissions check did not finish.".to_string(),
+            details: Some(error.to_string()),
+        })
+}
+
+/// Deep-links to the given pane in System Settings > Privacy & Security, for
+/// permissions macOS won't re-prompt for after an explicit deny.
+#[tauri::command]
+fn open_permission_settings(pane: String) -> Result<(), AppError> {
+    permissions::open_system_settings_pane(&pane)
 }
 
 #[tauri::command]
@@ -1197,6 +1454,7 @@ pub fn run() {
             get_app_status,
             list_meeting_history,
             get_meeting_history_detail,
+            delete_meeting,
             list_meeting_trends,
             list_audio_devices,
             start_recording,
@@ -1206,10 +1464,17 @@ pub fn run() {
             summarize_meeting,
             start_dictation,
             stop_dictation,
+            list_dictation_sessions,
+            delete_dictation_session,
+            get_dictation_stats_summary,
             toggle_dictation,
             inject_dictation_text,
             polish_dictation,
             update_dictation_settings,
+            update_summarizer_settings,
+            list_summarizer_models,
+            check_permissions,
+            open_permission_settings,
             update_transcriber_settings,
             update_audio_processing_settings,
             update_privacy_settings,

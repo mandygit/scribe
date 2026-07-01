@@ -3,16 +3,20 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AppStatus,
   AudioDevice,
+  DictationSessionPage,
+  DictationStatsSummary,
   LiveNudgeEvent,
   MeetingHistoryDetail,
   MeetingHistoryPage,
   MeetingNotesResult,
   MeetingTrendsResult,
   MetricsCalculationResult,
+  PermissionsSnapshot,
   PrivacySettingsUpdateResult,
   RecordingMetadata,
   RecordingStarted,
   ResonanceSettings,
+  SummarizerProvider,
   TranscriptionResult,
   TranscriptStreamEvent,
   TranscriptStreamSummary,
@@ -28,6 +32,9 @@ export type DictationState = 'idle' | 'listening' | 'transcribing';
 export type {
   AppStatus,
   AudioDevice,
+  DictationSessionPage,
+  DictationSessionRecord,
+  DictationStatsSummary,
   LiveNudgeEvent,
   MeetingActionItem,
   MeetingHistoryDetail,
@@ -38,11 +45,13 @@ export type {
   MeetingTrendPoint,
   MeetingTrendsResult,
   MetricsCalculationResult,
+  PermissionsSnapshot,
   PipelineFailureRecord,
   PrivacySettingsUpdateResult,
   RecordingMetadata,
   RecordingStarted,
   ResonanceSettings,
+  SummarizerProvider,
   TranscriptionResult,
   TranscriptSegment,
   TranscriptStreamEvent,
@@ -96,8 +105,20 @@ export const listMeetingHistory = async (
 export const getMeetingHistoryDetail = async (meetingId: string): Promise<MeetingHistoryDetail> =>
   invokeNative<MeetingHistoryDetail>('get_meeting_history_detail', { meetingId });
 
+export const deleteMeeting = async (meetingId: string): Promise<void> =>
+  invokeNative<void>('delete_meeting', { meetingId });
+
 export const listMeetingTrends = async (limit: number): Promise<MeetingTrendsResult> =>
   invokeNative<MeetingTrendsResult>('list_meeting_trends', { limit });
+
+export const listDictationSessions = async (limit: number, offset: number): Promise<DictationSessionPage> =>
+  invokeNative<DictationSessionPage>('list_dictation_sessions', { limit, offset });
+
+export const getDictationStatsSummary = async (): Promise<DictationStatsSummary> =>
+  invokeNative<DictationStatsSummary>('get_dictation_stats_summary');
+
+export const deleteDictationSession = async (sessionId: string): Promise<void> =>
+  invokeNative<void>('delete_dictation_session', { sessionId });
 
 export const startRecording = async (meetingId: string, deviceId?: string): Promise<RecordingStarted> =>
   invokeNative<RecordingStarted>('start_recording', { meetingId, deviceId: deviceId ?? null });
@@ -148,6 +169,32 @@ export const updateDictationSettings = async (
   dictationPolishEnabled: boolean,
 ): Promise<ResonanceSettings> =>
   invokeNative<ResonanceSettings>('update_dictation_settings', { dictationHotkey, dictationPolishEnabled });
+
+export const updateSummarizerSettings = async (
+  summarizerProvider: SummarizerProvider,
+  summarizerHost: string,
+  summarizerPort: number,
+  summarizerModel: string | null,
+): Promise<ResonanceSettings> =>
+  invokeNative<ResonanceSettings>('update_summarizer_settings', {
+    summarizerProvider,
+    summarizerHost,
+    summarizerPort,
+    summarizerModel,
+  });
+
+export const listSummarizerModels = async (
+  summarizerProvider: SummarizerProvider,
+  summarizerHost: string,
+  summarizerPort: number,
+): Promise<string[]> =>
+  invokeNative<string[]>('list_summarizer_models', { summarizerProvider, summarizerHost, summarizerPort });
+
+export const checkPermissions = async (): Promise<PermissionsSnapshot> =>
+  invokeNative<PermissionsSnapshot>('check_permissions');
+
+export const openPermissionSettings = async (pane: 'Microphone' | 'ScreenCapture' | 'Accessibility'): Promise<void> =>
+  invokeNative<void>('open_permission_settings', { pane });
 
 export const sendCompletionNotification = async (title: string, body: string): Promise<void> =>
   invokeNative<void>('send_completion_notification', { title, body });

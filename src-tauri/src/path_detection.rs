@@ -89,18 +89,55 @@ fn find_binary_on_path(binary_name: &str) -> Option<PathBuf> {
 }
 
 fn detect_model_path(kind: ModelKind) -> Option<String> {
-    let mut candidates = spotlight_search(match kind {
-        ModelKind::Whisper => WHISPER_MODEL_QUERY,
-        ModelKind::SpeakerEmbedding => SPEAKER_EMBEDDING_QUERY,
-        ModelKind::SpeakerSegmentation => SPEAKER_SEGMENTATION_QUERY,
-    });
+    let roots = search_roots();
+    let mut candidates = spotlight_search(
+        match kind {
+            ModelKind::Whisper => WHISPER_MODEL_QUERY,
+            ModelKind::SpeakerEmbedding => SPEAKER_EMBEDDING_QUERY,
+            ModelKind::SpeakerSegmentation => SPEAKER_SEGMENTATION_QUERY,
+        },
+        &roots,
+    );
 
-    collect_candidates_from_common_dirs(&mut candidates, &kind);
+    collect_candidates_from_common_dirs(&mut candidates, &kind, &roots);
     dedupe_and_select_best(candidates, kind)
 }
 
-fn spotlight_search(query: &str) -> Vec<PathBuf> {
-    let Ok(output) = Command::new("mdfind").arg(query).output() else {
+/// Directories model auto-detection is allowed to look in: the current
+/// working directory plus a handful of common download/model locations under
+/// the user's home. Shared between [`spotlight_search`] (as `-onlyin` scopes)
+/// and the manual directory walk so both stay in sync and neither searches
+/// the whole disk — an unscoped `mdfind` query hits every Spotlight-indexed
+/// location, including Photos and Music libraries, which is why macOS was
+/// prompting for those permissions despite Scribe never touching them.
+fn search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = env::current_dir() {
+        roots.push(current_dir);
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        for suffix in ["models", "Downloads", "Documents", "Desktop", ".cache"] {
+            let root = home.join(suffix);
+            if root.is_dir() {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+fn spotlight_search(query: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+
+    let mut command = Command::new("mdfind");
+    for root in roots {
+        command.arg("-onlyin").arg(root);
+    }
+    command.arg(query);
+
+    let Ok(output) = command.output() else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -116,22 +153,9 @@ fn spotlight_search(query: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn collect_candidates_from_common_dirs(candidates: &mut Vec<PathBuf>, kind: &ModelKind) {
-    let mut roots = Vec::new();
-    if let Ok(current_dir) = env::current_dir() {
-        roots.push(current_dir);
-    }
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        for suffix in ["models", "Downloads", "Documents", "Desktop", ".cache"] {
-            let root = home.join(suffix);
-            if root.is_dir() {
-                roots.push(root);
-            }
-        }
-    }
-
+fn collect_candidates_from_common_dirs(candidates: &mut Vec<PathBuf>, kind: &ModelKind, roots: &[PathBuf]) {
     for root in roots {
-        collect_matching_files(&root, 5, kind, candidates);
+        collect_matching_files(root, 5, kind, candidates);
     }
 }
 
