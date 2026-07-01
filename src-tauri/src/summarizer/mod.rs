@@ -36,7 +36,8 @@ const MAP_SYSTEM: &str =
 Capture key points, decisions, and action items with owners and due dates when stated. \
 Plain text only, no preamble.";
 
-const SUMMARY_SCHEMA: &str = "{\"executiveSummary\":\"2-4 sentence overview\",\
+const SUMMARY_SCHEMA: &str = "{\"meetingTitle\":\"3-6 word descriptive title, no quotes or punctuation\",\
+\"executiveSummary\":\"2-4 sentence overview\",\
 \"actionItems\":[{\"owner\":\"person or null\",\"task\":\"specific action\",\"due\":\"date or null\"}],\
 \"decisions\":[\"decision\"],\"openQuestions\":[\"question\"],\"speakingImprovements\":[]}";
 
@@ -129,7 +130,8 @@ fn single_shot_prompt(transcript: &str) -> String {
     format!(
         "Summarize this meeting for someone who missed it.\n\
 Return exactly one strict JSON object matching this schema and no Markdown:\n{SUMMARY_SCHEMA}\n\
-Use null for an unknown owner or due date. Keep action item tasks concrete.\n\n\
+Use null for an unknown owner or due date. Keep action item tasks concrete.\n\
+meetingTitle should identify the meeting's actual subject (e.g. \"Q3 Budget Review\"), not a generic label like \"Meeting Notes\".\n\n\
 Transcript:\n{transcript}{NO_THINK_DIRECTIVE}"
     )
 }
@@ -144,7 +146,8 @@ fn reduce_prompt(digests: &str) -> String {
     format!(
         "Combine these section notes from one meeting into a single set of meeting notes.\n\
 Return exactly one strict JSON object matching this schema and no Markdown:\n{SUMMARY_SCHEMA}\n\
-Merge duplicates, use null for an unknown owner or due date, and keep tasks concrete.\n\n\
+Merge duplicates, use null for an unknown owner or due date, and keep tasks concrete.\n\
+meetingTitle should identify the meeting's actual subject (e.g. \"Q3 Budget Review\"), not a generic label like \"Meeting Notes\".\n\n\
 Section notes:\n{digests}{NO_THINK_DIRECTIVE}"
     )
 }
@@ -171,6 +174,7 @@ pub fn parse_summary(reply: &str) -> Result<MeetingSummary, AppError> {
 
 fn meeting_summary_from_value(value: &Value) -> MeetingSummary {
     MeetingSummary {
+        meeting_title: non_empty_string(value.get("meetingTitle")),
         executive_summary: value
             .get("executiveSummary")
             .and_then(Value::as_str)
@@ -556,6 +560,15 @@ mod tests {
         assert_eq!(summary.action_items.len(), 1);
         assert_eq!(summary.action_items[0].owner.as_deref(), Some("Dana"));
         assert_eq!(summary.decisions, vec!["Cut saved cards".to_string()]);
+    }
+
+    #[test]
+    fn extracts_meeting_title_when_present() {
+        let summary = parse_summary(
+            "{\"meetingTitle\":\"Q3 Budget Review\",\"executiveSummary\":\"We cut scope.\",\"actionItems\":[],\"decisions\":[],\"openQuestions\":[]}",
+        )
+        .expect("valid json parses");
+        assert_eq!(summary.meeting_title.as_deref(), Some("Q3 Budget Review"));
     }
 
     #[test]

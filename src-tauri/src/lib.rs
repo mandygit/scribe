@@ -404,6 +404,20 @@ fn delete_meeting(app: AppHandle, state: State<'_, AppState>, meeting_id: String
     Ok(())
 }
 
+/// Renames a meeting. An empty (or all-whitespace) title clears it, reverting
+/// the meeting to its date-based display name in the UI.
+#[tauri::command]
+fn update_meeting_title(state: State<'_, AppState>, meeting_id: String, title: String) -> Result<(), AppError> {
+    validate_recording_file_stem(&meeting_id)?;
+    let meeting_id_value = MeetingId::new(meeting_id);
+    let trimmed = title.trim();
+    let title_value = if trimmed.is_empty() { None } else { Some(trimmed) };
+
+    let repository = state.repository.lock().map_err(map_lock_error)?;
+    let updated_at_ms = current_time_ms()?;
+    repository.update_meeting_title(&meeting_id_value, title_value, updated_at_ms)
+}
+
 /// Deletes a single dictation session summary row.
 #[tauri::command]
 fn delete_dictation_session(state: State<'_, AppState>, session_id: String) -> Result<(), AppError> {
@@ -670,6 +684,9 @@ async fn summarize_meeting(
     {
         let repository = state.repository.lock().map_err(map_lock_error)?;
         repository.upsert_meeting_summary(&meeting_id_value, &body_json, generated_at_ms)?;
+        if let Some(title) = summary.meeting_title.as_deref() {
+            repository.set_meeting_title_if_absent(&meeting_id_value, title, generated_at_ms)?;
+        }
         clear_pipeline_failure_after_success(&repository, &meeting_id_value);
     }
 
@@ -1491,6 +1508,7 @@ pub fn run() {
             list_meeting_history,
             get_meeting_history_detail,
             delete_meeting,
+            update_meeting_title,
             list_meeting_trends,
             list_audio_devices,
             start_recording,

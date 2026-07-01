@@ -100,6 +100,11 @@ pub struct MeetingSummary {
     pub decisions: Vec<String>,
     pub open_questions: Vec<String>,
     pub speaking_improvements: Vec<SpeakingImprovement>,
+    /// Short model-suggested meeting title. Only used to fill in a meeting's
+    /// title when it doesn't already have one — see
+    /// `SqliteRepository::set_meeting_title_if_absent`.
+    #[serde(default)]
+    pub meeting_title: Option<String>,
 }
 
 /// One action item extracted from a downloaded meeting recording.
@@ -509,6 +514,7 @@ impl RawMeetingSummary {
         include_speaking_improvements: bool,
     ) -> Result<MeetingSummary, AppError> {
         Ok(MeetingSummary {
+            meeting_title: None,
             executive_summary: require_non_empty("executiveSummary", self.executive_summary)?,
             action_items: self
                 .action_items

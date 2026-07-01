@@ -36,6 +36,7 @@ import {
   updateAudioProcessingSettings,
   updateDictationSettings,
   updatePrivacySettings,
+  updateMeetingTitle,
   updateSummarizerSettings,
   updateTranscriberSettings,
 } from './tauri-commands';
@@ -208,6 +209,24 @@ export default function App() {
     },
     [refreshHistory, requestConfirm, selectedId],
   );
+
+  const handleRenameMeeting = useCallback(async (meetingId: string, title: string) => {
+    const normalized = title.trim() || null;
+    setError(null);
+    try {
+      await updateMeetingTitle(meetingId, title);
+      setHistory((current) =>
+        current.map((item) => (item.meetingId === meetingId ? { ...item, title: normalized } : item)),
+      );
+      setDetail((current) =>
+        current && current.meeting.meetingId === meetingId
+          ? { ...current, meeting: { ...current.meeting, title: normalized } }
+          : current,
+      );
+    } catch (cause) {
+      setError(messageFromUnknownError(cause, 'Could not rename this meeting.'));
+    }
+  }, []);
 
   const handleDeleteDictationSession = useCallback(
     (sessionId: string) => {
@@ -464,6 +483,7 @@ export default function App() {
               canSummarize={tauri}
               onSummarize={() => void handleSummarize(detail.meeting.meetingId)}
               onDelete={() => void handleDeleteMeeting(detail.meeting.meetingId)}
+              onRename={(title) => void handleRenameMeeting(detail.meeting.meetingId, title)}
             />
           ) : (
             <EmptyState recording={isRecording} />
@@ -501,6 +521,7 @@ const ICON_PATHS: Record<string, string> = {
   trash: 'M5 7h14M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m2 0-.8 12.2a2 2 0 0 1-2 1.8H7.8a2 2 0 0 1-2-1.8L5 7h14z',
   copy: 'M10 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2zM4 16V4a2 2 0 0 1 2-2h10',
   check: 'M5 12l5 5L19 7',
+  edit: 'M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z',
 };
 
 function Icon({ name, size = 16 }: { name: keyof typeof ICON_PATHS | string; size?: number }) {
@@ -782,6 +803,7 @@ function MeetingDetailView({
   canSummarize,
   onSummarize,
   onDelete,
+  onRename,
 }: {
   detail: MeetingHistoryDetail;
   processing: boolean;
@@ -789,11 +811,27 @@ function MeetingDetailView({
   canSummarize: boolean;
   onSummarize: () => void;
   onDelete: () => void;
+  onRename: (title: string) => void;
 }) {
   const { meeting, transcriptSegments, summary } = detail;
   const segmentCount = transcriptSegments.length;
   const hasTranscript = segmentCount > 0;
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(meetingTitle(meeting));
+
+  useEffect(() => {
+    if (!isEditingTitle) {
+      setTitleDraft(meetingTitle(meeting));
+    }
+  }, [meeting, isEditingTitle]);
+
+  const commitTitle = useCallback(() => {
+    setIsEditingTitle(false);
+    if (titleDraft.trim() !== (meeting.title ?? '').trim()) {
+      onRename(titleDraft);
+    }
+  }, [titleDraft, meeting.title, onRename]);
 
   const handleCopy = useCallback(async () => {
     if (!summary) return;
@@ -810,7 +848,39 @@ function MeetingDetailView({
     <div>
       <div className="meeting-header">
         <div>
-          <h1>{meetingTitle(meeting)}</h1>
+          {isEditingTitle ? (
+            <input
+              type="text"
+              className="meeting-title-input"
+              value={titleDraft}
+              autoFocus
+              onChange={(event) => setTitleDraft(event.target.value)}
+              onBlur={commitTitle}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.currentTarget.blur();
+                } else if (event.key === 'Escape') {
+                  setTitleDraft(meetingTitle(meeting));
+                  setIsEditingTitle(false);
+                }
+              }}
+            />
+          ) : (
+            <h1 className="meeting-title-display" onClick={() => setIsEditingTitle(true)}>
+              {meetingTitle(meeting)}
+              <button
+                type="button"
+                className="title-edit-btn"
+                aria-label="Rename meeting"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setIsEditingTitle(true);
+                }}
+              >
+                <Icon name="edit" size={13} />
+              </button>
+            </h1>
+          )}
           <p className="meeting-sub">
             <Icon name="calendar" /> {formatDate(meeting.startedAtMs)}
             <span>·</span> {formatDuration(meeting.durationMs)}

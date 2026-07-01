@@ -280,6 +280,44 @@ button {
   font-weight: 500;
   margin: 0 0 5px;
 }
+.meeting-title-display {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: text;
+}
+.title-edit-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+.meeting-title-display:hover .title-edit-btn {
+  opacity: 1;
+}
+.meeting-title-input {
+  font-size: 22px;
+  font-weight: 500;
+  margin: 0 0 5px;
+  padding: 0 2px;
+  border: 0;
+  border-bottom: 1px solid var(--border-strong);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  width: 100%;
+  max-width: 420px;
+}
+.meeting-title-input:focus {
+  outline: none;
+  border-bottom-color: var(--accent, var(--border-strong));
+}
 .meeting-sub {
   font-size: 13px;
   color: var(--text-muted);

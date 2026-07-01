@@ -543,6 +543,52 @@ impl SqliteRepository {
         })
     }
 
+    /// Overwrites a meeting's title (manual rename). Passing `None` or an
+    /// empty title clears it, reverting the meeting to its date-based
+    /// display name in the UI.
+    pub fn update_meeting_title(
+        &self,
+        id: &MeetingId,
+        title: Option<&str>,
+        updated_at_ms: u64,
+    ) -> Result<(), AppError> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE meetings SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                params![id.as_str(), title, to_db_i64(updated_at_ms)?],
+            )
+            .map_err(map_report_create_error)?;
+
+        if changed == 0 {
+            return Err(persistence_error(
+                "meeting_not_found",
+                "Meeting could not be renamed because it does not exist.",
+                Some(format!("meeting_id={}", id.as_str())),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fills in a meeting's title from a model-generated suggestion, but only
+    /// when it doesn't already have one — so this never overwrites a manual
+    /// rename or a title set by an earlier summarization.
+    pub fn set_meeting_title_if_absent(
+        &self,
+        id: &MeetingId,
+        title: &str,
+        updated_at_ms: u64,
+    ) -> Result<(), AppError> {
+        self.connection
+            .execute(
+                "UPDATE meetings SET title = ?2, updated_at_ms = ?3
+                WHERE id = ?1 AND (title IS NULL OR trim(title) = '')",
+                params![id.as_str(), title, to_db_i64(updated_at_ms)?],
+            )
+            .map_err(map_report_create_error)?;
+        Ok(())
+    }
+
     /// Stores the latest failed pipeline stage for a meeting.
     pub fn upsert_pipeline_failure(
         &self,
@@ -3971,6 +4017,79 @@ mod tests {
             .expect_err("missing meeting cannot be marked stopped");
 
         assert_eq!(missing.code, "meeting_not_found");
+    }
+
+    #[test]
+    fn update_meeting_title_overwrites_and_clears() {
+        let test_repository = repository();
+        let meeting = create_test_meeting(&test_repository.repository, "meeting-rename");
+
+        test_repository
+            .repository
+            .update_meeting_title(&meeting.id, Some("Renamed by user"), 4_100)
+            .expect("meeting can be renamed");
+        assert_eq!(
+            test_repository.repository.get_meeting(&meeting.id).unwrap().unwrap().title,
+            Some("Renamed by user".to_string()),
+        );
+
+        test_repository
+            .repository
+            .update_meeting_title(&meeting.id, None, 4_200)
+            .expect("meeting title can be cleared");
+        assert_eq!(test_repository.repository.get_meeting(&meeting.id).unwrap().unwrap().title, None);
+
+        let missing = test_repository
+            .repository
+            .update_meeting_title(&MeetingId::new("missing-meeting"), Some("x"), 4_200)
+            .expect_err("missing meeting cannot be renamed");
+        assert_eq!(missing.code, "meeting_not_found");
+    }
+
+    #[test]
+    fn set_meeting_title_if_absent_fills_blank_titles_but_never_overwrites() {
+        let test_repository = repository();
+        let untitled = test_repository
+            .repository
+            .create_meeting(&CreateMeeting {
+                id: MeetingId::new("meeting-untitled"),
+                title: None,
+                started_at_ms: 1_000,
+                stopped_at_ms: Some(2_000),
+                created_at_ms: 1_000,
+                updated_at_ms: 2_000,
+            })
+            .expect("untitled meeting can be created");
+
+        test_repository
+            .repository
+            .set_meeting_title_if_absent(&untitled.id, "Model Suggested Title", 3_000)
+            .expect("title fills in when absent");
+        assert_eq!(
+            test_repository.repository.get_meeting(&untitled.id).unwrap().unwrap().title,
+            Some("Model Suggested Title".to_string()),
+        );
+
+        test_repository
+            .repository
+            .set_meeting_title_if_absent(&untitled.id, "Later Model Title", 4_000)
+            .expect("re-summarizing does not error");
+        assert_eq!(
+            test_repository.repository.get_meeting(&untitled.id).unwrap().unwrap().title,
+            Some("Model Suggested Title".to_string()),
+            "a later auto-generated title must never overwrite the first one",
+        );
+
+        let titled = create_test_meeting(&test_repository.repository, "meeting-already-titled");
+        test_repository
+            .repository
+            .set_meeting_title_if_absent(&titled.id, "Should Not Apply", 3_000)
+            .expect("call succeeds even though title is already set");
+        assert_eq!(
+            test_repository.repository.get_meeting(&titled.id).unwrap().unwrap().title,
+            titled.title,
+            "a manually-set or pre-existing title must never be overwritten",
+        );
     }
 
     #[test]

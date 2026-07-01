@@ -108,6 +108,9 @@ export const getMeetingHistoryDetail = async (meetingId: string): Promise<Meetin
 export const deleteMeeting = async (meetingId: string): Promise<void> =>
   invokeNative<void>('delete_meeting', { meetingId });
 
+export const updateMeetingTitle = async (meetingId: string, title: string): Promise<void> =>
+  invokeNative<void>('update_meeting_title', { meetingId, title });
+
 export const listMeetingTrends = async (limit: number): Promise<MeetingTrendsResult> =>
   invokeNative<MeetingTrendsResult>('list_meeting_trends', { limit });
 
