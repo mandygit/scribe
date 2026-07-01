@@ -1,752 +1,555 @@
-# Resonance Technical Architecture
-
-**Product:** Resonance  
-**Tagline:** Capture what happened. Improve what you said.  
-**Scope:** Local-first macOS meeting capture, transcription, summarization, speaking coaching, live nudges, history, trends, retention, local voice-aware imported-recording coaching, and Record and Review self-practice video feedback.
-
-This document explains why the project uses each major library or integration, what problem it solves, what alternatives were considered or rejected, and where the implementation lives.
-
-## 1. Design goals and constraints
-
-Resonance is optimized around these constraints:
-
-1. **Local-first privacy.** Raw audio should stay on the user's Mac. The default analyzer is local Ollama. Voice identity is local speaker verification, not a cloud voice API.
-2. **macOS-native capture.** The app must access microphone and system audio with user-granted macOS permissions.
-3. **No data loss.** Raw audio is saved before transcription, AEC, analysis, and summaries. Optional processing failures must not delete source recordings.
-4. **Progressive degradation.** Missing Ollama, whisper.cpp, SpeexDSP, ScreenCaptureKit permission, or speaker models should produce actionable errors or fallback behavior.
-5. **Typed boundaries.** Frontend/backend contracts use explicit DTOs and Tauri commands rather than ad hoc JSON.
-6. **Testable slices.** Pure logic is isolated in Rust or TypeScript helpers where possible, and native/external adapters are narrow.
-
-Core orchestration lives in `src-tauri/src/lib.rs`. It wires the Rust modules, exposes Tauri commands, owns the app state, sets up the SQLite repository, and contains the pipeline glue between recording, transcription, metrics, analysis, imported summaries, and voice matching.
-
-## 2. High-level runtime flow
-
-### Live/local meeting flow
-
-1. React calls `start_recording` through `src/tauri-commands.ts`.
-2. Rust command handling in `src-tauri/src/lib.rs` creates a meeting row and safe audio paths.
-3. `RecordingManager` in `src-tauri/src/audio/manager.rs` starts microphone capture through `CpalCaptureBackend` and optional system audio through `ScreenCaptureKitSystemAudioBackend`.
-4. Audio metadata is persisted through `SqliteRepository` in `src-tauri/src/persistence/mod.rs`.
-5. After stop, `transcribe_meeting` uses `WhisperShellTranscriber` in `src-tauri/src/transcription/mod.rs`.
-6. Transcript stream events use `resonance://transcript-segment` and `resonance://transcript-stream-complete`.
-7. Deterministic metrics run through `src-tauri/src/rules/mod.rs`.
-8. Local analysis prompts and validation run through `src-tauri/src/analysis/mod.rs`.
-9. Scorecards are produced by `src-tauri/src/scoring/mod.rs`.
-10. Reports, transcript detail, history, trends, and failures are read back through Tauri commands in `src-tauri/src/lib.rs`.
-
-### Imported/downloaded recording flow
-
-1. The user pastes a local media path in `src/components/ImportedRecordingPanel.tsx`.
-2. React calls `importRecordingSummary` in `src/tauri-commands.ts`.
-3. Rust validates and extracts local audio using `ffmpeg` through `src-tauri/src/media_import.rs`.
-4. The extracted audio is transcribed by the same whisper.cpp adapter.
-5. Optional voice-matched coaching runs diarization and speaker matching before analysis.
-6. The local summarizer in `src-tauri/src/analysis/mod.rs` asks Ollama for summary JSON.
-7. If matched user speech exists and the user explicitly confirms cloud video review, `src-tauri/src/video_review.rs` samples frames from the meeting video and asks OpenAI for visual delivery feedback around those matched speech windows.
-8. If the user is not visible, the source is audio-only, or no user speech is matched, Resonance returns an audio-only visual-review status instead of pretending to assess posture or eye contact.
-9. The meeting summary is persisted to `imported_meeting_summaries`; the visual-review result is returned with the current UI response.
-
-### Record and Review practice flow
-
-1. The user records through the Tauri WebView camera APIs or imports a local `.mp4`, `.mov`, or `.webm` in `src/components/RecordReviewPanel.tsx`.
-2. React calls `savePracticeCameraRecording` or `importPracticeVideo` in `src/tauri-commands.ts`.
-3. Rust writes/copies the video under app data using helpers in `src-tauri/src/media_import.rs` and persists a `practice_recordings` row through `src-tauri/src/persistence/mod.rs`.
-4. `analyze_practice_recording_audio` extracts mono 16 kHz WAV audio with `ffmpeg`, transcribes it with `WhisperShellTranscriber`, and calculates deterministic speech metrics with `src-tauri/src/rules/mod.rs`.
-5. Rust builds a `practice_review_reports` row plus queryable `practice_timeline_annotations` for pace, filler, and clarity findings.
-6. `src/components/PracticeReviewReport.tsx` renders the full practice report, audio/visual score slots, privacy badge, suggestions, and timeline evidence.
-7. Visual review crosses `src-tauri/src/video_review.rs`, which enforces both saved cloud-video opt-in and per-review confirmation before any full video could be sent to a configured provider.
-
-## 3. Frontend stack decisions
-
-### React
-
-**Files:**
-
-- `src/App.tsx`
-- `src/main.tsx`
-- `src/components/*.tsx`
-
-**Why React:** The app needs a stateful desktop UI with many panels: setup, recording, transcript stream, nudges, metrics, scorecards, history, trends, privacy, and imported recordings. React gives a simple component model and works smoothly with Tauri's WebView surface.
-
-**What it solves:**
-
-- Component composition for panels such as `ManualVerificationPanel`, `ImportedRecordingPanel`, `MeetingHistoryPanel`, and `ScorecardReport`.
-- Camera practice and review composition through `RecordReviewPanel` and `PracticeReviewReport`.
-- Local state orchestration in `src/App.tsx`.
-- Server-renderable component tests via `renderToStaticMarkup` in `tests/frontend/components.test.tsx`.
-
-**Why not a heavier UI framework:** The app does not currently need routing, server rendering, or a design-system dependency. Keeping the frontend dependency set small reduces bundle and maintenance risk.
-
-### TypeScript strict contracts
-
-**Files:**
-
-- `src/contracts.ts`
-- `src/tauri-commands.ts`
-- Rust DTOs in `src-tauri/src/lib.rs`
-
-**Why TypeScript:** Tauri command payloads cross a process boundary. TypeScript interfaces mirror Rust `Serialize` DTOs so UI code knows exact shapes.
-
-**What it solves:**
-
-- Prevents accidental frontend usage of missing fields.
-- Documents event payloads such as `TranscriptStreamEvent`, `LiveNudgeEvent`, `VoiceDiarizationResult`, and `ImportedRecordingSummaryResult`.
-- Documents practice DTOs such as `PracticeRecording`, `PracticeReviewReport`, `PracticeTimelineAnnotation`, and `PracticeReviewResult`.
-- Keeps UI tests strongly typed.
-
-**Important detail:** TypeScript types are compile-time only. Rust remains the source of truth at runtime. The Rust side validates external/untrusted data such as Ollama JSON and file paths.
-
-### Vite
-
-**Files:**
-
-- `vite.config.ts`
-- `package.json`
-- `src-tauri/tauri.conf.json`
-
-**Why Vite:** Tauri needs a frontend dev server and a static production bundle. Vite provides fast local dev and a small production build path with minimal configuration.
-
-**What it solves:**
-
-- `bun run dev` starts the frontend on `127.0.0.1`.
-- `bun run build` type-checks and builds `dist/`.
-- Tauri consumes `frontendDist: "../dist"` in `src-tauri/tauri.conf.json`.
-
-### Bun
-
-**Files:**
-
-- `package.json`
-- `bun.lock`
-- `tests/frontend/*.test.tsx`
-
-**Why Bun:** Bun is the chosen JS runtime and package manager for this repo. It runs dependency install, frontend tests, and scripts quickly.
-
-**What it solves:**
-
-- Fast `bun test tests/frontend`.
-- Lockfile for JS dependencies.
-- Simple script surface: `test:frontend`, `lint`, `build`, `tauri`, `package:mac`.
-
-### Biome
-
-**Files:**
-
-- `biome.json`
-- `package.json`
-
-**Why Biome:** Bun does not provide lint/format rules by itself. Biome supplies a fast formatter, import organizer, and lint check without adding ESLint/Prettier complexity.
-
-**What it solves:**
-
-- `bun run lint` checks formatting and import order.
-- `bun run lint:fix` applies safe formatting fixes.
-- Keeps TypeScript and TSX formatting consistent after broad changes like the Resonance rebrand.
-
-## 4. Desktop shell and native boundary
-
-### Tauri 2
-
-**Files:**
-
-- `src-tauri/Cargo.toml`
-- `src-tauri/tauri.conf.json`
-- `src-tauri/src/main.rs`
-- `src-tauri/src/lib.rs`
-- `src/tauri-commands.ts`
-
-**Why Tauri:** Resonance needs a macOS desktop app with native permissions, filesystem access, process spawning, a tray/menu affordance, and a React UI. Tauri gives a small native Rust shell around a web UI.
-
-**What it solves:**
-
-- Native command bridge for recording, transcription, analysis, settings, history, notifications, imported summaries, voice enrollment, and voice matching.
-- macOS bundling through `bun run package:mac`.
-- Tray icon/menu in `src-tauri/src/lib.rs`.
-- App data directory resolution through `app.path().app_data_dir()`.
-
-**Why not Electron:** Electron would make native capture and Rust audio integration heavier, increase bundle size, and duplicate Node/Rust boundaries. Tauri keeps Rust as the native integration layer.
-
-**Security note:** Tauri commands remain the boundary for local filesystem and native execution. User-provided paths are validated in Rust before use.
-
-### Swift ScreenCaptureKit sidecar
-
-**Files:**
-
-- `src-tauri/native/system-audio-capture/main.swift`
-- `src-tauri/build.rs`
-- `src-tauri/src/audio/system.rs`
-- `src-tauri/tauri.conf.json`
-- `docs/decisions/adr-001-system-audio-sidecar.md`
-
-**Why ScreenCaptureKit:** macOS system audio capture requires Apple-native APIs and Screen Recording permission. ScreenCaptureKit can capture system/app audio without a virtual audio driver.
-
-**Why a Swift sidecar:** Rust can call native frameworks, but direct Objective-C/Swift interop would enlarge the unsafe/native surface. The sidecar isolates the macOS-specific code in a small Swift program.
-
-**What it solves:**
-
-- Captures remote participant/system audio into `{meetingId}.system.m4a`.
-- Keeps mic audio and system audio separately identifiable.
-- Converts permission failures into actionable messages.
-- Avoids a driver install.
-
-**Minute implementation details:**
-
-- `src-tauri/build.rs` compiles the Swift helper with `xcrun swiftc`.
-- The helper binary base name is `resonance-system-audio-capture`.
-- Rust resolves the development helper path in `system_audio_helper_path()` in `src-tauri/src/audio/system.rs`.
-- Tauri bundles the external binary through `externalBin` in `src-tauri/tauri.conf.json`.
-- The helper stops through stdin; the Rust backend records helper failure as metadata instead of failing the whole mic recording.
-
-**Rejected alternatives:** Direct Rust FFI into ScreenCaptureKit and virtual audio drivers. See `docs/decisions/adr-001-system-audio-sidecar.md`.
-
-## 5. Rust backend library choices
-
-### cpal for microphone capture
-
-**Files:**
-
-- `src-tauri/Cargo.toml`
-- `src-tauri/src/audio/capture.rs`
-- `src-tauri/src/audio/manager.rs`
-- `src-tauri/src/audio/domain.rs`
-
-**Why cpal:** It is a common Rust cross-platform audio input abstraction. Resonance needs microphone capture with device listing and default input support.
-
-**What it solves:**
-
-- Captures mic input without writing platform-specific mic code first.
-- Supports a `CpalCaptureBackend` adapter behind the recording manager.
-- Keeps the rest of the pipeline independent of the capture implementation.
-
-**Why pinned to `=0.17.1`:** Audio APIs are sensitive. Pinning avoids accidental behavior changes from semver-compatible releases during this early native-capture phase.
-
-### hound for WAV writing
-
-**Files:**
-
-- `src-tauri/Cargo.toml`
-- `src-tauri/src/audio/wav.rs`
-- `src-tauri/src/audio/aec.rs`
-
-**Why hound:** The app needs simple local PCM WAV writing and reading for mic audio and AEC output. `hound` is a focused Rust WAV crate.
-
-**What it solves:**
-
-- Saves raw mic WAV files.
-- Writes derived AEC WAV files.
-- Keeps audio persistence simple and inspectable.
-
-**Why not a full media framework:** Full codecs are handled by external adapters (`ffmpeg` for imported media and ScreenCaptureKit/AVAssetWriter for system `.m4a`). The Rust app only needs reliable WAV handling internally.
-
-### rusqlite for embedded persistence
-
-**Files:**
-
-- `src-tauri/Cargo.toml`
-- `src-tauri/src/persistence/mod.rs`
-
-**Why SQLite through rusqlite:** Resonance is local-first and single-user. SQLite is embedded, durable, queryable, and does not require a server. `rusqlite` gives parameterized access without ORM overhead.
-
-**What it solves:**
-
-- Stores meetings, transcript segments, metrics, reports, imported summaries, practice recordings, practice review reports, practice timeline annotations, audio metadata, settings, pipeline failures, voice profile metadata, and schema versions.
-- Supports history search, trend queries, retention cleanup, imported-summary provenance, and practice review history.
-- Keeps all persistence local under app data.
-
-**Minute implementation details:**
-
-- Schema migrations live in `run_migrations()` in `src-tauri/src/persistence/mod.rs`.
-- `CURRENT_SCHEMA_VERSION` tracks the latest migration.
-- `schema_versions` records applied versions.
-- `ensure_column()` validates static identifiers and column type allow-list before formatting migration SQL.
-- Search uses escaped LIKE patterns through `like_contains_pattern()`.
-- The Orator -> Resonance data migration uses `rewrite_app_data_file_paths()` to rewrite app-data-owned paths after copying legacy data.
-- Record and Review adds `practice_recordings`, `practice_review_reports`, and `practice_timeline_annotations`; the report body is JSON for flexible UI rendering, while annotations remain queryable rows for timeline/history views.
-- `cloud_video_review_enabled` is separate from transcript cloud analysis because full video is more sensitive than transcript text.
-- Queries use `params![]`; user strings are not concatenated into SQL.
-
-**Why not PostgreSQL:** The app is local desktop software. PostgreSQL would require installation, a service process, credentials, and backup concerns that conflict with local-first simplicity.
-
-### serde and serde_json
-
-**Files:**
-
-- `src-tauri/src/domain.rs`
-- `src-tauri/src/lib.rs`
-- `src-tauri/src/analysis/mod.rs`
-- `src-tauri/src/voice_matching.rs`
-
-**Why serde:** Tauri command responses, persisted report JSON, Ollama responses, and frontend DTOs require structured serialization.
-
-**What it solves:**
-
-- `#[serde(rename_all = "camelCase")]` maps Rust fields to TypeScript-friendly JSON.
-- Analyzer and summary responses are parsed as strict JSON.
-- Persisted report and summary bodies are round-tripped through SQLite.
-
-**Security detail:** JSON from Ollama is treated as untrusted. `parse_coaching_analysis_response()` and `parse_meeting_summary_response()` in `src-tauri/src/analysis/mod.rs` validate schema shape and quote grounding before persistence.
-
-### tempfile for tests
-
-**Files:**
-
-- `src-tauri/Cargo.toml`
-- `src-tauri/src/persistence/mod.rs`
-
-**Why tempfile:** Repository tests need isolated SQLite files and migration scenarios without touching real app data.
-
-**What it solves:**
-
-- Creates throwaway databases for persistence tests.
-- Enables legacy migration tests and schema idempotence tests.
-
-## 6. External local tools
-
-### whisper.cpp through `whisper-cli`
-
-**Files:**
-
-- `src-tauri/src/transcription/mod.rs`
-- `src-tauri/src/lib.rs`
-- `src/components/SetupGuidePanel.tsx`
-- `src/components/ManualVerificationPanel.tsx`
-- `spikes/whisper-benchmark/`
-
-**Why whisper.cpp CLI:** Local transcription is central to privacy. Shelling out to a user-configured `whisper-cli` avoids embedding large model/runtime code in the app and keeps model choice configurable.
-
-**What it solves:**
-
-- Transcribes saved mic WAV and imported extracted audio.
-- Transcribes extracted practice-video audio for local Record and Review reports.
-- Produces timestamped transcript segments.
-- Lets users choose model files based on accuracy/performance tradeoffs.
-
-**Why not a cloud transcription API:** Raw meeting audio would leave the machine, conflicting with the primary privacy constraint.
-
-**Why not link a Whisper Rust binding yet:** CLI integration is simpler to package incrementally and can be validated independently. A Rust binding would add native build complexity and model runtime coupling.
-
-**Minute implementation details:**
-
-- Settings include `transcriber_bin_path` and `transcriber_model_path` in `ResonanceSettings`.
-- `WhisperShellTranscriber::from_settings()` validates configuration.
-- Pipeline failures persist when transcription fails.
-- Transcription retries once in the meeting pipeline before persisting final failure.
-
-### Ollama for local text analysis and summaries
-
-**Files:**
-
-- `src-tauri/src/analysis/mod.rs`
-- `src-tauri/src/lib.rs`
-- `src/components/SetupGuidePanel.tsx`
-
-**Why Ollama:** The app needs local LLM analysis without sending transcript text to a remote service. Ollama provides a localhost HTTP API and model management outside the app.
-
-**What it solves:**
-
-- Quote-grounded post-meeting coaching reports.
-- Imported-recording summaries with action items, decisions, open questions, and optional speaking improvements.
-- Local default analysis provider.
-
-**Security and correctness details:**
-
-- Prompts explicitly require strict JSON only.
-- Responses are parsed and validated before persistence.
-- Coaching observations must quote exact user transcript text.
-- Context quotes must come from context transcript rows.
-- The prompt instructs the model to analyze the user's communication, not other speakers' performance.
-
-**Why not use Ollama for voice identity:** LLMs are text generators, not speaker-verification systems. Voice identity needs embeddings and diarization, implemented separately with sherpa-onnx.
-
-### ffmpeg for imported media extraction
-
-**Files:**
-
-- `src-tauri/src/media_import.rs`
-- `src-tauri/src/lib.rs`
-- `src/components/ImportedRecordingPanel.tsx`
-- `src/components/RecordReviewPanel.tsx`
-
-**Why ffmpeg:** Downloaded recordings may be `.mp4`, `.mov`, `.m4a`, `.mp3`, or `.wav`, and practice videos may be `.mp4`, `.mov`, or `.webm`. The app needs a reliable local extractor to normalize audio for transcription, diarization, and practice speech review.
-
-**What it solves:**
-
-- Converts local media into app-owned extracted audio.
-- Keeps imported media support broad without adding codec libraries to Rust.
-- Extracts practice-video audio into `practice-recordings/{practiceId}.audio.wav` so retention cleanup can safely delete derived artifacts under app data.
-
-**Security detail:** The Rust code uses `Command::arg()` rather than shell string interpolation, so user paths are passed as arguments rather than evaluated by a shell.
-
-**Why path input instead of native file dialog:** Avoids a new dependency while the imported-recording pipeline is still being built. The UI clearly asks for an absolute local path.
-
-### WebView MediaRecorder for first camera practice capture
-
-**Files:**
-
-- `src/App.tsx`
-- `src/components/RecordReviewPanel.tsx`
-- `src-tauri/src/lib.rs`
-- `src-tauri/src/media_import.rs`
-- `src-tauri/Info.plist`
-
-**Why WebView MediaRecorder first:** The goal for the first Record and Review slice is a working camera practice path without adding native AVFoundation helper complexity or a new dependency. Tauri already provides a WebView surface, and browser media APIs can capture a camera/microphone stream into a Blob that Rust can persist under app data.
-
-**What it solves:**
-
-- Provides camera preview and start/stop controls in the existing React UI.
-- Saves recorded bytes through `save_practice_camera_recording`.
-- Enforces the 15-minute v1 cap in Rust before persistence.
-- Stores camera recordings under `practice-recordings/` so retention uses the same app-data safety boundary as raw audio.
-
-**Tradeoff:** WebView media support can vary by macOS/WebKit version. This is intentionally an incremental adapter. A native AVFoundation helper remains the hardening path if WebView recording proves unreliable in packaged builds.
-
-### OpenAI sampled-frame video review
-
-**Files:**
-
-- `src-tauri/src/video_review.rs`
-- `src-tauri/src/lib.rs`
-- `src-tauri/src/media_import.rs`
-- `src/components/RecordReviewPanel.tsx`
-- `src/components/PracticeReviewReport.tsx`
-
-**Why a separate video-review interface:** Posture, eye contact, gestures, framing, and lighting need a multimodal vision provider or future local vision stack. Full video upload is materially more sensitive than transcript text, so it cannot reuse the existing transcript-cloud setting.
-
-**What it solves:**
-
-- `VideoReviewAnalyzer` defines the provider boundary.
-- `OpenAiVideoReviewer` extracts sampled JPEG frames locally with `ffmpeg` and sends only those frames to the OpenAI Responses API.
-- Tests use `FixtureVideoReviewer` for deterministic visual annotations without network access.
-- Runtime visual review requires both `cloud_video_review_enabled` and `allow_cloud_video_for_this_review`.
-- The API key is read from `RESONANCE_OPENAI_API_KEY` or `OPENAI_API_KEY` at runtime and is never persisted.
-- Cost controls are environment-driven: `RESONANCE_OPENAI_MODEL`, `RESONANCE_OPENAI_MAX_FRAMES`, and `RESONANCE_OPENAI_FRAME_INTERVAL_SECONDS`.
-- OpenAI responses must match a strict JSON schema before any score or annotation is persisted.
-
-**Why sampled frames instead of full video upload:** A 1-15 minute video can be expensive and privacy-sensitive to send as a full asset. Sampling low-detail frames every few seconds is enough for MVP feedback on framing, posture, eye contact direction, lighting, and broad gesture/movement cues while bounding token/image cost. For imported meeting videos, the prompt includes locally matched user-speech windows so OpenAI can return `userVisible=false` when the matched speaker's camera is off or not identifiable in sampled frames.
-
-**Security details:**
-
-- The OpenAI secret is not passed as a command-line argument. `curl` receives request configuration through stdin so the authorization header is not exposed in ordinary process arguments.
-- Third-party JSON is treated as untrusted and revalidated in Rust before persistence.
-- Prompts explicitly prohibit inferring sensitive traits or identity.
-
-### SpeexDSP for acoustic echo cancellation
-
-**Files:**
-
-- `src-tauri/src/audio/aec.rs`
-- `src-tauri/src/lib.rs`
-- `docs/decisions/adr-002-offline-aec-adapter.md`
-
-**Why SpeexDSP:** A validation spike showed SpeexDSP could reduce synthetic echo enough for the V1 threshold. It is a focused native library for acoustic echo cancellation.
-
-**What it solves:**
-
-- Optionally creates `{meetingId}.aec.wav` from mic audio and a compatible reference.
-- Reduces system-audio bleed in the user's mic transcript when prerequisites are met.
-
-**Minute implementation details:**
-
-- Resonance runtime-loads `libspeexdsp.dylib` instead of hard-linking it.
-- If SpeexDSP is missing or input formats are incompatible, the pipeline falls back to raw mic WAV.
-- The raw mic and system audio are preserved.
-- `enableEchoCancellation` is separate from `enableSystemAudio`.
-
-**Why optional:** Requiring SpeexDSP at build/install time would make the app fragile on machines without the library. Runtime loading preserves degraded-mode behavior.
-
-## 7. Voice enrollment, matching, and diarization
-
-### sherpa-onnx
-
-**Files:**
-
-- `src-tauri/Cargo.toml`
-- `src-tauri/src/voice_matching.rs`
-- `src-tauri/src/lib.rs`
-- `src/components/ImportedRecordingPanel.tsx`
-- `src/components/ManualVerificationPanel.tsx`
-
-**Why sherpa-onnx:** Resonance needs local speaker embeddings and diarization to answer: "Was I speaking in this recording, and which transcript segments were mine?" `sherpa-onnx` provides local ONNX-backed speaker embedding extraction and offline speaker diarization with Rust APIs.
-
-**What it solves:**
-
-- Local voice profile preparation from an enrolled mic sample.
-- Cosine-similarity speaker verification.
-- Whole-recording coarse voice match checks.
-- Diarization preview for imported recordings.
-- Diarized speaker-to-profile matching.
-- Matched windows that label transcript rows as `User` or context before summary/coaching.
-
-**Why feature-gated:** Speaker matching is optional and model-dependent. The default build should not fail because a user has not configured or installed speaker models.
-
-**Important compile detail:**
-
-```toml
-[features]
-default = []
-speaker-matching-sherpa = ["dep:sherpa-onnx"]
+# Scribe — Technical Architecture
+
+This doc explains how Scribe is built, why each major dependency was chosen,
+and how the pieces fit together. It's aimed at whoever (human or agent) next
+needs to change something here and wants the context that isn't obvious from
+reading the code cold.
+
+For the "why" behind specific architecturally significant decisions, this
+doc points to ADRs in `docs/decisions/` rather than repeating their full
+alternatives-considered reasoning inline. Read those when you need the full
+story; read this doc for the map.
+
+## 1. What Scribe is
+
+A macOS desktop app (Tauri: React frontend + Rust backend) that:
+
+1. Records a meeting's microphone audio and (optionally, separately) system/
+   remote-participant audio.
+2. Transcribes the recording locally with `whisper.cpp`.
+3. Summarizes the transcript locally with an OpenAI-compatible chat model
+   server (LM Studio by default, or Ollama, or any custom endpoint).
+4. Surfaces live, deterministic (non-LLM) coaching nudges while a transcript
+   replays.
+5. Separately, offers system-wide dictation: a global hotkey captures speech,
+   transcribes it, optionally polishes it with on-device Apple Intelligence,
+   and pastes it into whatever app had focus.
+
+Everything above runs on the user's Mac. No network calls are made except to
+`127.0.0.1`-bound local model servers the user installs themselves. There is
+no cloud fallback path currently wired up (an earlier product direction
+explored one; see §11).
+
+Internally the project is still named **Resonance** in a lot of places
+(crate name, app-data folder, bundle identifier `com.resonance.meetingcoach`,
+one of the two Swift sidecar binary names). The user-facing brand is
+**Scribe**. Both names are correct depending on which layer you're looking
+at — this isn't a half-finished rename, it's just been left alone because
+renaming an app-data identifier has real migration cost (see the legacy
+`rewrite_app_data_file_paths` path in `lib.rs`, a leftover from an even
+earlier rename, Orator → Resonance).
+
+## 2. System architecture
+
+```mermaid
+flowchart TB
+    subgraph UI["Frontend — React 19 + TypeScript (Tauri WebView)"]
+        App["App.tsx\n(recording, history, trends, settings)"]
+        Pill["DictationPill.tsx\n(floating NSPanel window)"]
+        Contracts["contracts.ts / tauri-commands.ts\n(typed IPC boundary)"]
+    end
+
+    subgraph Core["Rust backend (src-tauri)"]
+        Cmds["Tauri commands\n(lib.rs invoke handlers)"]
+        Audio["audio/\ncpal mic capture, AEC"]
+        Trans["transcription/\nwhisper-cli wrapper"]
+        Summ["summarizer/\nLM Studio / Ollama / Custom client"]
+        Dict["dictation/\nhotkey, capture, injection"]
+        Rules["rules/ + nudges/\ndeterministic metrics + live coaching"]
+        Persist["persistence/\nSqliteRepository"]
+    end
+
+    subgraph Native["Native helpers"]
+        SCK["Swift: system-audio-capture\n(ScreenCaptureKit sidecar)"]
+        Polish["Swift: dictation-polish\n(Apple Intelligence sidecar)"]
+    end
+
+    subgraph External["External local processes"]
+        Whisper["whisper-cli\n(whisper.cpp)"]
+        LLM["LM Studio / Ollama / custom\n(/v1/chat/completions)"]
+    end
+
+    DB[("resonance.sqlite3\nvia rusqlite")]
+
+    App -- "invoke()" --> Cmds
+    Cmds -- "emit() events" --> App
+    Pill -- "invoke()" --> Cmds
+
+    Cmds --> Audio
+    Cmds --> Trans
+    Cmds --> Summ
+    Cmds --> Dict
+    Cmds --> Rules
+    Cmds --> Persist
+
+    Audio -- "spawn process" --> SCK
+    Dict -- "spawn process" --> Polish
+    Trans -- "spawn process" --> Whisper
+    Summ -- "HTTP (raw TCP)" --> LLM
+    Persist --> DB
 ```
 
-When the feature is disabled, commands fail safely with explicit dependency-disabled errors rather than pretending matching worked.
+**IPC shape**: the frontend never talks to Rust directly except through two
+channels — `invoke()` for request/response commands, and `emit()`/`listen()`
+for one-way events (transcript segments streaming in, live nudges, etc). See
+§9 for the full command/event surface.
 
-**Voice pipeline detail:**
+## 3. Why Tauri (not Electron)
 
-1. `enroll_voice_profile_from_last_mic_test` copies a local mic sample into app data.
-2. `prepare_voice_profile_for_matching` extracts and persists an embedding.
-3. `match_voice_profile_from_meeting` compares a candidate local sample.
-4. `match_imported_recording_voice` performs coarse whole-recording matching.
-5. `diarize_imported_recording_speakers` previews speaker segments.
-6. `match_imported_recording_speaker_segments` matches diarized speaker turns to the profile.
-7. `import_recording_summary` can use matched windows to request speaking improvements only for matched user speech.
+- Rust backend gets direct access to `cpal` (audio), `rusqlite` (SQLite),
+  and process-spawning for the native helpers and external tools, without an
+  N-API/native-module bridge.
+- Much smaller shipped binary and memory footprint than bundling Chromium —
+  Tauri uses the OS's native WebView (WKWebView on macOS).
+- Rust's ownership model matters here specifically because the app spawns
+  and manages multiple concurrent OS-level resources (audio streams, child
+  processes, TCP connections to local model servers) where use-after-free or
+  data races would be easy to introduce in a less strict language.
+- Trade-off accepted: WKWebView is less featureful/debuggable than a full
+  Chromium devtools experience, and cross-platform behavior (this app is
+  macOS-only anyway, so this doesn't bite yet).
 
-**Why not OpenAI voice models:** The current product promise is local-first raw-audio handling. Sending raw meeting audio to a cloud voice model would violate the default privacy posture. Cloud could be a future explicit opt-in, but not the base identity path.
+## 4. Frontend
 
-**Why not Ollama:** Ollama handles text summaries/coaching. It cannot reliably perform speaker verification or diarization from audio.
+**Stack**: React 19 + TypeScript, Vite for dev/build, Biome for lint/format,
+`@tauri-apps/api` for the `invoke`/`emit` bindings. No state management
+library, no router, no component framework — plain `useState`/`useCallback`.
 
-**Threshold details:**
+**File map**:
 
-- Default speaker match threshold is `0.75` in `src-tauri/src/lib.rs`.
-- Matching logic re-evaluates `similarity_score >= threshold`; it does not trust stale `is_match` flags.
-- Transcript labeling only marks segments as user when matched windows overlap and pass threshold.
-- If matched windows exist, non-overlapping speech becomes context rather than user speech.
-
-## 8. Deterministic rules, live nudges, and scoring
-
-### Rules module
-
-**Files:**
-
-- `src-tauri/src/rules/mod.rs`
-- `src-tauri/src/lib.rs`
-
-**Why deterministic rules:** Live meeting feedback must be low-latency and should not run an LLM during the call. Filler words, hedging phrases, WPM, and talk-time can be detected locally and deterministically.
-
-**What it solves:**
-
-- Filler count.
-- Hedging count.
-- Words per minute.
-- Talk-time ratio.
-- Longest monologue.
-
-### Live nudge pipeline
-
-**Files:**
-
-- `src-tauri/src/nudges/mod.rs`
-- `src-tauri/src/lib.rs`
-- `src/components/LiveNudgePanel.tsx`
-- `src/components/CoachDock.tsx`
-
-**Why a deterministic event pipeline:** Nudges should be immediate, bounded, and low-distraction. A local pipeline avoids LLM latency and privacy exposure.
-
-**What it solves:**
-
-- Emits `resonance://live-nudge`.
-- Throttles duplicate/burst nudges.
-- Maintains bounded recent event history.
-- Allows UI dismissal without mutating persisted meeting data.
-
-### Scoring module
-
-**Files:**
-
-- `src-tauri/src/scoring/mod.rs`
-- `src/components/ScorecardReport.tsx`
-
-**Why separate scoring:** Scores should be deterministic, bounded, and testable independently from the LLM. Missing metrics should produce partial scores rather than broken reports.
-
-**What it solves:**
-
-- Availability-aware scoring.
-- Bounded 0-100 score dimensions.
-- Weighted overall score over available dimensions.
-- UI warnings for missing signals.
-
-## 9. Persistence and data model
-
-**Primary file:** `src-tauri/src/persistence/mod.rs`
-
-Main persisted concepts:
-
-- `meetings`: meeting lifecycle metadata.
-- `transcript_segments`: timestamped transcript rows.
-- `metrics`: deterministic metric values.
-- `reports`: local coaching analysis JSON and score.
-- `audio_metadata`: mic/system audio paths and capture metadata.
-- `pipeline_failures`: latest failed stage per meeting.
-- `imported_meeting_summaries`: downloaded-recording summaries, extracted audio path, and speaking-coaching source.
-- `practice_recordings`: app-data-owned self-practice videos from camera or import, extracted audio path, status, failure fields, and cloud-video provenance.
-- `practice_review_reports`: combined practice report JSON with overall/audio/visual score slots.
-- `practice_timeline_annotations`: queryable timestamped findings for audio-local and future video review evidence.
-- `voice_profiles`: local voice enrollment metadata and persisted embedding.
-- `settings`: privacy, transcription, system audio, AEC, voice model, analyzer, and explicit cloud-video-review settings.
-- `schema_versions`: migration tracking.
-
-## 10. Error handling and resilience
-
-**Files:**
-
-- `src-tauri/src/domain.rs`
-- `src-tauri/src/lib.rs`
-- `src-tauri/src/persistence/mod.rs`
-
-Errors use `AppError { code, message, details }`. The codebase prefers explicit, user-actionable errors over silent fallback.
-
-Important examples:
-
-- Transcription failures are retried once, then persisted as pipeline failures.
-- Metrics and analysis failures preserve raw audio and completed artifacts.
-- Retention cleanup skips unsafe paths rather than deleting outside app data.
-- Practice retention deletes expired practice videos and extracted practice audio only when canonical paths are under app data; practice rows and reports remain.
-- Voice matching reports disabled dependencies clearly when the Sherpa feature is not compiled.
-- Visual review refuses to run without separate saved cloud-video opt-in and per-review confirmation.
-- Legacy Orator app-data migration fails loudly if copying data fails.
-
-## 11. Privacy and security boundaries
-
-### Local-first raw audio
-
-Raw mic audio, system audio, voice enrollment samples, imported extracted audio, practice videos, and practice extracted audio remain local app data. External adapters are local processes:
-
-- `whisper-cli`
-- `ffmpeg`
-- Swift ScreenCaptureKit helper
-- Optional SpeexDSP dynamic library
-- Optional sherpa-onnx local model runtime
-
-### Localhost analyzer
-
-Ollama requests go to localhost. Prompts contain transcript text, not raw audio.
-
-### Path safety
-
-Relevant files:
-
-- `src-tauri/src/audio/storage.rs`
-- `src-tauri/src/media_import.rs`
-- `src-tauri/src/lib.rs`
-- `src-tauri/src/persistence/mod.rs`
-
-Important protections:
-
-- Recording file stems are validated.
-- Generated audio paths are under app data.
-- Imported practice videos are copied under app data before analysis.
-- Camera practice bytes are written by Rust under app data rather than leaving the app to reference a browser blob.
-- Voice profile delete and retention cleanup canonicalize paths before deletion.
-- Practice retention cleanup canonicalizes paths before deleting video or extracted audio.
-- Imported media extraction uses process arguments, not shell interpolation.
-- SQLite queries use parameterized `rusqlite::params`.
-- Migration SQL helper only accepts static-safe identifiers and column types.
-- LIKE patterns escape `%`, `_`, and `\` before using `ESCAPE '\\'`.
-
-## 12. Resonance rebrand and legacy data migration
-
-**Files:**
-
-- `src-tauri/tauri.conf.json`
-- `src-tauri/src/lib.rs`
-- `src-tauri/src/persistence/mod.rs`
-- `package.json`
-- `src-tauri/Cargo.toml`
-
-The app was renamed from Orator to Resonance. Because macOS app data paths depend on app identity, the rename could have stranded existing local user data.
-
-The migration logic:
-
-1. Uses new app identifier `com.resonance.meetingcoach`.
-2. Looks for legacy app data directories for `com.orator.meetingcoach` and `Orator`.
-3. If `resonance.sqlite3` does not exist and legacy `orator.sqlite3` does, copies legacy app data into the new directory.
-4. Renames:
-   - `orator.sqlite3` -> `resonance.sqlite3`
-   - `orator.sqlite3-wal` -> `resonance.sqlite3-wal`
-   - `orator.sqlite3-shm` -> `resonance.sqlite3-shm`
-5. Opens the copied DB.
-6. Rewrites app-data-owned file paths in:
-   - `audio_metadata.file_path`
-   - `audio_metadata.system_audio_file_path`
-   - `voice_profiles.sample_audio_file_path`
-   - `imported_meeting_summaries.extracted_audio_file_path`
-7. Leaves external source paths, such as imported media files in Downloads, unchanged.
-
-The remaining `Orator/orator` strings in source are intentional legacy migration constants and tests.
-
-## 13. Why dependencies are intentionally limited
-
-The codebase avoids adding libraries unless they solve a concrete boundary problem:
-
-| Dependency/integration | Why it exists |
+| File | Role |
 | --- | --- |
-| Tauri | Native desktop shell and command bridge. |
-| React | Stateful UI composition. |
-| TypeScript | Frontend contract safety. |
-| Vite | Fast frontend dev/build for Tauri. |
-| Bun | Package manager, scripts, and tests. |
-| Biome | Formatting/linting without ESLint/Prettier complexity. |
-| cpal | Cross-platform mic capture abstraction. |
-| hound | Focused WAV read/write. |
-| rusqlite | Embedded local persistence. |
-| serde/serde_json | DTO and persisted JSON serialization. |
-| tempfile | Isolated persistence tests. |
-| ScreenCaptureKit sidecar | macOS system audio without a virtual driver. |
-| whisper.cpp CLI | Local transcription without bundling model runtime. |
-| Ollama | Local LLM analysis and summaries. |
-| ffmpeg | Local imported media extraction. |
-| SpeexDSP | Optional offline AEC. |
-| sherpa-onnx | Optional local speaker embeddings and diarization. |
+| `src/App.tsx` | The entire UI. Recording controls, meeting history/detail, trends, settings, dictation stats. This is a single ~1600-line component tree, not split into `src/components/*` — an earlier version of this doc (and an earlier README) described a `src/components/` directory that no longer exists; the app was consolidated into `App.tsx` at some point and never split back out. Worth revisiting if this file keeps growing, but not urgent — React's re-render cost here is small (a handful of settings screens and lists, not a data-heavy app). |
+| `src/DictationPill.tsx` | A second, tiny React entry point rendered into its own Tauri window — the floating dictation status pill (see §8). |
+| `src/contracts.ts` | Hand-written TypeScript interfaces mirroring every `#[derive(Serialize)]` struct on the Rust side (`MeetingSummary`, `MeetingHistoryDetail`, etc). This is the actual type-safety boundary between frontend and backend — there's no codegen keeping these in sync, so a Rust DTO change requires a manual matching edit here. |
+| `src/tauri-commands.ts` | One thin async wrapper per Tauri command, typed against `contracts.ts`. Nothing else in the frontend calls `invoke()` directly. |
+| `src/summary-clipboard.ts` | Builds the HTML + plain-text clipboard payload for the "Copy" button on generated notes — deliberately bullet lists and bold labels, no tables, so it pastes cleanly into Slack/Teams. |
+| `src/format.ts`, `src/error-utils.ts` | Small formatting/error-message helpers. |
 
-## 14. Validation commands
+## 5. Audio capture
 
-Frontend:
+```mermaid
+flowchart LR
+    Mic["Microphone\n(cpal input stream)"] -->|i16 mono samples,\nbounded channel| WavWriter["hound WAV writer\n(background thread)"]
+    WavWriter --> MicFile[("{meetingId}.wav")]
 
-```bash
-bun run test:frontend
-bun run lint
-bun run build
+    SysAudio["Remote/system audio"] -->|ScreenCaptureKit| SidecarProc["Swift sidecar process\n(resonance-system-audio-capture)"]
+    SidecarProc --> SysFile[("{meetingId}.system.m4a")]
+
+    MicFile --> AEC{"AEC enabled\nand reference\ncompatible?"}
+    SysFile --> AEC
+    AEC -- yes --> AECOut["SpeexDSP echo cancellation\n(dlopen libspeexdsp)"]
+    AEC -- "no / unavailable / failed" --> MicFile
+    AECOut --> CleanedFile[("{meetingId}.aec.wav")]
+
+    CleanedFile --> ToWhisper["to transcription"]
+    MicFile --> ToWhisper
 ```
 
-Rust:
+- **`cpal = "=0.17.1"`** (pinned, not a range) — low-level, cross-platform
+  audio callback API. Pinned because audio callback APIs are exactly the
+  kind of dependency where a minor-version behavior change (buffer sizing,
+  callback timing) can introduce audio glitches that are painful to
+  diagnose; a pin makes upgrades a deliberate, tested action instead of an
+  incidental one.
+- Samples flow from the real-time audio callback into a **bounded**
+  `sync_channel` (capacity: 5 seconds of 48kHz mono samples). If the writer
+  thread falls behind, new samples are **dropped and counted**
+  (`dropped_sample_count`) rather than the channel growing unbounded — an
+  audio callback that blocks or allocates unboundedly risks glitching the
+  whole OS audio pipeline, so backpressure has to fail towards dropping data
+  with a visible counter, not towards blocking.
+- **`hound = "3.5.1"`** writes the mono 16-bit PCM WAV file incrementally on
+  a background thread as samples arrive, so recording length isn't bounded
+  by available RAM.
+- **System audio** is NOT captured in Rust — ScreenCaptureKit is a
+  Swift/Apple-framework API with no first-class Rust binding, so it's a
+  small Swift sidecar process (`native/system-audio-capture/main.swift`),
+  spawned and stopped (via stdin) by the Rust `RecordingManager`. See
+  **ADR-001** for the full reasoning (direct FFI and virtual-driver
+  alternatives were considered and rejected).
+- **Echo cancellation** is optional and best-effort: `SpeexEchoCancellationBackend`
+  `dlopen`s `libspeexdsp.dylib` at runtime rather than linking it at build
+  time, so the app still builds and runs on machines without SpeexDSP
+  installed. If AEC is disabled, unavailable, or fails for any reason,
+  transcription falls back to the raw mic WAV — recording and transcription
+  never block on AEC. See **ADR-002**.
+- A **denied Screen Recording permission does not fail the whole recording** —
+  `RecordingManager::start_recording` catches the system-audio start
+  failure and falls back to mic-only, storing the reason in
+  `system_audio_stream_error` on the meeting's metadata instead of
+  propagating an error up through `?`. (This used to abort the entire
+  recording — see the fixed-bugs note in `docs/distributing.md`'s history if
+  you're wondering why this is called out.)
 
-```bash
-cd src-tauri
-cargo fmt -- --check
-cargo check --quiet
-cargo check --features speaker-matching-sherpa --quiet
-cargo test --quiet
+## 6. Transcription
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant Cmd as transcribe_meeting (async command)
+    participant Blocking as spawn_blocking task
+    participant Whisper as whisper-cli (subprocess)
+    participant DB as SQLite
+
+    FE->>Cmd: invoke("transcribeMeeting", meetingId)
+    Cmd->>DB: load settings + audio metadata (quick, under lock)
+    Cmd->>Blocking: move whisper-cli + AEC selection off the async runtime
+    Blocking->>Whisper: spawn with -m model -f audio -ojf (JSON output)
+    Whisper-->>Blocking: JSON transcript (whole file, on process exit)
+    Blocking-->>Cmd: TranscriptionOutput
+    Cmd->>DB: persist transcript_segments, clear/record pipeline_failure
+    Cmd->>FE: emit resonance://transcript-segment (per segment)
+    Cmd->>FE: emit resonance://transcript-stream-complete
+    Cmd-->>FE: TranscriptionResult (command return value)
 ```
 
-## 15. Known gotchas for future engineers and agents
+- **`whisper-cli` is an external binary, not a linked Rust crate.** This
+  keeps the whisper.cpp build (and its hardware-specific acceleration —
+  Metal, CoreML, etc.) entirely out of Scribe's own build, and lets a user
+  swap in whichever whisper.cpp build/model suits their machine without
+  recompiling Scribe. The trade-off is a runtime dependency the app has to
+  detect (`path_detection.rs` checks common Homebrew paths, then `$PATH`)
+  and validate (binary is executable, model file exists, absolute paths
+  only).
+- `WhisperShellTranscriber::transcribe` shells out with `-ojf` (JSON output
+  to file), then parses that JSON (`parse_whisper_json`) into
+  `TranscriptSegment`s with millisecond offsets, rejecting non-monotonic
+  offsets as a defensive check against a malformed whisper-cli build.
+- **Retry-once**: `transcribe_audio_with_retry` retries a single time on any
+  failure before giving up — cheap insurance against a transient spawn
+  failure, not a substitute for validating whisper-cli/model paths up front.
+- **The command runs off the async runtime** (`tauri::async_runtime::spawn_blocking`),
+  because whisper-cli on a long recording can run for as long as the
+  meeting itself. Originally this command was synchronous and the frontend
+  `await`ed it directly after `stopRecording()` — stopping an 81-minute
+  meeting meant staring at a spinner for however long transcription took,
+  with zero progress feedback, because the batch JSON output only arrives
+  once whisper-cli exits. The fix has two parts:
+  - Backend: run the whisper-cli + AEC work inside `spawn_blocking` so the
+    Tauri command doesn't tie up the invoke-handling thread pool for the
+    whole run.
+  - Frontend: `handleStop` in `App.tsx` no longer awaits transcription — it
+    stops the recording, returns control immediately, and transcribes in
+    the background (tracked per-meeting-id so the UI can show
+    "Transcribing…" against just that item), firing a completion
+    notification (`send_completion_notification`) when done.
+- **Streaming replay, not true streaming transcription**: despite the
+  `StreamingTranscriber`/`TranscriptEventSink` traits existing, the actual
+  whisper-cli integration is batch — `BatchReplayStreamingTranscriber`
+  wraps any batch `Transcriber` and replays its full output as a sequence of
+  "final" events after the fact. This is why the UI shows all transcript
+  segments appear at once rather than trickling in during whisper-cli's
+  run. A genuinely incremental transcriber (parsing whisper-cli's stdout
+  as it produces segments, rather than only its final JSON file) would let
+  the UI show real progress instead of just a spinner, and is the natural
+  next step if transcription latency remains a UX problem after the
+  background-run fix above. Not done yet because it requires either a
+  whisper-cli invocation mode that streams partial results to stdout, or an
+  in-process whisper.cpp binding — both bigger changes than the async fix.
+- **Detail-view transcript limit**: `get_meeting_history_detail` caps the
+  transcript segments it returns to `HISTORY_DETAIL_TRANSCRIPT_LIMIT`
+  (currently 5000; was 200, which silently cut off any meeting past ~45
+  minutes with a `transcriptTruncated` flag the UI barely surfaced). This is
+  a display cap, not data loss — the full transcript is always persisted;
+  only the detail view's render is capped, to bound worst-case DOM size for
+  pathologically long meetings.
 
-1. **Do not use Ollama for speaker identity.** Use local speaker embeddings and diarization.
-2. **Do not delete legacy Orator constants casually.** They preserve upgrade data migration.
-3. **Do not make SpeexDSP a hard build dependency.** AEC must remain optional.
-4. **Do not merge mic/system audio too early.** Separate channels preserve attribution and privacy options.
-5. **Do not treat imported whole-recording voice match as user-only proof.** It is a coarse pre-diarization signal.
-6. **Do not label unmatched transcript rows as user when matched windows exist.** Unmatched rows are context.
-7. **Do not shell-interpolate user paths.** Use `Command::arg()` and validate/canonicalize where needed.
-8. **Do not add cloud audio analysis as a default path.** Raw audio privacy is a core product constraint.
-9. **Do not scan/delete outside app data for retention or voice profile cleanup.** Canonical app-data checks are intentional.
-10. **Do not remove schema migration tests when changing persistence.** SQLite migrations are the upgrade path for all local user data.
+## 7. Summarization
 
-## 16. Reference map
+```mermaid
+flowchart TB
+    Segments["Transcript segments\n(from SQLite)"] --> Budget{"Rendered transcript\nunder 36,000 chars?"}
+    Budget -- yes --> SingleShot["Single chat completion\n(SUMMARY_SYSTEM + full transcript + /no_think)"]
+    Budget -- no --> Chunk["Split into ~12,000-char windows"]
+    Chunk --> Map["One 'map' chat completion per chunk\n(condense to bullet notes + /no_think)"]
+    Map --> Reduce["One 'reduce' chat completion\nover all chunk digests + /no_think"]
+    SingleShot --> Parse["Parse strict-JSON reply\n(tolerates code fences/preamble)"]
+    Reduce --> Parse
+    Parse --> MeetingSummary["MeetingSummary\n(executiveSummary, decisions,\nopenQuestions, actionItems)"]
 
-| Concern | Main files |
+    Client["LmStudioClient / OpenAiCompatibleClient\n(raw TCP + hand-rolled HTTP/1.1)"] -. serves .-> SingleShot
+    Client -. serves .-> Map
+    Client -. serves .-> Reduce
+```
+
+- **Generic OpenAI-compatible client, not an LM-Studio-only integration.**
+  `SummarizerProvider` (`LmStudio | Ollama | Custom`) picks between
+  `LmStudioClient` (which also drives the `lms` CLI to start/load/unload the
+  server and model — see `LmStudioLifecycle`) and `OpenAiCompatibleClient`
+  (a thin HTTP client for anything else, including Ollama's
+  OpenAI-compatible endpoint). Both implement one `ChatCompletion` trait, so
+  the actual summarization logic (`LmStudioSummarizer`) doesn't know or care
+  which server it's talking to. This avoids locking users into one local
+  LLM runtime.
+- **Raw TCP, not `reqwest`.** `summarizer/mod.rs` opens a `TcpStream` and
+  writes a hand-framed HTTP/1.1 request itself (`post`/`get`/`send_request`),
+  parsing status line, headers, and chunked-transfer-encoding by hand. This
+  keeps the dependency list free of an HTTP client crate (and its own
+  transitive dependency tree) for what is, in practice, always a
+  `127.0.0.1` loopback call to a local model server — there's no need for
+  TLS, redirects, cookies, or any of what a general HTTP client buys you.
+- **Map-reduce chunking** kicks in once the rendered transcript exceeds
+  `SINGLE_SHOT_CHAR_BUDGET` (36,000 chars, roughly 9k tokens) — chunks of
+  `CHUNK_CHAR_TARGET` (12,000 chars) are condensed individually, then
+  combined in one final reduce call. Both single-shot and reduce prompts
+  demand one strict JSON object matching a fixed schema; `parse_summary`
+  tolerates code fences and preamble text a chatty model might add around
+  the JSON.
+- **Default model, sizing, and the timeout failure mode** — see
+  **ADR-003** for the full story, including a real production incident:
+  the previous default (a 26B model) reliably failed on a real 81-minute
+  meeting because it was too slow for the hardware to finish a map/reduce
+  call inside the 600-second per-request timeout, surfacing as
+  `summarizer_unavailable` / `os error 35` (EAGAIN — the client's own read
+  timeout firing, not a real connectivity problem). The current default is
+  **Qwen3-14B, MLX 4-bit quantized** (reported by LM Studio as
+  `qwen3-14b-mlx`), sized for a 36GB Apple Silicon Mac, with a `/no_think`
+  directive appended to every prompt to skip Qwen3's default hidden
+  reasoning pass (pure latency overhead for a deterministic extraction
+  task). If you're packaging Scribe for lower-RAM machines, size down
+  (Qwen2.5-7B-Instruct or similar) rather than reuse this default as a
+  universal constant — model choice is a hardware-dependent decision, not a
+  fixed one.
+- **Model lifecycle**: `LmStudioLifecycle` shells out to the `lms` CLI to
+  start the server, load the configured model, and unload it after use —
+  so a large model only occupies RAM while a summary is actually being
+  produced, not for the app's entire lifetime.
+
+## 8. Dictation
+
+```mermaid
+flowchart LR
+    Hotkey["Global hotkey\n(tauri-plugin-global-shortcut,\ndouble-press to toggle)"] --> Capture["DictationRecorder\n(reuses cpal mic backend)"]
+    Capture --> Whisper2["whisper-cli\n(same transcriber as meetings)"]
+    Whisper2 --> Polish{"Polish enabled?"}
+    Polish -- yes --> PolishHelper["Swift sidecar: dictation-polish\n(Apple Intelligence / FoundationModels,\nmacOS 15+)"]
+    Polish -- no --> Raw["Raw transcript text"]
+    PolishHelper --> Inject["Clipboard write + paste\ninto focused app"]
+    Raw --> Inject
+    Pill["Floating pill (NSPanel)"] -. shows state .-> Hotkey
+```
+
+- **Capture reuses the same `cpal`-backed recorder** as meeting recording
+  (`DictationRecorder<CpalCaptureBackend>`), and the same
+  `WhisperShellTranscriber` for transcription — dictation isn't a
+  parallel, separately-maintained pipeline.
+- **Injection is clipboard-paste, not an Accessibility text-insertion API.**
+  Broadly compatible across arbitrary target apps (anything that accepts
+  paste) without needing per-app integration; the cost is a brief clipboard
+  overwrite, which the injection code is careful to sequence correctly
+  (write clipboard, then simulate paste, hiding the pill window first so
+  focus doesn't bounce to Scribe instead of the target app).
+- **Apple Intelligence polish is optional and degrades silently.** The
+  `dictation-polish` Swift sidecar uses `FoundationModels`, available macOS
+  15+; on older macOS or when the on-device model isn't ready, it exits
+  with a distinct code (2) that the Rust side treats as "use the raw
+  transcript" rather than an error.
+- **The floating pill is an `NSPanel`, not a normal Tauri window** —
+  specifically so that clicking it (to see status, or its mic/polish
+  controls) never activates Scribe or steals focus from whatever app the
+  user was dictating into. `tauri-nspanel` (macOS-only Cargo dependency)
+  converts the window at runtime. Getting the interaction right required
+  care around *when* focus changes relative to the paste action (hide the
+  panel, then paste — not the other way around), since a visible NSPanel
+  briefly grabbing key focus mid-paste would insert the text into Scribe's
+  own window instead of the target app.
+- **Hotkey detection is double-press, not press-and-hold** (`DictationHotkey`
+  tracks press timing to distinguish a deliberate double-tap from an
+  incidental single press) — modeled on the Wispr Flow interaction pattern,
+  since a single global hotkey with no visual "recording" affordance needs a
+  very deliberate trigger gesture to avoid accidental activation.
+- **Dictation sessions store stats only, not transcript text**
+  (`dictation_sessions` table) — word count, duration, whether polish was
+  used — by design, since dictated text is often much more sensitive/
+  ephemeral (passwords typed via dictation, personal messages) than meeting
+  transcripts, and there's no product need to keep the text around after
+  it's been pasted.
+
+## 9. Deterministic metrics and live nudges
+
+Two small, deliberately non-LLM modules:
+
+- **`rules/`** — pure functions over transcript segments. Tokenizes text,
+  counts filler words (`um`, `uh`, `like`) and hedging phrases (`i think`,
+  `kind of`, and similar), computes words-per-minute, total talk time, and
+  longest monologue. No state, no I/O — `calculate_metrics(segments) ->
+  MetricsSummary`.
+- **`nudges/`** — `LiveNudgePipeline` layers throttled live feedback on top
+  of the transcript replay stream (`NudgeTranscriptEventSink` composes it
+  with `TauriTranscriptEventSink`): filler-word/hedging detection, pace
+  outside 110-180 WPM, monologues over 45s. Each category is throttled
+  independently (default 30s) plus a wall-clock minimum gap (1.5s) so nudges
+  don't spam as segments replay quickly.
+
+**Why rule-based instead of asking the local LLM for live feedback**: this
+needs to be instant and deterministic — it fires while a transcript is
+replaying, not after a multi-second model round trip, and it shouldn't
+depend on whether a model server happens to be running. Reserve the LLM
+call (§7) for the one thing rules genuinely can't do well: synthesizing an
+executive summary and extracting decisions/action items from free text.
+
+## 10. Persistence
+
+- **`rusqlite` directly, no ORM.** `SqliteRepository` hand-writes every
+  query with `params![]` bound parameters — appropriate for a single-user,
+  fully local, embedded dataset where an ORM's main value (managing a
+  shared multi-user schema across a network boundary) doesn't apply, and
+  where the schema is small enough that hand-written SQL stays readable.
+- **Schema versioning**: a `schema_versions` table tracks applied
+  migrations (`run_migrations`, currently at version 15); `ensure_column`
+  validates column names/types against a static allow-list before
+  formatting any DDL string, since SQLite's `ALTER TABLE ADD COLUMN` can't
+  be parameterized the way row-level queries can.
+- **Live tables** (actually read/written by shipped features): `meetings`,
+  `transcript_segments`, `metrics`, `reports`, `meeting_summaries`,
+  `audio_metadata`, `settings`, `pipeline_failures`, `dictation_sessions`,
+  `schema_versions`.
+- **Schema-only tables** (exist, have no CRUD methods or reachable command
+  wired to them): `practice_recordings`, `practice_review_reports`,
+  `practice_timeline_annotations`, `voice_profiles`. See §11.
+- **Retention**: a background job removes raw audio files older than the
+  configured retention window (`rawAudioRetentionDays`), while keeping
+  transcripts/notes indefinitely — audio is the bulky, re-derivable
+  artifact; transcripts and notes are the durable value.
+
+## 11. Known dead code and unshipped features
+
+Documenting this honestly matters more than it might seem — without it, the
+schema-only tables and feature-gated code below look like bugs or
+half-finished work-in-progress to the next person (or agent) who finds them,
+when really they're a deliberate, paused product direction.
+
+| Item | Status | Where |
+| --- | --- | --- |
+| **`analysis::OllamaAnalyzer`** (post-meeting coaching scorecard) | Dead code. Superseded by the generic `summarizer` provider path (§7); the `MeetingSummarizer` trait it implements is still used, but nothing calls `OllamaAnalyzer` itself. `run_blocking_ollama_summary` and `ensure_analysis_provider_available` are `#[allow(dead_code)]`. | `src-tauri/src/analysis/` |
+| **Record and Review** (practice video recording/import, local review report) | Schema exists (`practice_recordings`, `practice_review_reports`, `practice_timeline_annotations`), and some backend plumbing (`media_import.rs` has `copy_practice_video`/`extract_practice_video_audio`), but there is no Tauri command wired to any of it and no frontend view. Original spec: `docs/record-and-review-plan.md`. | `src-tauri/src/media_import.rs`, `docs/record-and-review-plan.md` |
+| **Voice-matched coaching** (speaker enrollment, embeddings, diarization) | Schema-only (`voice_profiles` table, no CRUD methods). The `speaker-matching-sherpa` Cargo feature gates an optional `sherpa-onnx` dependency but is never enabled by default and nothing in the active command surface uses it. | `Cargo.toml` (`speaker-matching-sherpa` feature) |
+| **Cloud video review** (sampled-frame review via OpenAI) | Absent from the current codebase — no `video_review.rs`, no OpenAI API wiring, no frame sampling. Referenced in `docs/ideas/meeting-coach.md` as original product intent. | `docs/ideas/meeting-coach.md` |
+
+If reviving any of these, start from the linked plan/idea doc for the
+original intent, but verify against current code — none of it has been kept
+in sync with the Scribe-era pipeline (dictation, the generic summarizer
+provider, the async transcription fix) described above.
+
+## 12. Tauri command and event surface
+
+All commands are registered in `lib.rs`'s `invoke_handler`. Grouped by area:
+
+| Area | Commands |
 | --- | --- |
-| Tauri command orchestration | `src-tauri/src/lib.rs`, `src/tauri-commands.ts` |
-| Shared domain and settings | `src-tauri/src/domain.rs`, `src/contracts.ts` |
-| SQLite persistence | `src-tauri/src/persistence/mod.rs` |
-| Mic/system audio | `src-tauri/src/audio/`, `src-tauri/native/system-audio-capture/main.swift` |
-| AEC | `src-tauri/src/audio/aec.rs`, `docs/decisions/adr-002-offline-aec-adapter.md` |
-| Transcription | `src-tauri/src/transcription/mod.rs` |
-| Rules/metrics | `src-tauri/src/rules/mod.rs` |
-| Live nudges | `src-tauri/src/nudges/mod.rs`, `src/components/LiveNudgePanel.tsx` |
-| Analysis and summaries | `src-tauri/src/analysis/mod.rs`, `src/components/ScorecardReport.tsx` |
-| Scoring | `src-tauri/src/scoring/mod.rs` |
-| Imported recordings | `src-tauri/src/media_import.rs`, `src/components/ImportedRecordingPanel.tsx` |
-| Voice matching/diarization | `src-tauri/src/voice_matching.rs`, `src/components/ImportedRecordingPanel.tsx` |
-| History/trends | `src/components/MeetingHistoryPanel.tsx`, `src/components/TrendsDashboard.tsx` |
-| Privacy settings | `src/components/PrivacySettingsPanel.tsx` |
-| First-run setup | `src/components/SetupGuidePanel.tsx` |
-| Packaging | `src-tauri/tauri.conf.json`, `src-tauri/build.rs`, `src-tauri/Info.plist` |
-| Frontend tests | `tests/frontend/components.test.tsx`, `tests/frontend/notifications.test.ts`, `tests/frontend/formatting.test.ts` |
+| App/status | `get_app_status`, `check_permissions`, `open_permission_settings` |
+| Recording | `list_audio_devices`, `start_recording`, `stop_recording` |
+| Transcription/analysis | `transcribe_meeting`, `calculate_metrics`, `summarize_meeting` |
+| History | `list_meeting_history`, `get_meeting_history_detail`, `delete_meeting`, `list_meeting_trends` |
+| Dictation | `start_dictation`, `stop_dictation`, `toggle_dictation`, `list_dictation_sessions`, `delete_dictation_session`, `get_dictation_stats_summary`, `inject_dictation_text`, `polish_dictation`, `update_dictation_settings` |
+| Settings | `update_summarizer_settings`, `list_summarizer_models`, `update_transcriber_settings`, `update_audio_processing_settings`, `update_privacy_settings` |
+| Misc | `send_completion_notification` |
+
+Events (one-way, `app.emit()` to frontend `listen()`):
+
+- `resonance://transcript-segment` — one per transcript segment, emitted
+  during transcript replay (see §6; despite the name suggesting live
+  streaming, these currently all fire in a burst once whisper-cli's full
+  output is ready).
+- `resonance://transcript-stream-complete` — end-of-replay marker, includes
+  segment count and any dropped-event count from the bounded event sink.
+- `resonance://live-nudge` — one per nudge from `LiveNudgePipeline` (§9).
+
+**The `spawn_blocking` pattern**: any command that does real, possibly
+long-running work outside pure DB reads/writes — `transcribe_meeting`
+(whisper-cli + AEC), `summarize_meeting` (LM Studio/Ollama HTTP calls +
+model load/unload), `inject_dictation_text` and `polish_dictation`
+(spawning `pbcopy`/`osascript`/the polish sidecar) — is an `async fn`
+command that moves the blocking work into
+`tauri::async_runtime::spawn_blocking`, re-acquiring any repository locks
+only before/after the blocking section, never across it. This is a
+deliberate, repeated pattern: **new commands that shell out to a subprocess
+or make a network call should follow it too**, rather than doing that work
+directly in a synchronous command body.
+
+## 13. Build and packaging
+
+- **Frontend**: Vite builds `src/` to `dist/`, which Tauri's bundler embeds.
+- **Swift sidecars**: `src-tauri/build.rs` compiles both
+  `native/system-audio-capture/main.swift` and
+  `native/dictation-polish/main.swift` via `xcrun swiftc -parse-as-library -O`
+  into `src-tauri/binaries/<name>-<target>`, skipping recompilation if the
+  output is already newer than the source. `tauri.conf.json`'s
+  `bundle.externalBin` lists both so Tauri copies the right target's binary
+  into the app bundle.
+- **Signing**: ad-hoc signed only (Tauri's default when no `signingIdentity`
+  is set) — no Apple Developer ID yet. This has a real, recurring cost: see
+  the README's "Building and installing a distributable build" section for
+  the day-to-day workaround, and the note below for why it hasn't been
+  fixed properly yet.
+- **A self-signing attempt was tried and abandoned**: a self-signed
+  "Scribe Local Dev" code-signing certificate was generated and trusted in
+  the login keychain, but `codesign -s "Scribe Local Dev"` failed with
+  `errSecInternalComponent` (suspected login-keychain password out of sync
+  with the account password after a password reset). If revisited: try
+  resetting the login keychain password to match the account password
+  first. The real fix is an Apple Developer ID + notarization
+  (`docs/distributing.md`'s "Upgrading to notarized builds later" section
+  has the concrete steps) — self-signing only gets a locally-consistent
+  signature hash across rebuilds, it doesn't satisfy Gatekeeper on other
+  machines the way notarization does.
+- **Packaging scripts**: `bun run package:mac` (`.app` only) and
+  `bun run package:mac:dmg` (`.dmg`, what you'd hand to a teammate).
+
+## 14. Dependency reference
+
+### Rust (`src-tauri/Cargo.toml`)
+
+| Crate | Why |
+| --- | --- |
+| `tauri` (`macos-private-api`, `tray-icon`, `image-png` features) | App shell, window management, tray icon, IPC. `macos-private-api` is needed for the NSPanel dictation pill conversion. |
+| `tauri-plugin-global-shortcut` | System-wide dictation hotkey registration, independent of window focus. |
+| `tauri-nspanel` (macOS-only, git dependency) | Converts the dictation pill's window into a non-activating `NSPanel` at runtime — not available as a published crate at the version needed, hence the git dependency pinned to the `v2` branch. |
+| `cpal` (pinned `=0.17.1`) | Cross-platform low-level audio input callback API — mic capture and dictation capture both go through it. |
+| `hound` | WAV file reading/writing (PCM 16-bit mono), used for mic recordings, AEC input/output, and dictation capture. |
+| `rusqlite` | Embedded SQLite driver — all persistence. No ORM (see §10). |
+| `serde` / `serde_json` | (De)serialization for Tauri command DTOs, whisper-cli's JSON output, and the summarizer's chat-completion JSON. |
+| `tempfile` | Scratch directories for whisper-cli's JSON output and AEC intermediates. |
+| `sherpa-onnx` (optional, `speaker-matching-sherpa` feature) | ONNX runtime bindings for the never-enabled-by-default voice-matching feature (§11). Feature-gated specifically so normal builds don't pull in ONNX Runtime's native binary. |
+| `tauri-build` (build-dependency) | Tauri's code-generation step; also where `build.rs` hooks in the Swift sidecar compilation. |
+
+No HTTP client crate (`reqwest` etc.) — the summarizer hand-rolls HTTP/1.1
+over a raw `TcpStream` (§7). No async runtime crate beyond what Tauri
+already pulls in — `tauri::async_runtime::spawn_blocking` is used directly.
+
+### Frontend (`package.json`)
+
+| Package | Why |
+| --- | --- |
+| `react` / `react-dom` (v19) | UI framework. |
+| `@tauri-apps/api` | `invoke`/`emit`/`listen` bindings into the Rust backend. |
+| `vite` + `@vitejs/plugin-react` | Dev server (HMR) and production bundling. |
+| `typescript` | Static typing across the whole frontend, including the hand-written IPC contracts in `contracts.ts`. |
+| `@biomejs/biome` | Combined linter + formatter (replaces ESLint + Prettier with one faster tool). |
+| `@tauri-apps/cli` | `tauri dev` / `tauri build` commands. |
+
+## 15. Testing and verification
+
+- **Rust**: `cargo test` (150+ tests) covers domain logic, parsing (whisper
+  JSON, chat-completion responses), the recording manager's fallback
+  behavior, persistence round-trips, and the map-reduce chunking logic. A
+  handful of tests are `#[ignore]`d because they need real hardware/local
+  services (`whisper-cli` + a model, a running LM Studio, Accessibility
+  permission) — run them manually when touching those paths.
+- **Frontend**: `bun test tests/frontend` for component/utility tests;
+  `tsc --noEmit` for type-checking; `biome check` for lint/format.
+- **No end-to-end test harness.** The Tauri backend requires the native
+  app shell — Vite's dev server alone (`bun run dev`) can render the
+  frontend, but `isTauriRuntime()` is false there, so none of the actual
+  `invoke()` calls reach real Rust commands. Verifying a change to the
+  record/transcribe/summarize pipeline means running the actual built app
+  (`bun run tauri dev`, or a packaged build), not just the web preview.
+
+## Further reading
+
+- `docs/decisions/adr-001-system-audio-sidecar.md` — why a Swift sidecar for system audio, not FFI or a virtual driver.
+- `docs/decisions/adr-002-offline-aec-adapter.md` — why offline SpeexDSP AEC, dlopen'd rather than linked.
+- `docs/decisions/adr-003-summarizer-model-and-timeout.md` — the 26B-model timeout incident, and why the default model/timeout/`/no_think` are set the way they are.
+- `docs/record-and-review-plan.md`, `docs/ideas/meeting-coach.md` — original product direction for the unshipped features in §11.
+- `docs/distributing.md` — the team-facing version of the ad-hoc-signing workaround.

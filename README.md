@@ -1,244 +1,190 @@
-# Resonance
+# Scribe
 
-**Capture what happened. Improve what you said.**
+**Private, on-device meeting notes and dictation for macOS.**
 
-Resonance is a privacy-first macOS meeting coach and practice reviewer. It records local meeting audio, transcribes it with local whisper.cpp, summarizes meetings with local Ollama, gives live communication nudges, tracks speaking trends, can use local voice enrollment plus speaker matching to focus coaching on your own speech in downloaded recordings, and can record or import self-practice videos for Record and Review.
+Scribe is a Tauri desktop app that records meetings locally, transcribes them with
+`whisper.cpp`, and writes concise notes (executive summary, decisions, open
+questions, action items) with a local LLM — nothing leaves your Mac. It also
+ships a system-wide dictation mode: hold a hotkey, speak, and the transcribed
+(optionally polished) text is pasted into whatever app you were typing into.
 
-Raw audio stays on your Mac by default. Cloud video review is available only as an explicit opt-in flow: Resonance samples video frames locally, sends those sampled images to OpenAI only after a saved setting plus per-review confirmation, and validates the JSON response before saving feedback.
+The app is packaged under the product name **Scribe**, but the source still
+uses its original working name **Resonance** for the crate (`resonance_lib`),
+the app-data folder (`com.resonance.meetingcoach`), and some helper binaries
+(`resonance-system-audio-capture`). This is intentional and harmless — just
+don't be surprised to see both names in the codebase.
 
-## What Resonance does
+## What it does today
 
 | Capability | What it gives you |
 | --- | --- |
-| Local microphone recording | Saves raw mic audio before any processing. |
-| System audio capture | Captures remote participant/system audio separately on macOS through ScreenCaptureKit. |
-| Echo-cancellation preprocessing | Optionally derives a cleaned mic WAV when a compatible system-audio reference and SpeexDSP are available. |
-| Local transcription | Uses a configured `whisper-cli` binary and model path. |
-| Live nudges | Emits local rule-based nudges for filler words, hedging, pace, and talk-time patterns. |
-| Post-meeting coaching | Uses local Ollama with quote-grounded JSON validation. |
-| Meeting summaries | Summarizes downloaded recordings into executive summary, action items, decisions, open questions, and optional user-only delivery feedback. |
-| Voice-aware imported coaching | Uses local voice enrollment, speaker embeddings, and diarization to coach only matched user speech. |
-| Record and Review | Records or imports self-practice videos, extracts audio locally, and produces a practice report with timeline annotations. |
-| History and trends | Stores local transcripts, reports, imported summaries, metrics, and trend points in SQLite. |
-| Retention controls | Lets you configure raw-audio retention while preserving transcripts and reports. |
+| Meeting recording | Local microphone capture, plus separate system/remote-participant audio via ScreenCaptureKit. |
+| Echo cancellation | Optional offline SpeexDSP pass that derives a cleaned mic WAV before transcription, when a compatible reference track is available. |
+| Local transcription | Runs a configured `whisper-cli` binary + model over the recording, in the background so "stop meeting" doesn't block the UI. |
+| Local summarization | Sends the transcript to a local OpenAI-compatible chat server (LM Studio, Ollama, or any custom endpoint) and produces structured notes. Long transcripts are automatically map-reduced into chunks. |
+| Copy to Slack/Teams | One click copies the generated notes (bold section labels, bullet lists, no tables) as rich text that pastes cleanly into chat apps. |
+| Live nudges | Deterministic, rule-based (not LLM) feedback during transcript playback: filler words, hedging, pace, long monologues. |
+| History & trends | Every meeting's transcript, metrics, and notes are stored locally in SQLite; a trends view charts pace/filler words/score over time. |
+| Dictation | Global hotkey (double-press to toggle), floating non-activating pill UI, optional on-device polish via Apple Intelligence (macOS 15+), paste-based injection into the focused app. |
+| Retention controls | Configure how long raw audio is kept; transcripts and notes are kept regardless. |
+| Permission onboarding | First-run flow for Microphone / Screen Recording / Accessibility, with a clear explanation of what's degraded without each. |
+
+### Not implemented yet (schema exists, nothing wired up)
+
+The SQLite schema and some backend plumbing exist for a few features that
+**have no UI and no reachable commands today** — don't be alarmed if you spot
+them while poking around:
+
+- **Record and Review** (practice video recording/import + local review report) — see `docs/record-and-review-plan.md` for the original spec.
+- **Voice-matched coaching** (speaker enrollment/diarization, `voice_profiles` table, the `speaker-matching-sherpa` Cargo feature) — schema-only.
+- **Cloud video review** (sampled-frame review via OpenAI) — mentioned in older docs, not present in code.
+- **Ollama-based coaching scorecard** (`analysis::OllamaAnalyzer`) — superseded by the generic summarizer path below; kept around but never invoked.
+
+See `docs/technical-architecture.md` § "Known dead code and unshipped features" for the full, current status of each.
 
 ## Requirements
 
-Resonance currently targets local macOS development and packaging.
+- macOS 13+ (ScreenCaptureKit system-audio capture; the dictation Apple Intelligence polish helper additionally needs macOS 15+, and degrades gracefully without it).
+- [Bun](https://bun.sh) for the frontend.
+- Rust + Cargo (`rustc --version` to check) for the Tauri backend.
+- Xcode Command Line Tools (`xcode-select --install`) — needed to compile the two Swift sidecar helpers at build time.
+- [`whisper.cpp`](https://github.com/ggml-org/whisper.cpp)'s `whisper-cli` binary, plus a downloaded `ggml-*.bin` model.
+- A local LLM server for summarization — any one of:
+  - [LM Studio](https://lmstudio.ai) (default; the app can start/stop/load models for it via the `lms` CLI), or
+  - [Ollama](https://ollama.com), or
+  - any other server that speaks the OpenAI-compatible `/v1/chat/completions` API.
+- Optional: SpeexDSP (`brew install speexdsp` or similar) for echo cancellation — recording and transcription work fine without it, just without the cleaned-mic pass.
 
-- macOS 13 or newer for ScreenCaptureKit system-audio capture.
-- Bun for frontend package scripts.
-- Rust toolchain for the Tauri backend.
-- Xcode Command Line Tools for the Swift ScreenCaptureKit helper.
-- `ffmpeg` for imported/downloaded recording audio extraction.
-- `whisper-cli` from whisper.cpp plus a local Whisper model file.
-- Ollama running locally on `127.0.0.1:11434` with a local model for summaries/coaching.
-- Optional: SpeexDSP installed locally for echo-cancellation preprocessing.
-- Optional: local sherpa-onnx speaker embedding and speaker segmentation ONNX models for voice matching and diarization.
-- Optional: OpenAI API key for cloud visual review of sampled video frames.
-
-## Quick start for development
-
-1. Install JavaScript dependencies:
-
-   ```bash
-   bun install
-   ```
-
-2. Install or verify Rust:
-
-   ```bash
-   rustc --version
-   cargo --version
-   ```
-
-3. Install local external tools. Example Homebrew commands:
-
-   ```bash
-   brew install ffmpeg ollama
-   ```
-
-   Install whisper.cpp separately if your system does not already provide `whisper-cli`. Then download a local Whisper model such as `ggml-base.bin` or `ggml-small.bin`.
-
-4. Start Ollama and pull a local model:
-
-   ```bash
-   ollama serve
-   ollama pull llama3.2
-   ```
-
-5. Run the Tauri app:
-
-   ```bash
-   bun run tauri dev
-   ```
-
-6. In the app, open the setup panel and configure:
-
-   - `whisper-cli` binary path, for example `/opt/homebrew/bin/whisper-cli`.
-   - Whisper model path, for example `/Users/you/models/ggml-base.bin`.
-   - Optional speaker embedding model path for voice matching.
-   - Optional speaker segmentation model path for diarization.
-
-## Running with optional local voice matching
-
-The `sherpa-onnx` dependency is optional and feature-gated so normal builds do not require speaker-model native code.
-
-To compile the Rust backend with the local speaker matching adapter:
+## Quick start (development)
 
 ```bash
-cd src-tauri
-cargo check --features speaker-matching-sherpa
-```
+# 1. Install JS dependencies
+bun install
 
-For app development with the feature enabled, pass the feature to the Tauri CLI:
+# 2. Confirm your Rust toolchain
+rustc --version && cargo --version
 
-```bash
-bun run tauri dev --features speaker-matching-sherpa
-```
+# 3. Install whisper.cpp and a model (Homebrew example)
+brew install whisper-cpp
+# then download a model, e.g. ggml-base.bin, from the whisper.cpp releases
 
-Then configure absolute paths for:
+# 4. Install and start a local LLM server, e.g. LM Studio, and load a model
+#    (Qwen3-14B-MLX-4bit is a good fit for 32GB+ Apple Silicon Macs — see
+#    docs/technical-architecture.md § Summarization for sizing notes)
 
-- Speaker embedding model: used to extract local speaker embeddings from your enrollment sample and candidate audio.
-- Speaker segmentation model: used to diarize imported recordings into speaker turns before matching those turns against your local profile.
-
-The app keeps this local. It does not use Ollama for identity matching; Ollama is only used for text summaries and coaching.
-
-## Typical usage
-
-### Record and coach a live meeting
-
-1. Open Resonance from the Tauri app window.
-2. Confirm macOS permissions:
-   - Microphone permission for local mic capture.
-   - Screen & System Audio Recording permission if system audio is enabled.
-3. Click start recording.
-4. Speak normally. Resonance records mic audio and, when enabled, system audio separately.
-5. Stop recording.
-6. Run transcription.
-7. Run deterministic metrics.
-8. Run local analysis to generate a scorecard report.
-9. Review history and trends over time.
-
-### Summarize a downloaded recording
-
-1. Put the recording somewhere local, such as Downloads.
-2. Paste the absolute media path into the downloaded-recording panel.
-3. Confirm `ffmpeg` path if the default is not correct.
-4. Click **Extract, transcribe, and summarize**.
-5. Review the executive summary, action items, decisions, and open questions.
-
-### Get speaking feedback only for your own speech in a downloaded recording
-
-1. Record a short mic test in Resonance.
-2. Click **Enroll from last mic test**.
-3. Configure a local speaker embedding model path.
-4. Click **Prepare matching**.
-5. Configure a local speaker segmentation model path.
-6. For a downloaded recording, use:
-   - **Preview speaker segments** to inspect diarization readiness.
-   - **Match my speaker segments** to identify likely user speech windows.
-7. Enable **Use my matched voice profile for speaking coaching**.
-8. Optional: enable cloud video review and confirm this specific meeting review may send sampled frames to OpenAI.
-9. Run the imported summary.
-
-If voice matching is not available, use **I am the main speaker/presenter in this recording** only when that is clearly true. That is a manual fallback, not identity detection.
-
-For imported meeting videos, visual feedback is only attempted when Resonance finds matched user-speech windows. OpenAI is asked to review sampled frames around those windows and to return audio-only status when your camera appears off, hidden, or not identifiable. If the recording is audio-only or no user speech is matched, Resonance keeps the result audio-only and does not send frames.
-
-### Record and review a practice video
-
-1. Open **Record and Review**.
-2. Enter an optional practice title.
-3. Choose either:
-   - **Start camera practice**, then **Stop and save practice** within 15 minutes.
-   - Paste an absolute `.mp4`, `.mov`, or `.webm` path and click **Import practice video**.
-4. Confirm the `ffmpeg` path if the default is not correct.
-5. Click **Run local audio review** to extract audio locally, transcribe it, calculate delivery metrics, and create a practice report.
-6. For visual feedback, launch Resonance from a terminal that has `RESONANCE_OPENAI_API_KEY` set, enable cloud video review, confirm the specific review, then click **Run combined review**.
-7. Review the overall/audio/visual score, suggestions, privacy note, and timeline annotations.
-
-Visual review uses sampled frames rather than uploading the whole video. Configure cost controls with optional environment variables:
-
-```bash
-export RESONANCE_OPENAI_API_KEY="your_api_key"
-export RESONANCE_OPENAI_MODEL="gpt-4.1-mini"                  # optional default
-export RESONANCE_OPENAI_MAX_FRAMES="12"                       # optional, capped at 16
-export RESONANCE_OPENAI_FRAME_INTERVAL_SECONDS="10"           # optional, clamped 5-60
+# 5. Run the app
 bun run tauri dev
 ```
 
-## Commands
+On first launch, Scribe walks you through granting Microphone / Screen
+Recording / Accessibility permissions, and its Settings screen lets you point
+at your `whisper-cli` binary/model path and your LLM server's host/port/model
+(with a "Detect" button to list what's available).
+
+## Everyday commands
 
 | Command | Purpose |
 | --- | --- |
-| `bun install` | Install frontend/tooling dependencies. |
-| `bun run tauri dev` | Run the desktop app in development. |
-| `bun run test:frontend` | Run Bun-based frontend/component tests. |
-| `bun run lint` | Run Biome checks. |
-| `bun run lint:fix` | Apply Biome-safe formatting/import fixes. |
-| `bun run build` | Type-check and build the frontend. |
-| `bun run package:mac` | Build a local macOS `.app` bundle. |
-| `bun run package:mac:dmg` | Build a `.dmg` for handing to other Macs. See `docs/distributing.md`. |
-| `cd src-tauri && cargo test` | Run Rust tests. |
-| `cd src-tauri && cargo check --features speaker-matching-sherpa` | Validate the optional speaker matching build. |
+| `bun run tauri dev` | Run the desktop app in development (hot-reloads the frontend; a Rust change needs a restart). |
+| `bun run lint` / `bun run lint:fix` | Biome checks / auto-fix. |
+| `bun run build` | Type-check (`tsc --noEmit`) and build the frontend bundle. |
+| `bun run test:frontend` | Bun-based frontend tests (`tests/frontend/`). |
+| `cd src-tauri && cargo check` | Fast Rust compile check. |
+| `cd src-tauri && cargo test` | Rust unit/integration tests (150+; a few native ones are `#[ignore]`d since they need real hardware/whisper-cli/LM Studio). |
+| `bun run package:mac` | Build a local unsigned `.app` bundle. |
+| `bun run package:mac:dmg` | Build a `.dmg` for handing to another Mac. |
 
-## Local data and privacy
+## Building and installing a distributable build
 
-Resonance stores local app data under the macOS app data directory for `com.resonance.meetingcoach`. It uses:
+There's no Apple Developer ID yet, so builds are **ad-hoc signed** (Tauri's
+default) rather than notarized. That's fine for handing the app to yourself
+or a teammate, but macOS's Gatekeeper and TCC (permissions) behave a little
+differently than with a notarized app — follow this exactly to avoid
+"app is damaged" dialogs and permission dead-ends.
 
-- `resonance.sqlite3` for meetings, transcripts, metrics, reports, settings, imported summaries, failures, and voice profile metadata.
-- Per-meeting audio files for raw mic audio and optional system audio.
-- A local voice enrollment sample under the app data directory.
-- Imported-recording extracted audio under the app data directory.
-- Practice videos and extracted practice audio under `practice-recordings/` in the app data directory.
-
-During the Orator -> Resonance rebrand, the app gained a legacy migration that copies local data from the previous app identity into the new Resonance app data directory and rewrites stored app-data paths. The legacy strings that remain in source code are only for that upgrade path.
-
-## Validation checklist
-
-Before relying on a local build, run:
+### 1. Build the DMG
 
 ```bash
-bun run test:frontend
-bun run lint
-bun run build
-cd src-tauri && cargo fmt -- --check
-cd src-tauri && cargo check --quiet
-cd src-tauri && cargo test --quiet
+bun run package:mac:dmg
 ```
 
-If you are working on voice matching:
+This produces `src-tauri/target/release/bundle/dmg/Scribe_<version>_aarch64.dmg`
+(or `x64` on Intel).
+
+### 2. Install it and clear the quarantine flag
 
 ```bash
-cd src-tauri && cargo check --features speaker-matching-sherpa --quiet
+# Mount the DMG, then copy (or drag) Scribe.app into /Applications, then:
+xattr -cr /Applications/Scribe.app
 ```
+
+Without this, Gatekeeper blocks the app as coming from an "unidentified
+developer." (Right-click → Open and confirming the dialog once has the same
+effect, if you'd rather not use Terminal.)
+
+### 3. Grant permissions — and expect to re-grant them after every rebuild
+
+Launch the app and step through the permission onboarding (Microphone,
+Screen Recording, Accessibility — none are hard requirements; the app
+degrades gracefully without each, see the table above).
+
+**The gotcha:** every `cargo build`/`tauri build` changes the app's ad-hoc
+code-signature hash. macOS ties Screen Recording and Accessibility grants to
+that hash, so **each rebuild silently invalidates both** — System Settings
+still shows Scribe toggled on, but it's an orphaned grant that doesn't match
+the new binary, and the app just quietly loses the permission.
+
+When that happens (you'll notice system audio stop capturing, or dictation
+stop pasting into other apps):
+
+1. Open **System Settings → Privacy & Security → Screen Recording** (or
+   **Accessibility**), select the stale Scribe row, and remove it with `−`.
+2. Trigger a fresh permission request from inside the app — start a meeting
+   recording (for Screen Recording) or attempt a dictation paste (for
+   Accessibility).
+3. Grant the permission in the native prompt that appears.
+4. **Fully quit the app (Cmd+Q) and relaunch it.** TCC grants don't take
+   effect on an already-running process.
+
+If you get an Apple Developer ID later, this whole dance goes away — add
+`signingIdentity` under `bundle.macOS` in `src-tauri/tauri.conf.json` and
+notarize with `xcrun notarytool` as a build step. See `docs/distributing.md`
+for the day-to-day version of this section aimed at a team installing builds
+you hand them, and `docs/technical-architecture.md` for why we haven't done
+this yet.
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
-| `src/` | React frontend, TypeScript contracts, Tauri command wrappers, notification helpers. |
-| `src/components/` | User-facing panels for recording, setup, reports, history, trends, privacy, and imported recordings. |
-| `src-tauri/src/` | Rust backend modules for commands, audio, persistence, transcription, analysis, scoring, rules, nudges, and voice matching. |
-| `src-tauri/native/system-audio-capture/` | Swift ScreenCaptureKit sidecar source. |
-| `src-tauri/tauri.conf.json` | Tauri product, bundle, window, and external helper configuration. |
-| `docs/decisions/` | Architecture decision records. |
-| `docs/technical-architecture.md` | Detailed engineering rationale and file map. |
-| `tests/frontend/` | Bun-rendered React/component and notification tests. |
-| `spikes/` | Historical validation spikes for Whisper, ScreenCaptureKit, and AEC. |
+| `src/App.tsx` | The entire frontend UI — recording, history, trends, settings, dictation panel. Single file by design (see technical doc). |
+| `src/DictationPill.tsx` | The floating, non-activating dictation pill window. |
+| `src/contracts.ts` | TypeScript types mirroring every Rust `Serialize` DTO — the typed IPC boundary. |
+| `src/tauri-commands.ts` | Thin `invoke()` wrappers, one per Tauri command. |
+| `src/summary-clipboard.ts` | Builds the rich-text/plain-text clipboard payload for the "Copy" button. |
+| `src-tauri/src/lib.rs` | Tauri command handlers, app wiring, settings. |
+| `src-tauri/src/audio/` | Mic capture (cpal), system audio (ScreenCaptureKit sidecar), AEC (SpeexDSP), WAV I/O. |
+| `src-tauri/src/transcription/` | `whisper-cli` subprocess wrapper, streaming replay. |
+| `src-tauri/src/summarizer/` | LM Studio/Ollama/custom chat client, map-reduce summarization. |
+| `src-tauri/src/dictation/` | Hotkey detection, capture, clipboard injection, Apple Intelligence polish. |
+| `src-tauri/src/rules/`, `src-tauri/src/nudges/` | Deterministic transcript metrics and live coaching nudges. |
+| `src-tauri/src/persistence/` | `SqliteRepository` — all SQL lives here. |
+| `src-tauri/native/` | Swift sidecar sources (system audio capture, dictation polish). |
+| `docs/technical-architecture.md` | The detailed engineering doc — read this next. |
+| `docs/decisions/` | ADRs for the architecturally significant calls. |
+| `docs/distributing.md` | The short version of "Building and installing a distributable build" above, written for handing builds to teammates. |
 
 ## Known limitations
 
-- The app is macOS-focused.
-- System audio capture requires macOS Screen Recording permission.
-- Voice matching requires locally supplied speaker embedding and segmentation models.
-- Echo cancellation only produces a cleaned file when all prerequisites are compatible; otherwise Resonance safely falls back to raw mic audio.
-- Imported-recording input is path-based rather than a native file picker to avoid adding another dependency.
-- Camera recording uses the Tauri WebView media APIs and saves the resulting video through a Rust command; native AVFoundation capture remains a future hardening path.
-- Visual posture, eye-contact, gesture, framing, and lighting review uses OpenAI through sampled frames. It requires `curl`, `ffmpeg`, an OpenAI API key in the runtime environment, the saved cloud-video setting, and per-review confirmation.
-- Ollama summaries depend on a local Ollama server and model quality.
+- macOS only.
+- System audio capture requires the Screen Recording permission; without it, recording silently falls back to mic-only.
+- Echo cancellation only runs when SpeexDSP is installed and a compatible reference track exists; otherwise it safely falls back to the raw mic recording.
+- Summarization quality and speed depend entirely on your local model choice and hardware — see `docs/technical-architecture.md` § Summarization for sizing guidance.
+- Not notarized — see the rebuild/re-grant dance above.
 
-## More technical detail
+## Learn more
 
-Read `docs/technical-architecture.md` for the full implementation rationale, library choices, alternatives, privacy boundaries, and file references.
+Read `docs/technical-architecture.md` for the full architecture: why each
+dependency was chosen, how the pieces fit together (with diagrams), the
+Tauri command/event surface, and an honest accounting of what's dead code vs.
+shipped.
