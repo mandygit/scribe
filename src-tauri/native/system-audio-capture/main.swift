@@ -21,7 +21,7 @@ enum SystemAudioCaptureError: LocalizedError {
         case .missingOutputPath:
             return "Missing output path argument for system audio capture."
         case .screenRecordingDenied:
-            return "Screen Recording permission is required to capture system audio. Enable Resonance in System Settings -> Privacy & Security -> Screen Recording, then relaunch."
+            return "Screen Recording permission is required to capture system audio. Enable Scribe in System Settings -> Privacy & Security -> Screen Recording, then relaunch."
         case .noDisplayAvailable:
             return "ScreenCaptureKit did not report any displays to capture."
         case let .cannotRemoveExistingOutput(url, error):
@@ -46,7 +46,7 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let outputURL: URL
     private let writer: AVAssetWriter
     private let audioInput: AVAssetWriterInput
-    private let queue = DispatchQueue(label: "com.resonance.meetingcoach.system-audio")
+    private let queue = DispatchQueue(label: "com.scribe.app.system-audio")
     private let stateLock = NSLock()
     private var hasStartedWriting = false
     private var capturedAudioBuffers = 0

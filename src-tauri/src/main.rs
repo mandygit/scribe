@@ -1,3 +1,3 @@
 fn main() {
-    resonance_lib::run();
+    scribe_lib::run();
 }

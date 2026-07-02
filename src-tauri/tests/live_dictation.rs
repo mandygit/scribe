@@ -5,25 +5,25 @@
 //! with:
 //!
 //! ```sh
-//! RESONANCE_LIVE_WAV=/abs/dictation.wav \
-//! RESONANCE_WHISPER_MODEL=/abs/ggml-small.bin \
+//! SCRIBE_LIVE_WAV=/abs/dictation.wav \
+//! SCRIBE_WHISPER_MODEL=/abs/ggml-small.bin \
 //! cargo test --test live_dictation -- --ignored --nocapture
 //! ```
 
 use std::path::Path;
 
-use resonance_lib::dictation::transcribe_clip;
-use resonance_lib::domain::ResonanceSettings;
-use resonance_lib::transcription::WhisperShellTranscriber;
+use scribe_lib::dictation::transcribe_clip;
+use scribe_lib::domain::ScribeSettings;
+use scribe_lib::transcription::WhisperShellTranscriber;
 
 #[test]
 #[ignore = "requires whisper-cli and a whisper model"]
 fn live_clip_to_text() {
-    let wav = std::env::var("RESONANCE_LIVE_WAV").expect("set RESONANCE_LIVE_WAV to a wav clip");
-    let whisper_model = std::env::var("RESONANCE_WHISPER_MODEL")
-        .expect("set RESONANCE_WHISPER_MODEL to a ggml model");
+    let wav = std::env::var("SCRIBE_LIVE_WAV").expect("set SCRIBE_LIVE_WAV to a wav clip");
+    let whisper_model = std::env::var("SCRIBE_WHISPER_MODEL")
+        .expect("set SCRIBE_WHISPER_MODEL to a ggml model");
 
-    let mut settings = ResonanceSettings::default();
+    let mut settings = ScribeSettings::default();
     settings.transcriber_model_path = Some(whisper_model);
     let transcriber = WhisperShellTranscriber::from_settings(&settings).expect("build transcriber");
 

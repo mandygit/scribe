@@ -30,9 +30,9 @@ fn polish_helper_unavailable() -> AppError {
 /// Resolves the bundled dictation-polish Swift sidecar, preferring the dev build
 /// under `binaries/` and falling back to the path next to the app executable.
 pub fn polish_helper_path() -> Result<PathBuf, AppError> {
-    let helper_name = option_env!("RESONANCE_DICTATION_POLISH_HELPER_NAME")
+    let helper_name = option_env!("SCRIBE_DICTATION_POLISH_HELPER_NAME")
         .ok_or_else(polish_helper_unavailable)?;
-    let target = option_env!("RESONANCE_DICTATION_POLISH_HELPER_TARGET")
+    let target = option_env!("SCRIBE_DICTATION_POLISH_HELPER_TARGET")
         .ok_or_else(polish_helper_unavailable)?;
 
     let development_path = Path::new(env!("CARGO_MANIFEST_DIR"))

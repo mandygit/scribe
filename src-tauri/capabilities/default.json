@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default desktop capability for the Resonance main window and the dictation pill (both load local app content and need to listen for backend events).",
+  "description": "Default desktop capability for the Scribe main window and the dictation pill (both load local app content and need to listen for backend events).",
   "windows": ["main", "pill"],
   "permissions": ["core:default"]
 }

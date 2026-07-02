@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use crate::domain::{AppError, ResonanceSettings};
+use crate::domain::{AppError, ScribeSettings};
 
 const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &["wav", "m4a", "mp3", "flac", "ogg"];
 const HOMEBREW_WHISPER_PATHS: &[&str] = &[
@@ -15,8 +15,8 @@ const HOMEBREW_WHISPER_PATHS: &[&str] = &[
     "/usr/local/bin/whisper-cli",
 ];
 const MAX_WHISPER_JSON_BYTES: u64 = 16 * 1024 * 1024;
-pub const TRANSCRIPT_SEGMENT_EVENT: &str = "resonance://transcript-segment";
-pub const TRANSCRIPT_STREAM_COMPLETE_EVENT: &str = "resonance://transcript-stream-complete";
+pub const TRANSCRIPT_SEGMENT_EVENT: &str = "scribe://transcript-segment";
+pub const TRANSCRIPT_STREAM_COMPLETE_EVENT: &str = "scribe://transcript-stream-complete";
 
 /// Strategy interface for batch transcription providers.
 pub trait Transcriber {
@@ -151,7 +151,7 @@ pub struct WhisperShellTranscriber {
 }
 
 impl WhisperShellTranscriber {
-    pub fn from_settings(settings: &ResonanceSettings) -> Result<Self, AppError> {
+    pub fn from_settings(settings: &ScribeSettings) -> Result<Self, AppError> {
         let binary_path = match &settings.transcriber_bin_path {
             Some(path) => validate_binary_path(Path::new(path))?,
             None => resolve_default_binary_path()?,

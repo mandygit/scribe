@@ -10,7 +10,7 @@ Accepted
 
 ## Context
 
-Resonance needs acoustic echo cancellation so remote participant/system audio bleed in the microphone channel does not contaminate the user's transcript. The validation spike proved SpeexDSP can reduce synthetic echo by more than the V1 quality threshold, but production integration has two constraints:
+Scribe needs acoustic echo cancellation so remote participant/system audio bleed in the microphone channel does not contaminate the user's transcript. The validation spike proved SpeexDSP can reduce synthetic echo by more than the V1 quality threshold, but production integration has two constraints:
 
 - Raw microphone and system audio must remain intact even when AEC fails.
 - The main app must still build and run on machines where SpeexDSP is not installed.

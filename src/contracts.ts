@@ -19,7 +19,7 @@ export type SummarizerProvider = 'lmStudio' | 'ollama' | 'custom';
 
 export type ThemePreference = 'system' | 'light' | 'dark';
 
-export interface ResonanceSettings {
+export interface ScribeSettings {
   microphoneDeviceId: string | null;
   enableSystemAudio: boolean;
   enableEchoCancellation: boolean;
@@ -74,7 +74,7 @@ export interface RetentionCleanupSummary {
 }
 
 export interface PrivacySettingsUpdateResult {
-  settings: ResonanceSettings;
+  settings: ScribeSettings;
   cleanup: RetentionCleanupSummary;
 }
 
@@ -109,7 +109,7 @@ export interface AppStatus {
   state: string;
   detail: string;
   currentLifecycle: MeetingLifecycleState;
-  defaultSettings: ResonanceSettings;
+  defaultSettings: ScribeSettings;
 }
 
 export interface AudioDevice {

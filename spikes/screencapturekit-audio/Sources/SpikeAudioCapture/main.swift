@@ -20,8 +20,8 @@ enum SpikeError: LocalizedError {
         case .screenRecordingDenied:
             return """
             Screen Recording permission is not granted for this app bundle.
-            Open System Settings → Privacy & Security → Screen Recording, enable "Resonance System Audio Spike", then run again.
-            If this Mac is managed by MDM and the control is disabled, ask the device administrator to allow Screen Recording for bundle id dev.resonance.screencapturekit-audio-spike.
+            Open System Settings → Privacy & Security → Screen Recording, enable "Scribe System Audio Spike", then run again.
+            If this Mac is managed by MDM and the control is disabled, ask the device administrator to allow Screen Recording for bundle id dev.scribe.screencapturekit-audio-spike.
             """
         case .noDisplayAvailable:
             return "ScreenCaptureKit did not report any displays to capture."
@@ -36,8 +36,8 @@ enum SpikeError: LocalizedError {
         case let .shareableContentFailed(error):
             return """
             ScreenCaptureKit could not enumerate shareable displays/windows: \(error.localizedDescription)
-            Confirm Screen Recording is allowed for "Resonance System Audio Spike".
-            On managed Macs, MDM may block Screen Recording; ask the administrator to allow bundle id dev.resonance.screencapturekit-audio-spike.
+            Confirm Screen Recording is allowed for "Scribe System Audio Spike".
+            On managed Macs, MDM may block Screen Recording; ask the administrator to allow bundle id dev.scribe.screencapturekit-audio-spike.
             """
         case let .captureStopped(error):
             return "SCStream stopped with error: \(error.localizedDescription)"
@@ -51,7 +51,7 @@ final class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let outputURL: URL
     private let writer: AVAssetWriter
     private let audioInput: AVAssetWriterInput
-    private let queue = DispatchQueue(label: "dev.resonance.spike.audio-output")
+    private let queue = DispatchQueue(label: "dev.scribe.spike.audio-output")
     private let stateLock = NSLock()
     private var hasStartedWriting = false
     private var capturedAudioBuffers = 0
@@ -182,7 +182,7 @@ struct SpikeAudioCapture {
 
     private static func run() async throws {
         let bundleIdentifier = Bundle.main.bundleIdentifier ?? "(missing bundle id)"
-        print("Resonance ScreenCaptureKit system-audio spike")
+        print("Scribe ScreenCaptureKit system-audio spike")
         print("Bundle identifier: \(bundleIdentifier)")
         print("This app captures system/app audio only. It does not request or capture microphone audio.")
 
@@ -201,7 +201,7 @@ struct SpikeAudioCapture {
 
         let outputURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Desktop")
-            .appendingPathComponent("resonance-system-audio-spike.m4a")
+            .appendingPathComponent("scribe-system-audio-spike.m4a")
 
         let recorder = try AudioRecorder(outputURL: outputURL)
         let configuration = SCStreamConfiguration()

@@ -13,7 +13,7 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
-use resonance_lib::dictation::inject_text;
+use scribe_lib::dictation::inject_text;
 
 fn osascript(script: &str) -> String {
     let output = Command::new("osascript")

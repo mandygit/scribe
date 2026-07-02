@@ -5,7 +5,7 @@ use std::{
     sync::Mutex,
 };
 
-use analysis::{AnalysisTranscriptSegment, MeetingSummarizer, MeetingSummary, OllamaAnalyzer};
+use analysis::{AnalysisTranscriptSegment, MeetingSummarizer, MeetingSummary};
 use audio::{
     aec::{EchoCancellationBackend, SpeexEchoCancellationBackend},
     storage::{safe_system_audio_path, safe_wav_path, validate_recording_file_stem},
@@ -15,7 +15,7 @@ use audio::{
 use dictation::{DictationHotkey, DictationRecorder, HotkeyAction};
 use domain::{
     AnalyzerProvider, AppError, DictationSessionId, MeetingId, MeetingLifecycleState,
-    ProcessingStage, ReportId, ResonanceSettings, SummarizerProvider, ThemePreference,
+    ProcessingStage, ReportId, ScribeSettings, SummarizerProvider, ThemePreference,
 };
 use nudges::{
     LiveNudgeEvent, LiveNudgePipeline, NudgeEventSink, NudgeTranscriptEventSink, LIVE_NUDGE_EVENT,
@@ -59,7 +59,7 @@ struct AppState {
     dictation_hotkey: Mutex<DictationHotkey>,
 }
 
-fn load_effective_settings(repository: &SqliteRepository) -> Result<ResonanceSettings, AppError> {
+fn load_effective_settings(repository: &SqliteRepository) -> Result<ScribeSettings, AppError> {
     Ok(hydrate_settings_with_local_defaults(repository.get_settings()?))
 }
 
@@ -69,7 +69,7 @@ struct AppStatus {
     state: String,
     detail: String,
     current_lifecycle: MeetingLifecycleState,
-    default_settings: ResonanceSettings,
+    default_settings: ScribeSettings,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,7 +164,7 @@ pub struct RetentionCleanupSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrivacySettingsUpdateResult {
-    settings: ResonanceSettings,
+    settings: ScribeSettings,
     cleanup: RetentionCleanupSummary,
 }
 
@@ -186,10 +186,7 @@ const DEFAULT_TRENDS_LIMIT: u32 = 12;
 const MAX_TRENDS_LIMIT: u32 = 50;
 const MAX_RAW_AUDIO_RETENTION_DAYS: u16 = 365;
 const MILLIS_PER_DAY: u64 = 86_400_000;
-const RESONANCE_DATABASE_FILE_NAME: &str = "resonance.sqlite3";
-const LEGACY_APP_IDENTIFIER: &str = "com.orator.meetingcoach";
-const LEGACY_APP_NAME: &str = "Orator";
-const LEGACY_DATABASE_FILE_NAME: &str = "orator.sqlite3";
+const SCRIBE_DATABASE_FILE_NAME: &str = "scribe.sqlite3";
 
 #[tauri::command]
 fn get_app_status(state: State<'_, AppState>) -> Result<AppStatus, AppError> {
@@ -710,7 +707,7 @@ fn begin_dictation(state: &AppState) -> Result<(), AppError> {
 /// holding any locks.
 fn stop_dictation_capture(
     state: &AppState,
-) -> Result<(PathBuf, ResonanceSettings, u64), AppError> {
+) -> Result<(PathBuf, ScribeSettings, u64), AppError> {
     let (wav_path, started_at_ms) = {
         let mut recorder = state.dictation.lock().map_err(map_lock_error)?;
         recorder.finish()?
@@ -779,7 +776,7 @@ fn record_dictation_session(state: &AppState, started_at_ms: u64, text: &str) {
 /// so callers run it off the main thread.
 fn transcribe_dictation_wav(
     wav_path: &Path,
-    settings: &ResonanceSettings,
+    settings: &ScribeSettings,
 ) -> Result<String, AppError> {
     let result = WhisperShellTranscriber::from_settings(settings)
         .and_then(|transcriber| dictation::transcribe_clip(&transcriber, wav_path));
@@ -815,7 +812,7 @@ const DICTATION_DONE_SOUND: &str = "/System/Library/Sounds/Glass.aiff";
 
 /// Id of the menu-bar tray icon, used both to build it and to flip its title to a
 /// recording indicator during dictation.
-const TRAY_ICON_ID: &str = "resonance";
+const TRAY_ICON_ID: &str = "scribe";
 
 /// Plays a short macOS system sound as fire-and-forget dictation feedback.
 fn play_cue(sound_file: &str) {
@@ -824,7 +821,7 @@ fn play_cue(sound_file: &str) {
 
 /// Event the dictation pill listens to so it can reflect the current state
 /// (`idle` → `listening` → `transcribing` → `idle`).
-const DICTATION_STATE_EVENT: &str = "resonance://dictation-state";
+const DICTATION_STATE_EVENT: &str = "scribe://dictation-state";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1198,7 +1195,7 @@ fn update_dictation_settings(
     state: State<'_, AppState>,
     dictation_hotkey: String,
     dictation_polish_enabled: bool,
-) -> Result<ResonanceSettings, AppError> {
+) -> Result<ScribeSettings, AppError> {
     #[cfg(desktop)]
     if dictation_shortcut_for(&dictation_hotkey).is_none() {
         return Err(AppError {
@@ -1266,7 +1263,7 @@ fn update_summarizer_settings(
     summarizer_host: String,
     summarizer_port: u16,
     summarizer_model: Option<String>,
-) -> Result<ResonanceSettings, AppError> {
+) -> Result<ScribeSettings, AppError> {
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let mut settings = repository.get_settings()?;
     settings.summarizer_provider = summarizer_provider;
@@ -1328,7 +1325,7 @@ fn update_transcriber_settings(
     transcriber_model_path: Option<String>,
     speaker_embedding_model_path: Option<String>,
     speaker_segmentation_model_path: Option<String>,
-) -> Result<ResonanceSettings, AppError> {
+) -> Result<ScribeSettings, AppError> {
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let mut settings = repository.get_settings()?;
     settings.transcriber_bin_path = normalize_optional_path(transcriber_bin_path);
@@ -1345,7 +1342,7 @@ fn update_audio_processing_settings(
     state: State<'_, AppState>,
     enable_system_audio: bool,
     enable_echo_cancellation: bool,
-) -> Result<ResonanceSettings, AppError> {
+) -> Result<ScribeSettings, AppError> {
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let mut settings = repository.get_settings()?;
     settings.enable_system_audio = enable_system_audio;
@@ -1358,7 +1355,7 @@ fn update_audio_processing_settings(
 fn update_theme_preference(
     state: State<'_, AppState>,
     theme_preference: ThemePreference,
-) -> Result<ResonanceSettings, AppError> {
+) -> Result<ScribeSettings, AppError> {
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let mut settings = repository.get_settings()?;
     settings.theme_preference = theme_preference;
@@ -1550,21 +1547,9 @@ pub fn run() {
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
-            let legacy_app_data_dir = migrate_legacy_app_data_to_resonance(&app_data_dir)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.message))?;
-            let database_path = app_data_dir.join(RESONANCE_DATABASE_FILE_NAME);
+            let database_path = app_data_dir.join(SCRIBE_DATABASE_FILE_NAME);
             let repository = SqliteRepository::open(&database_path)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.message))?;
-            if let Some(legacy_dir) = legacy_app_data_dir {
-                repository
-                    .rewrite_app_data_file_paths(
-                        &legacy_dir.to_string_lossy(),
-                        &app_data_dir.to_string_lossy(),
-                    )
-                    .map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::Other, error.message)
-                    })?;
-            }
             let saved_settings = repository
                 .get_settings()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.message))?;
@@ -1594,7 +1579,7 @@ pub fn run() {
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-                let show = MenuItem::with_id(app, "show", "Show Resonance", true, None::<&str>)?;
+                let show = MenuItem::with_id(app, "show", "Show Scribe", true, None::<&str>)?;
                 let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show, &quit])?;
                 let tray_icon =
@@ -1661,7 +1646,7 @@ pub fn run() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running Resonance");
+        .expect("error while running Scribe");
 }
 
 #[cfg(test)]
@@ -1798,7 +1783,7 @@ fn load_meeting_audio_metadata(
 }
 
 fn select_transcription_audio_path(
-    settings: &ResonanceSettings,
+    settings: &ScribeSettings,
     metadata: &AudioMetadata,
     echo_cancellation: &impl EchoCancellationBackend,
 ) -> String {
@@ -1968,24 +1953,6 @@ fn calculate_metrics_for_meeting_resilient(
     }
 }
 
-// Retained for the upcoming meeting-summary command (Phase 1 build).
-#[allow(dead_code)]
-fn run_blocking_ollama_summary(
-    transcript_segments: Vec<AnalysisTranscriptSegment>,
-    include_speaking_improvements: bool,
-) -> Result<MeetingSummary, AppError> {
-    std::thread::spawn(move || {
-        let analyzer = OllamaAnalyzer::default_local();
-        analyzer.summarize(&transcript_segments, include_speaking_improvements)
-    })
-    .join()
-    .map_err(|_| AppError {
-        code: "summary_thread_failed".to_string(),
-        message: "Local summary worker failed before producing a report.".to_string(),
-        details: None,
-    })?
-}
-
 fn normalize_search_query(search_query: Option<String>) -> Option<String> {
     search_query
         .map(|query| query.trim().chars().take(120).collect::<String>())
@@ -2124,26 +2091,6 @@ fn validate_retention_days(retention_days: u16) -> Result<u16, AppError> {
         message: "Raw audio retention must be between 0 and 365 days.".to_string(),
         details: Some(format!("raw_audio_retention_days={retention_days}")),
     })
-}
-
-// Retained for the upcoming meeting-summary command (Phase 1 build).
-#[allow(dead_code)]
-fn ensure_analysis_provider_available(settings: &ResonanceSettings) -> Result<(), AppError> {
-    match (settings.analyzer_provider, settings.cloud_analysis_enabled) {
-        (AnalyzerProvider::LocalOllama, _) => Ok(()),
-        (_, false) => Err(AppError {
-            code: "cloud_analysis_disabled".to_string(),
-            message: "Cloud analysis requires an explicit opt-in before transcript text can leave this Mac."
-                .to_string(),
-            details: None,
-        }),
-        (_, true) => Err(AppError {
-            code: "cloud_analyzer_unavailable".to_string(),
-            message: "Cloud analyzer adapters are not connected yet. Switch back to Local Ollama."
-                .to_string(),
-            details: Some(format!("analyzer_provider={:?}", settings.analyzer_provider)),
-        }),
-    }
 }
 
 fn apply_audio_retention_policy(
@@ -2307,77 +2254,6 @@ fn app_data_dir(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
         message: "Could not resolve the application data directory.".to_string(),
         details: Some(error.to_string()),
     })
-}
-
-fn migrate_legacy_app_data_to_resonance(app_data_dir: &Path) -> Result<Option<PathBuf>, AppError> {
-    if app_data_dir.join(RESONANCE_DATABASE_FILE_NAME).is_file() {
-        return Ok(None);
-    }
-
-    let Some(legacy_dir) = legacy_app_data_dir_candidates(app_data_dir)
-        .into_iter()
-        .find(|candidate| {
-            candidate != app_data_dir && candidate.join(LEGACY_DATABASE_FILE_NAME).is_file()
-        })
-    else {
-        return Ok(None);
-    };
-
-    copy_legacy_app_data_dir(&legacy_dir, app_data_dir)?;
-    Ok(Some(legacy_dir))
-}
-
-fn legacy_app_data_dir_candidates(app_data_dir: &Path) -> Vec<PathBuf> {
-    let Some(parent) = app_data_dir.parent() else {
-        return Vec::new();
-    };
-    vec![
-        parent.join(LEGACY_APP_IDENTIFIER),
-        parent.join(LEGACY_APP_NAME),
-    ]
-}
-
-fn copy_legacy_app_data_dir(legacy_dir: &Path, app_data_dir: &Path) -> Result<(), AppError> {
-    fs::create_dir_all(app_data_dir)
-        .map_err(|error| legacy_migration_error(app_data_dir, error))?;
-    copy_legacy_app_data_entries(legacy_dir, app_data_dir)
-}
-
-fn copy_legacy_app_data_entries(source_dir: &Path, target_dir: &Path) -> Result<(), AppError> {
-    for entry in
-        fs::read_dir(source_dir).map_err(|error| legacy_migration_error(source_dir, error))?
-    {
-        let entry = entry.map_err(|error| legacy_migration_error(source_dir, error))?;
-        let source_path = entry.path();
-        let target_path = target_dir.join(legacy_migration_target_file_name(&entry.file_name()));
-
-        if source_path.is_dir() {
-            fs::create_dir_all(&target_path)
-                .map_err(|error| legacy_migration_error(&target_path, error))?;
-            copy_legacy_app_data_entries(&source_path, &target_path)?;
-        } else if source_path.is_file() && !target_path.exists() {
-            fs::copy(&source_path, &target_path)
-                .map_err(|error| legacy_migration_error(&source_path, error))?;
-        }
-    }
-    Ok(())
-}
-
-fn legacy_migration_target_file_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
-    match file_name.to_str() {
-        Some(LEGACY_DATABASE_FILE_NAME) => RESONANCE_DATABASE_FILE_NAME.into(),
-        Some("orator.sqlite3-wal") => "resonance.sqlite3-wal".into(),
-        Some("orator.sqlite3-shm") => "resonance.sqlite3-shm".into(),
-        _ => file_name.to_os_string(),
-    }
-}
-
-fn legacy_migration_error(path: &Path, error: std::io::Error) -> AppError {
-    AppError {
-        code: "legacy_app_data_migration_failed".to_string(),
-        message: "Could not migrate local data from the previous app name.".to_string(),
-        details: Some(format!("path={}, error={error}", path.display())),
-    }
 }
 
 fn current_time_ms() -> Result<u64, AppError> {
@@ -2671,22 +2547,22 @@ mod tests {
 
     #[test]
     fn select_transcription_audio_path_uses_aec_output_when_enabled() {
-        let settings = ResonanceSettings::default();
+        let settings = ScribeSettings::default();
         let metadata = audio_metadata_with_system_reference("meeting-aec-enabled");
         let echo_cancellation = StubEchoCancellation {
             calls: AtomicU8::new(0),
-            result: Ok(PathBuf::from("/tmp/resonance/meeting-aec-enabled.aec.wav")),
+            result: Ok(PathBuf::from("/tmp/scribe/meeting-aec-enabled.aec.wav")),
         };
 
         let selected_path =
             select_transcription_audio_path(&settings, &metadata, &echo_cancellation);
 
-        assert_eq!(selected_path, "/tmp/resonance/meeting-aec-enabled.aec.wav");
+        assert_eq!(selected_path, "/tmp/scribe/meeting-aec-enabled.aec.wav");
     }
 
     #[test]
     fn select_transcription_audio_path_falls_back_to_raw_mic_when_aec_fails() {
-        let settings = ResonanceSettings::default();
+        let settings = ScribeSettings::default();
         let metadata = audio_metadata_with_system_reference("meeting-aec-fallback");
         let echo_cancellation = StubEchoCancellation {
             calls: AtomicU8::new(0),
@@ -2705,14 +2581,14 @@ mod tests {
 
     #[test]
     fn select_transcription_audio_path_uses_raw_mic_when_aec_disabled() {
-        let settings = ResonanceSettings {
+        let settings = ScribeSettings {
             enable_echo_cancellation: false,
-            ..ResonanceSettings::default()
+            ..ScribeSettings::default()
         };
         let metadata = audio_metadata_with_system_reference("meeting-aec-disabled");
         let echo_cancellation = StubEchoCancellation {
             calls: AtomicU8::new(0),
-            result: Ok(PathBuf::from("/tmp/resonance/meeting-aec-disabled.aec.wav")),
+            result: Ok(PathBuf::from("/tmp/scribe/meeting-aec-disabled.aec.wav")),
         };
 
         let selected_path =
@@ -2723,44 +2599,21 @@ mod tests {
 
     #[test]
     fn select_transcription_audio_path_attempts_aec_for_m4a_system_audio() {
-        let settings = ResonanceSettings::default();
+        let settings = ScribeSettings::default();
         let metadata = AudioMetadata {
-            system_audio_file_path: Some("/tmp/resonance/meeting-aec-m4a.system.m4a".to_string()),
+            system_audio_file_path: Some("/tmp/scribe/meeting-aec-m4a.system.m4a".to_string()),
             ..audio_metadata_with_system_reference("meeting-aec-m4a")
         };
         let echo_cancellation = StubEchoCancellation {
             calls: AtomicU8::new(0),
-            result: Ok(PathBuf::from("/tmp/resonance/meeting-aec-m4a.aec.wav")),
+            result: Ok(PathBuf::from("/tmp/scribe/meeting-aec-m4a.aec.wav")),
         };
 
         let selected_path =
             select_transcription_audio_path(&settings, &metadata, &echo_cancellation);
 
-        assert_eq!(selected_path, "/tmp/resonance/meeting-aec-m4a.aec.wav");
+        assert_eq!(selected_path, "/tmp/scribe/meeting-aec-m4a.aec.wav");
         assert_eq!(echo_cancellation.calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn analysis_provider_requires_explicit_available_local_provider() {
-        assert!(ensure_analysis_provider_available(&ResonanceSettings::default()).is_ok());
-
-        let disabled_cloud_settings = ResonanceSettings {
-            analyzer_provider: AnalyzerProvider::CloudClaude,
-            cloud_analysis_enabled: false,
-            ..ResonanceSettings::default()
-        };
-        let disabled_error = ensure_analysis_provider_available(&disabled_cloud_settings)
-            .expect_err("cloud provider requires explicit opt-in");
-        assert_eq!(disabled_error.code, "cloud_analysis_disabled");
-
-        let enabled_cloud_settings = ResonanceSettings {
-            analyzer_provider: AnalyzerProvider::CloudOpenAi,
-            cloud_analysis_enabled: true,
-            ..ResonanceSettings::default()
-        };
-        let unavailable_error = ensure_analysis_provider_available(&enabled_cloud_settings)
-            .expect_err("cloud provider is not implemented yet");
-        assert_eq!(unavailable_error.code, "cloud_analyzer_unavailable");
     }
 
     #[test]
@@ -3008,53 +2861,6 @@ mod tests {
         assert_eq!(error.code, "metrics_already_exist");
     }
 
-    #[test]
-    fn legacy_app_data_migration_copies_database_and_owned_files() {
-        let root = test_data_dir("legacy-app-data-migration");
-        if root.exists() {
-            std::fs::remove_dir_all(&root).expect("old migration test dir can be removed");
-        }
-        let legacy_dir = root.join(LEGACY_APP_IDENTIFIER);
-        let app_data_dir = root.join("com.resonance.meetingcoach");
-        std::fs::create_dir_all(legacy_dir.join("voice-profile"))
-            .expect("legacy voice profile dir can be created");
-        std::fs::write(
-            legacy_dir.join(LEGACY_DATABASE_FILE_NAME),
-            b"legacy database",
-        )
-        .expect("legacy database can be written");
-        std::fs::write(
-            legacy_dir
-                .join("voice-profile")
-                .join("enrollment-sample.wav"),
-            b"voice sample",
-        )
-        .expect("legacy voice sample can be written");
-
-        let migrated_from = migrate_legacy_app_data_to_resonance(&app_data_dir)
-            .expect("legacy app data can be migrated")
-            .expect("legacy app data is detected");
-
-        assert_eq!(migrated_from, legacy_dir);
-        assert_eq!(
-            std::fs::read(app_data_dir.join(RESONANCE_DATABASE_FILE_NAME))
-                .expect("migrated database can be read"),
-            b"legacy database"
-        );
-        assert_eq!(
-            std::fs::read(
-                app_data_dir
-                    .join("voice-profile")
-                    .join("enrollment-sample.wav")
-            )
-            .expect("migrated voice sample can be read"),
-            b"voice sample"
-        );
-        assert!(migrate_legacy_app_data_to_resonance(&app_data_dir)
-            .expect("second migration check succeeds")
-            .is_none());
-    }
-
     fn test_repository(name: &str) -> SqliteRepository {
         let directory = test_data_dir("lib-transcription");
         std::fs::create_dir_all(&directory).expect("test database directory can be created");
@@ -3081,8 +2887,8 @@ mod tests {
     fn audio_metadata_with_system_reference(meeting_id: &str) -> AudioMetadata {
         AudioMetadata {
             meeting_id: MeetingId::new(meeting_id),
-            file_path: format!("/tmp/resonance/{meeting_id}.wav"),
-            system_audio_file_path: Some(format!("/tmp/resonance/{meeting_id}.system.wav")),
+            file_path: format!("/tmp/scribe/{meeting_id}.wav"),
+            system_audio_file_path: Some(format!("/tmp/scribe/{meeting_id}.system.wav")),
             duration_ms: Some(1_000),
             sample_rate_hz: Some(48_000),
             byte_size: Some(96_000),

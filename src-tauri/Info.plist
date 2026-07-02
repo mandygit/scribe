@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Resonance records microphone audio locally so it can transcribe meetings and generate private coaching feedback.</string>
+  <string>Scribe records microphone audio locally so it can transcribe meetings and generate private coaching feedback.</string>
   <key>NSCameraUsageDescription</key>
-  <string>Resonance records self-practice camera videos locally for Record and Review feedback.</string>
+  <string>Scribe records self-practice camera videos locally for Record and Review feedback.</string>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>Resonance captures system audio locally so meeting context from other participants can be included in transcripts and coaching feedback.</string>
+  <string>Scribe captures system audio locally so meeting context from other participants can be included in transcripts and coaching feedback.</string>
 </dict>
 </plist>

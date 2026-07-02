@@ -4,16 +4,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::domain::{
-    AnalyzerProvider, AppError, DictationSessionId, MeetingId, MetricId, PracticeAnnotationId,
-    PracticeRecordingId, PracticeReviewReportId, ProcessingStage, ReportId, ResonanceSettings,
-    Score, SegmentId, SummarizerProvider, SummaryId, ThemePreference,
+    AnalyzerProvider, AppError, DictationSessionId, MeetingId, MetricId, ProcessingStage,
+    ReportId, ScribeSettings, Score, SegmentId, SummarizerProvider, SummaryId,
+    ThemePreference,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 16;
 const SETTINGS_ID: &str = "default";
-const VOICE_PROFILE_ID: &str = "default";
 
-/// SQLite-backed repository for local Resonance data.
+/// SQLite-backed repository for local Scribe data.
 pub struct SqliteRepository {
     connection: Connection,
 }
@@ -174,107 +173,6 @@ pub struct ImportedMeetingSummaryRecord {
 pub struct MeetingSummaryRecord {
     pub body_json: String,
     pub generated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePracticeRecording {
-    pub id: PracticeRecordingId,
-    pub title: Option<String>,
-    pub source_kind: String,
-    pub video_file_path: String,
-    pub extracted_audio_file_path: Option<String>,
-    pub duration_ms: Option<u64>,
-    pub byte_size: Option<u64>,
-    pub recorded_at_ms: u64,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    pub analysis_status: String,
-    pub cloud_video_used: bool,
-    pub pipeline_failure_code: Option<String>,
-    pub pipeline_failure_message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PracticeRecordingRecord {
-    pub id: PracticeRecordingId,
-    pub title: Option<String>,
-    pub source_kind: String,
-    pub video_file_path: String,
-    pub extracted_audio_file_path: Option<String>,
-    pub duration_ms: Option<u64>,
-    pub byte_size: Option<u64>,
-    pub recorded_at_ms: u64,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    pub analysis_status: String,
-    pub cloud_video_used: bool,
-    pub pipeline_failure_code: Option<String>,
-    pub pipeline_failure_message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePracticeReviewReport {
-    pub id: PracticeReviewReportId,
-    pub practice_recording_id: PracticeRecordingId,
-    pub overall_score: Option<Score>,
-    pub audio_score: Option<Score>,
-    pub visual_score: Option<Score>,
-    pub body_json: String,
-    pub generated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PracticeReviewReportRecord {
-    pub id: PracticeReviewReportId,
-    pub practice_recording_id: PracticeRecordingId,
-    pub overall_score: Option<Score>,
-    pub audio_score: Option<Score>,
-    pub visual_score: Option<Score>,
-    pub body_json: String,
-    pub generated_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePracticeTimelineAnnotation {
-    pub id: PracticeAnnotationId,
-    pub practice_recording_id: PracticeRecordingId,
-    pub started_at_ms: u64,
-    pub ended_at_ms: u64,
-    pub category: String,
-    pub severity: String,
-    pub evidence: String,
-    pub suggestion: String,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PracticeTimelineAnnotationRecord {
-    pub id: PracticeAnnotationId,
-    pub practice_recording_id: PracticeRecordingId,
-    pub started_at_ms: u64,
-    pub ended_at_ms: u64,
-    pub category: String,
-    pub severity: String,
-    pub evidence: String,
-    pub suggestion: String,
-    pub source: String,
-}
-
-/// Persisted local voice enrollment metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VoiceProfileRecord {
-    pub sample_audio_file_path: String,
-    pub sample_duration_ms: Option<u64>,
-    pub sample_byte_size: u64,
-    pub enrolled_at_ms: u64,
-    pub embedding_json: Option<String>,
-    pub embedding_dimension: Option<u32>,
-    pub embedding_model_path: Option<String>,
-    pub embedding_computed_at_ms: Option<u64>,
 }
 
 /// Persisted audio metadata for a meeting recording.
@@ -1151,387 +1049,6 @@ impl SqliteRepository {
             .map_err(map_db_error)
     }
 
-    pub fn create_practice_recording(
-        &self,
-        recording: &CreatePracticeRecording,
-    ) -> Result<PracticeRecordingRecord, AppError> {
-        self.connection
-            .execute(
-                "INSERT INTO practice_recordings (
-                    id,
-                    title,
-                    source_kind,
-                    video_file_path,
-                    extracted_audio_file_path,
-                    duration_ms,
-                    byte_size,
-                    recorded_at_ms,
-                    created_at_ms,
-                    updated_at_ms,
-                    analysis_status,
-                    cloud_video_used,
-                    pipeline_failure_code,
-                    pipeline_failure_message
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    recording.id.as_str(),
-                    recording.title.as_deref(),
-                    recording.source_kind.as_str(),
-                    recording.video_file_path.as_str(),
-                    recording.extracted_audio_file_path.as_deref(),
-                    optional_to_db_i64(recording.duration_ms)?,
-                    optional_to_db_i64(recording.byte_size)?,
-                    to_db_i64(recording.recorded_at_ms)?,
-                    to_db_i64(recording.created_at_ms)?,
-                    to_db_i64(recording.updated_at_ms)?,
-                    recording.analysis_status.as_str(),
-                    bool_to_db(recording.cloud_video_used),
-                    recording.pipeline_failure_code.as_deref(),
-                    recording.pipeline_failure_message.as_deref(),
-                ],
-            )
-            .map_err(map_db_error)?;
-
-        self.get_practice_recording(&recording.id)?.ok_or_else(|| {
-            persistence_error(
-                "practice_recording_not_found",
-                "Created practice recording could not be read back.",
-                Some(format!("practice_recording_id={}", recording.id.as_str())),
-            )
-        })
-    }
-
-    pub fn get_practice_recording(
-        &self,
-        id: &PracticeRecordingId,
-    ) -> Result<Option<PracticeRecordingRecord>, AppError> {
-        self.connection
-            .query_row(
-                "SELECT
-                    id,
-                    title,
-                    source_kind,
-                    video_file_path,
-                    extracted_audio_file_path,
-                    duration_ms,
-                    byte_size,
-                    recorded_at_ms,
-                    created_at_ms,
-                    updated_at_ms,
-                    analysis_status,
-                    cloud_video_used,
-                    pipeline_failure_code,
-                    pipeline_failure_message
-                FROM practice_recordings
-                WHERE id = ?1",
-                params![id.as_str()],
-                read_practice_recording,
-            )
-            .optional()
-            .map_err(map_db_error)
-    }
-
-    pub fn list_practice_recordings(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<PracticeRecordingRecord>, AppError> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT
-                    id,
-                    title,
-                    source_kind,
-                    video_file_path,
-                    extracted_audio_file_path,
-                    duration_ms,
-                    byte_size,
-                    recorded_at_ms,
-                    created_at_ms,
-                    updated_at_ms,
-                    analysis_status,
-                    cloud_video_used,
-                    pipeline_failure_code,
-                    pipeline_failure_message
-                FROM practice_recordings
-                ORDER BY updated_at_ms DESC, recorded_at_ms DESC, id ASC
-                LIMIT ?1 OFFSET ?2",
-            )
-            .map_err(map_db_error)?;
-
-        let rows = statement
-            .query_map(
-                params![i64::from(limit), i64::from(offset)],
-                read_practice_recording,
-            )
-            .map_err(map_db_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(map_db_error)
-    }
-
-    pub fn list_practice_recordings_before(
-        &self,
-        cutoff_ms: u64,
-    ) -> Result<Vec<PracticeRecordingRecord>, AppError> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT
-                    id,
-                    title,
-                    source_kind,
-                    video_file_path,
-                    extracted_audio_file_path,
-                    duration_ms,
-                    byte_size,
-                    recorded_at_ms,
-                    created_at_ms,
-                    updated_at_ms,
-                    analysis_status,
-                    cloud_video_used,
-                    pipeline_failure_code,
-                    pipeline_failure_message
-                FROM practice_recordings
-                WHERE created_at_ms <= ?1
-                ORDER BY created_at_ms ASC, id ASC",
-            )
-            .map_err(map_db_error)?;
-
-        let rows = statement
-            .query_map(params![to_db_i64(cutoff_ms)?], read_practice_recording)
-            .map_err(map_db_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(map_db_error)
-    }
-
-    pub fn update_practice_recording_analysis_state(
-        &self,
-        id: &PracticeRecordingId,
-        extracted_audio_file_path: Option<&str>,
-        analysis_status: &str,
-        cloud_video_used: bool,
-        failure: Option<(&str, &str)>,
-        updated_at_ms: u64,
-    ) -> Result<PracticeRecordingRecord, AppError> {
-        let (failure_code, failure_message) = failure
-            .map(|(code, message)| (Some(code), Some(message)))
-            .unwrap_or((None, None));
-        let changed = self
-            .connection
-            .execute(
-                "UPDATE practice_recordings
-                SET extracted_audio_file_path = COALESCE(?2, extracted_audio_file_path),
-                    analysis_status = ?3,
-                    cloud_video_used = ?4,
-                    pipeline_failure_code = ?5,
-                    pipeline_failure_message = ?6,
-                    updated_at_ms = ?7
-                WHERE id = ?1",
-                params![
-                    id.as_str(),
-                    extracted_audio_file_path,
-                    analysis_status,
-                    bool_to_db(cloud_video_used),
-                    failure_code,
-                    failure_message,
-                    to_db_i64(updated_at_ms)?,
-                ],
-            )
-            .map_err(map_db_error)?;
-
-        if changed == 0 {
-            return Err(persistence_error(
-                "practice_recording_not_found",
-                "Practice recording could not be updated because it does not exist.",
-                Some(format!("practice_recording_id={}", id.as_str())),
-            ));
-        }
-
-        self.get_practice_recording(id)?.ok_or_else(|| {
-            persistence_error(
-                "practice_recording_not_found",
-                "Updated practice recording could not be read back.",
-                Some(format!("practice_recording_id={}", id.as_str())),
-            )
-        })
-    }
-
-    pub fn create_practice_review_report(
-        &self,
-        report: &CreatePracticeReviewReport,
-    ) -> Result<PracticeReviewReportRecord, AppError> {
-        self.connection
-            .execute(
-                "INSERT INTO practice_review_reports (
-                    id,
-                    practice_recording_id,
-                    overall_score,
-                    audio_score,
-                    visual_score,
-                    body_json,
-                    generated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(practice_recording_id) DO UPDATE SET
-                    id = excluded.id,
-                    overall_score = excluded.overall_score,
-                    audio_score = excluded.audio_score,
-                    visual_score = excluded.visual_score,
-                    body_json = excluded.body_json,
-                    generated_at_ms = excluded.generated_at_ms",
-                params![
-                    report.id.as_str(),
-                    report.practice_recording_id.as_str(),
-                    report.overall_score.map(|score| i64::from(score.value())),
-                    report.audio_score.map(|score| i64::from(score.value())),
-                    report.visual_score.map(|score| i64::from(score.value())),
-                    report.body_json.as_str(),
-                    to_db_i64(report.generated_at_ms)?,
-                ],
-            )
-            .map_err(map_db_error)?;
-
-        self.get_practice_review_report_for_recording(&report.practice_recording_id)?
-            .ok_or_else(|| {
-                persistence_error(
-                    "practice_review_report_not_found",
-                    "Saved practice review report could not be read back.",
-                    Some(format!(
-                        "practice_recording_id={}",
-                        report.practice_recording_id.as_str()
-                    )),
-                )
-            })
-    }
-
-    pub fn get_practice_review_report_for_recording(
-        &self,
-        practice_recording_id: &PracticeRecordingId,
-    ) -> Result<Option<PracticeReviewReportRecord>, AppError> {
-        self.connection
-            .query_row(
-                "SELECT
-                    id,
-                    practice_recording_id,
-                    overall_score,
-                    audio_score,
-                    visual_score,
-                    body_json,
-                    generated_at_ms
-                FROM practice_review_reports
-                WHERE practice_recording_id = ?1",
-                params![practice_recording_id.as_str()],
-                read_practice_review_report,
-            )
-            .optional()
-            .map_err(map_db_error)
-    }
-
-    pub fn replace_practice_timeline_annotations(
-        &self,
-        practice_recording_id: &PracticeRecordingId,
-        annotations: &[CreatePracticeTimelineAnnotation],
-    ) -> Result<Vec<PracticeTimelineAnnotationRecord>, AppError> {
-        self.connection
-            .execute(
-                "DELETE FROM practice_timeline_annotations WHERE practice_recording_id = ?1",
-                params![practice_recording_id.as_str()],
-            )
-            .map_err(map_db_error)?;
-
-        for annotation in annotations {
-            self.connection
-                .execute(
-                    "INSERT INTO practice_timeline_annotations (
-                        id,
-                        practice_recording_id,
-                        started_at_ms,
-                        ended_at_ms,
-                        category,
-                        severity,
-                        evidence,
-                        suggestion,
-                        source
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        annotation.id.as_str(),
-                        annotation.practice_recording_id.as_str(),
-                        to_db_i64(annotation.started_at_ms)?,
-                        to_db_i64(annotation.ended_at_ms)?,
-                        annotation.category.as_str(),
-                        annotation.severity.as_str(),
-                        annotation.evidence.as_str(),
-                        annotation.suggestion.as_str(),
-                        annotation.source.as_str(),
-                    ],
-                )
-                .map_err(map_db_error)?;
-        }
-
-        self.list_practice_timeline_annotations(practice_recording_id)
-    }
-
-    pub fn list_practice_timeline_annotations(
-        &self,
-        practice_recording_id: &PracticeRecordingId,
-    ) -> Result<Vec<PracticeTimelineAnnotationRecord>, AppError> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT
-                    id,
-                    practice_recording_id,
-                    started_at_ms,
-                    ended_at_ms,
-                    category,
-                    severity,
-                    evidence,
-                    suggestion,
-                    source
-                FROM practice_timeline_annotations
-                WHERE practice_recording_id = ?1
-                ORDER BY started_at_ms ASC, ended_at_ms ASC, id ASC",
-            )
-            .map_err(map_db_error)?;
-
-        let rows = statement
-            .query_map(
-                params![practice_recording_id.as_str()],
-                read_practice_timeline_annotation,
-            )
-            .map_err(map_db_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(map_db_error)
-    }
-
-    /// Rewrites app-data-owned file paths after a product app-data directory migration.
-    pub fn rewrite_app_data_file_paths(
-        &self,
-        old_app_data_dir: &str,
-        new_app_data_dir: &str,
-    ) -> Result<(), AppError> {
-        let like_pattern = like_prefix_pattern(old_app_data_dir);
-        for sql in [
-            "UPDATE audio_metadata
-             SET file_path = replace(file_path, ?1, ?2)
-             WHERE file_path LIKE ?3 ESCAPE '\\'",
-            "UPDATE audio_metadata
-             SET system_audio_file_path = replace(system_audio_file_path, ?1, ?2)
-             WHERE system_audio_file_path LIKE ?3 ESCAPE '\\'",
-            "UPDATE voice_profiles
-             SET sample_audio_file_path = replace(sample_audio_file_path, ?1, ?2)
-             WHERE sample_audio_file_path LIKE ?3 ESCAPE '\\'",
-            "UPDATE imported_meeting_summaries
-             SET extracted_audio_file_path = replace(extracted_audio_file_path, ?1, ?2)
-             WHERE extracted_audio_file_path LIKE ?3 ESCAPE '\\'",
-        ] {
-            self.connection
-                .execute(
-                    sql,
-                    params![old_app_data_dir, new_app_data_dir, like_pattern],
-                )
-                .map_err(map_db_error)?;
-        }
-        Ok(())
-    }
-
     /// Inserts or updates audio metadata for a meeting recording.
     pub fn upsert_audio_metadata(
         &self,
@@ -1662,91 +1179,8 @@ impl SqliteRepository {
             .map_err(map_db_error)
     }
 
-    /// Inserts or replaces the singleton local voice profile.
-    pub fn upsert_voice_profile(
-        &self,
-        profile: &VoiceProfileRecord,
-    ) -> Result<VoiceProfileRecord, AppError> {
-        self.connection
-            .execute(
-                "INSERT INTO voice_profiles (
-                    id,
-                    sample_audio_file_path,
-                    sample_duration_ms,
-                    sample_byte_size,
-                    enrolled_at_ms,
-                    embedding_json,
-                    embedding_dimension,
-                    embedding_model_path,
-                    embedding_computed_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ON CONFLICT(id) DO UPDATE SET
-                    sample_audio_file_path = excluded.sample_audio_file_path,
-                    sample_duration_ms = excluded.sample_duration_ms,
-                    sample_byte_size = excluded.sample_byte_size,
-                    enrolled_at_ms = excluded.enrolled_at_ms,
-                    embedding_json = excluded.embedding_json,
-                    embedding_dimension = excluded.embedding_dimension,
-                    embedding_model_path = excluded.embedding_model_path,
-                    embedding_computed_at_ms = excluded.embedding_computed_at_ms",
-                params![
-                    VOICE_PROFILE_ID,
-                    profile.sample_audio_file_path.as_str(),
-                    optional_to_db_i64(profile.sample_duration_ms)?,
-                    to_db_i64(profile.sample_byte_size)?,
-                    to_db_i64(profile.enrolled_at_ms)?,
-                    profile.embedding_json.as_deref(),
-                    optional_to_db_i64(profile.embedding_dimension.map(u64::from))?,
-                    profile.embedding_model_path.as_deref(),
-                    optional_to_db_i64(profile.embedding_computed_at_ms)?,
-                ],
-            )
-            .map_err(map_db_error)?;
-
-        self.get_voice_profile()?.ok_or_else(|| {
-            persistence_error(
-                "voice_profile_not_found",
-                "Saved voice profile could not be read back.",
-                None,
-            )
-        })
-    }
-
-    /// Returns the singleton local voice profile, if enrolled.
-    pub fn get_voice_profile(&self) -> Result<Option<VoiceProfileRecord>, AppError> {
-        self.connection
-            .query_row(
-                "SELECT
-                    sample_audio_file_path,
-                    sample_duration_ms,
-                    sample_byte_size,
-                    enrolled_at_ms,
-                    embedding_json,
-                    embedding_dimension,
-                    embedding_model_path,
-                    embedding_computed_at_ms
-                FROM voice_profiles
-                WHERE id = ?1",
-                params![VOICE_PROFILE_ID],
-                read_voice_profile,
-            )
-            .optional()
-            .map_err(map_db_error)
-    }
-
-    /// Deletes the singleton local voice profile metadata.
-    pub fn delete_voice_profile(&self) -> Result<bool, AppError> {
-        self.connection
-            .execute(
-                "DELETE FROM voice_profiles WHERE id = ?1",
-                params![VOICE_PROFILE_ID],
-            )
-            .map(|deleted_rows| deleted_rows > 0)
-            .map_err(map_db_error)
-    }
-
     /// Returns persisted settings, or local-first defaults when none exist.
-    pub fn get_settings(&self) -> Result<ResonanceSettings, AppError> {
+    pub fn get_settings(&self) -> Result<ScribeSettings, AppError> {
         self.connection
             .query_row(
                 "SELECT
@@ -1782,7 +1216,7 @@ impl SqliteRepository {
     /// Inserts or replaces the singleton settings row.
     pub fn upsert_settings(
         &self,
-        settings: &ResonanceSettings,
+        settings: &ScribeSettings,
         updated_at_ms: u64,
     ) -> Result<(), AppError> {
         self.connection
@@ -1964,18 +1398,6 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS voice_profiles (
-                id TEXT PRIMARY KEY CHECK (id = 'default'),
-                sample_audio_file_path TEXT NOT NULL,
-                sample_duration_ms INTEGER,
-                sample_byte_size INTEGER NOT NULL,
-                enrolled_at_ms INTEGER NOT NULL,
-                embedding_json TEXT,
-                embedding_dimension INTEGER,
-                embedding_model_path TEXT,
-                embedding_computed_at_ms INTEGER
-            );
-
             CREATE TABLE IF NOT EXISTS settings (
                 id TEXT PRIMARY KEY CHECK (id = 'default'),
                 microphone_device_id TEXT,
@@ -1997,53 +1419,6 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 summarizer_port INTEGER NOT NULL DEFAULT 1234,
                 summarizer_model TEXT,
                 updated_at_ms INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS practice_recordings (
-                id TEXT PRIMARY KEY,
-                title TEXT,
-                source_kind TEXT NOT NULL CHECK (source_kind IN ('camera', 'imported')),
-                video_file_path TEXT NOT NULL,
-                extracted_audio_file_path TEXT,
-                duration_ms INTEGER,
-                byte_size INTEGER,
-                recorded_at_ms INTEGER NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL,
-                analysis_status TEXT NOT NULL CHECK (
-                    analysis_status IN ('recorded', 'extracting', 'transcribing', 'reviewing', 'complete', 'failed_partial')
-                ),
-                cloud_video_used INTEGER NOT NULL CHECK (cloud_video_used IN (0, 1)),
-                pipeline_failure_code TEXT,
-                pipeline_failure_message TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS practice_review_reports (
-                id TEXT PRIMARY KEY,
-                practice_recording_id TEXT NOT NULL UNIQUE,
-                overall_score INTEGER,
-                audio_score INTEGER,
-                visual_score INTEGER,
-                body_json TEXT NOT NULL,
-                generated_at_ms INTEGER NOT NULL,
-                CHECK (overall_score IS NULL OR overall_score BETWEEN 0 AND 100),
-                CHECK (audio_score IS NULL OR audio_score BETWEEN 0 AND 100),
-                CHECK (visual_score IS NULL OR visual_score BETWEEN 0 AND 100),
-                FOREIGN KEY (practice_recording_id) REFERENCES practice_recordings(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS practice_timeline_annotations (
-                id TEXT PRIMARY KEY,
-                practice_recording_id TEXT NOT NULL,
-                started_at_ms INTEGER NOT NULL,
-                ended_at_ms INTEGER NOT NULL,
-                category TEXT NOT NULL,
-                severity TEXT NOT NULL CHECK (severity IN ('info', 'caution', 'strong')),
-                evidence TEXT NOT NULL,
-                suggestion TEXT NOT NULL,
-                source TEXT NOT NULL CHECK (source IN ('audioLocal', 'videoCloud', 'videoLocal')),
-                CHECK (ended_at_ms >= started_at_ms),
-                FOREIGN KEY (practice_recording_id) REFERENCES practice_recordings(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS dictation_sessions (
@@ -2069,10 +1444,6 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 ON reports(generated_at_ms DESC, id ASC);
             CREATE INDEX IF NOT EXISTS idx_imported_summaries_recent
                 ON imported_meeting_summaries(generated_at_ms DESC, id ASC);
-            CREATE INDEX IF NOT EXISTS idx_practice_recordings_recent
-                ON practice_recordings(updated_at_ms DESC, recorded_at_ms DESC, id ASC);
-            CREATE INDEX IF NOT EXISTS idx_practice_annotations_recording
-                ON practice_timeline_annotations(practice_recording_id, started_at_ms ASC);
             CREATE INDEX IF NOT EXISTS idx_dictation_sessions_recent
                 ON dictation_sessions(started_at_ms DESC, id ASC);
 
@@ -2117,20 +1488,6 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         "audio_metadata",
         "system_audio_stream_error",
         "TEXT",
-    )?;
-    ensure_column(connection, "voice_profiles", "embedding_json", "TEXT")?;
-    ensure_column(
-        connection,
-        "voice_profiles",
-        "embedding_dimension",
-        "INTEGER",
-    )?;
-    ensure_column(connection, "voice_profiles", "embedding_model_path", "TEXT")?;
-    ensure_column(
-        connection,
-        "voice_profiles",
-        "embedding_computed_at_ms",
-        "INTEGER",
     )?;
     ensure_column(
         connection,
@@ -2553,64 +1910,6 @@ fn read_imported_meeting_summary(
     })
 }
 
-fn read_practice_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<PracticeRecordingRecord> {
-    Ok(PracticeRecordingRecord {
-        id: PracticeRecordingId::new(row.get::<_, String>(0)?),
-        title: row.get(1)?,
-        source_kind: row.get(2)?,
-        video_file_path: row.get(3)?,
-        extracted_audio_file_path: row.get(4)?,
-        duration_ms: optional_from_db_u64(row.get(5)?)?,
-        byte_size: optional_from_db_u64(row.get(6)?)?,
-        recorded_at_ms: from_db_u64(row.get(7)?)?,
-        created_at_ms: from_db_u64(row.get(8)?)?,
-        updated_at_ms: from_db_u64(row.get(9)?)?,
-        analysis_status: row.get(10)?,
-        cloud_video_used: db_to_bool(row.get(11)?, 11)?,
-        pipeline_failure_code: row.get(12)?,
-        pipeline_failure_message: row.get(13)?,
-    })
-}
-
-fn read_practice_review_report(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PracticeReviewReportRecord> {
-    Ok(PracticeReviewReportRecord {
-        id: PracticeReviewReportId::new(row.get::<_, String>(0)?),
-        practice_recording_id: PracticeRecordingId::new(row.get::<_, String>(1)?),
-        overall_score: row
-            .get::<_, Option<i64>>(2)?
-            .map(|value| score_from_db(value, 2))
-            .transpose()?,
-        audio_score: row
-            .get::<_, Option<i64>>(3)?
-            .map(|value| score_from_db(value, 3))
-            .transpose()?,
-        visual_score: row
-            .get::<_, Option<i64>>(4)?
-            .map(|value| score_from_db(value, 4))
-            .transpose()?,
-        body_json: row.get(5)?,
-        generated_at_ms: from_db_u64(row.get(6)?)?,
-    })
-}
-
-fn read_practice_timeline_annotation(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PracticeTimelineAnnotationRecord> {
-    Ok(PracticeTimelineAnnotationRecord {
-        id: PracticeAnnotationId::new(row.get::<_, String>(0)?),
-        practice_recording_id: PracticeRecordingId::new(row.get::<_, String>(1)?),
-        started_at_ms: from_db_u64(row.get(2)?)?,
-        ended_at_ms: from_db_u64(row.get(3)?)?,
-        category: row.get(4)?,
-        severity: row.get(5)?,
-        evidence: row.get(6)?,
-        suggestion: row.get(7)?,
-        source: row.get(8)?,
-    })
-}
-
 fn read_audio_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<AudioMetadata> {
     Ok(AudioMetadata {
         meeting_id: MeetingId::new(row.get::<_, String>(0)?),
@@ -2625,20 +1924,7 @@ fn read_audio_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<AudioMetadat
     })
 }
 
-fn read_voice_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceProfileRecord> {
-    Ok(VoiceProfileRecord {
-        sample_audio_file_path: row.get(0)?,
-        sample_duration_ms: optional_from_db_u64(row.get(1)?)?,
-        sample_byte_size: from_db_u64(row.get(2)?)?,
-        enrolled_at_ms: from_db_u64(row.get(3)?)?,
-        embedding_json: row.get(4)?,
-        embedding_dimension: optional_from_db_u32(row.get(5)?, 5)?,
-        embedding_model_path: row.get(6)?,
-        embedding_computed_at_ms: optional_from_db_u64(row.get(7)?)?,
-    })
-}
-
-fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResonanceSettings> {
+fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScribeSettings> {
     let retention_days = row.get::<_, i64>(4)?;
     let raw_audio_retention_days = u16::try_from(retention_days).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -2648,7 +1934,7 @@ fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResonanceSettings>
         )
     })?;
 
-    Ok(ResonanceSettings {
+    Ok(ScribeSettings {
         microphone_device_id: row.get(0)?,
         enable_system_audio: db_to_bool(row.get(1)?, 1)?,
         enable_echo_cancellation: db_to_bool(row.get(2)?, 2)?,
@@ -2687,10 +1973,6 @@ fn optional_to_db_i64(value: Option<u64>) -> Result<Option<i64>, AppError> {
 
 fn like_contains_pattern(value: &str) -> String {
     format!("%{}%", escape_like_pattern(value))
-}
-
-fn like_prefix_pattern(value: &str) -> String {
-    format!("{}%", escape_like_pattern(value))
 }
 
 fn escape_like_pattern(value: &str) -> String {
@@ -3431,217 +2713,6 @@ mod tests {
     }
 
     #[test]
-    fn practice_recordings_reports_and_annotations_round_trip() {
-        let test_repository = repository();
-        let recording = test_repository
-            .repository
-            .create_practice_recording(&CreatePracticeRecording {
-                id: PracticeRecordingId::new("practice-round-trip"),
-                title: Some("Pitch rehearsal".to_string()),
-                source_kind: "imported".to_string(),
-                video_file_path: "/tmp/resonance/practice.mp4".to_string(),
-                extracted_audio_file_path: None,
-                duration_ms: Some(60_000),
-                byte_size: Some(1024),
-                recorded_at_ms: 1_000,
-                created_at_ms: 1_000,
-                updated_at_ms: 1_000,
-                analysis_status: "recorded".to_string(),
-                cloud_video_used: false,
-                pipeline_failure_code: None,
-                pipeline_failure_message: None,
-            })
-            .expect("practice recording can be created");
-
-        let updated_recording = test_repository
-            .repository
-            .update_practice_recording_analysis_state(
-                &recording.id,
-                Some("/tmp/resonance/practice.audio.wav"),
-                "complete",
-                false,
-                None,
-                2_000,
-            )
-            .expect("practice recording state can be updated");
-        assert_eq!(
-            updated_recording.extracted_audio_file_path.as_deref(),
-            Some("/tmp/resonance/practice.audio.wav")
-        );
-        assert_eq!(updated_recording.analysis_status, "complete");
-
-        let report = test_repository
-            .repository
-            .create_practice_review_report(&CreatePracticeReviewReport {
-                id: PracticeReviewReportId::new("practice-round-trip-review"),
-                practice_recording_id: recording.id.clone(),
-                overall_score: Some(Score::new(82).expect("score is valid")),
-                audio_score: Some(Score::new(82).expect("score is valid")),
-                visual_score: None,
-                body_json: "{\"summary\":\"Audio review\"}".to_string(),
-                generated_at_ms: 3_000,
-            })
-            .expect("practice report can be created");
-        assert_eq!(
-            report.audio_score,
-            Some(Score::new(82).expect("score is valid"))
-        );
-
-        let annotations = test_repository
-            .repository
-            .replace_practice_timeline_annotations(
-                &recording.id,
-                &[CreatePracticeTimelineAnnotation {
-                    id: PracticeAnnotationId::new("practice-round-trip-annotation"),
-                    practice_recording_id: recording.id.clone(),
-                    started_at_ms: 10_000,
-                    ended_at_ms: 12_000,
-                    category: "pace".to_string(),
-                    severity: "caution".to_string(),
-                    evidence: "182 words per minute".to_string(),
-                    suggestion: "Slow down around key points.".to_string(),
-                    source: "audioLocal".to_string(),
-                }],
-            )
-            .expect("practice annotations can be replaced");
-        assert_eq!(annotations.len(), 1);
-        assert_eq!(annotations[0].category, "pace");
-
-        let listed = test_repository
-            .repository
-            .list_practice_recordings(10, 0)
-            .expect("practice recordings can be listed");
-        assert_eq!(listed, vec![updated_recording]);
-        assert_eq!(
-            test_repository
-                .repository
-                .get_practice_review_report_for_recording(&recording.id)
-                .expect("practice report can be loaded")
-                .expect("practice report exists")
-                .id,
-            PracticeReviewReportId::new("practice-round-trip-review")
-        );
-    }
-
-    #[test]
-    fn rewrite_app_data_file_paths_updates_owned_audio_voice_and_imported_paths() {
-        let test_repository = repository();
-        let meeting = create_test_meeting(&test_repository.repository, "path-rewrite");
-        let unrelated_meeting =
-            create_test_meeting(&test_repository.repository, "path-rewrite-unrelated");
-        let old_root = "/Users/john_doe/Library/Application Support/com.orator.meetingcoach";
-        let new_root = "/Users/john_doe/Library/Application Support/com.resonance.meetingcoach";
-        let wildcard_lookalike_root =
-            "/Users/johnXdoe/Library/Application Support/com.orator.meetingcoach";
-
-        test_repository
-            .repository
-            .upsert_audio_metadata(&AudioMetadata {
-                meeting_id: meeting.id.clone(),
-                file_path: format!("{old_root}/path-rewrite.wav"),
-                system_audio_file_path: Some(format!("{old_root}/path-rewrite.system.m4a")),
-                duration_ms: Some(1_000),
-                sample_rate_hz: Some(48_000),
-                byte_size: Some(64),
-                system_audio_byte_size: Some(32),
-                system_audio_stream_error: None,
-                created_at_ms: 1_000,
-            })
-            .expect("audio metadata can be stored");
-        test_repository
-            .repository
-            .upsert_audio_metadata(&AudioMetadata {
-                meeting_id: unrelated_meeting.id.clone(),
-                file_path: format!("{wildcard_lookalike_root}/unrelated.wav"),
-                system_audio_file_path: None,
-                duration_ms: Some(1_000),
-                sample_rate_hz: Some(48_000),
-                byte_size: Some(64),
-                system_audio_byte_size: None,
-                system_audio_stream_error: None,
-                created_at_ms: 1_000,
-            })
-            .expect("unrelated audio metadata can be stored");
-        test_repository
-            .repository
-            .upsert_voice_profile(&VoiceProfileRecord {
-                sample_audio_file_path: format!("{old_root}/voice-profile/enrollment-sample.wav"),
-                sample_duration_ms: Some(2_000),
-                sample_byte_size: 128,
-                enrolled_at_ms: 1_000,
-                embedding_json: None,
-                embedding_dimension: None,
-                embedding_model_path: None,
-                embedding_computed_at_ms: None,
-            })
-            .expect("voice profile can be stored");
-        test_repository
-            .repository
-            .create_imported_meeting_summary(&CreateImportedMeetingSummary {
-                id: SummaryId::new("path-rewrite-summary"),
-                meeting_id: meeting.id.clone(),
-                source_file_path: "/Users/example/Downloads/source.mp4".to_string(),
-                extracted_audio_file_path: format!(
-                    "{old_root}/imported-recordings/path-rewrite.wav"
-                ),
-                speaking_improvements_source: "none".to_string(),
-                body_json: "{}".to_string(),
-                generated_at_ms: 2_000,
-            })
-            .expect("imported summary can be stored");
-
-        test_repository
-            .repository
-            .rewrite_app_data_file_paths(old_root, new_root)
-            .expect("app data paths can be rewritten");
-
-        let audio_metadata = test_repository
-            .repository
-            .get_audio_metadata(&meeting.id)
-            .expect("audio metadata can be read")
-            .expect("audio metadata exists");
-        assert_eq!(
-            audio_metadata.file_path,
-            format!("{new_root}/path-rewrite.wav")
-        );
-        assert_eq!(
-            audio_metadata.system_audio_file_path,
-            Some(format!("{new_root}/path-rewrite.system.m4a"))
-        );
-        assert_eq!(
-            test_repository
-                .repository
-                .get_audio_metadata(&unrelated_meeting.id)
-                .expect("unrelated audio metadata can be read")
-                .expect("unrelated audio metadata exists")
-                .file_path,
-            format!("{wildcard_lookalike_root}/unrelated.wav")
-        );
-        assert_eq!(
-            test_repository
-                .repository
-                .get_voice_profile()
-                .expect("voice profile can be read")
-                .expect("voice profile exists")
-                .sample_audio_file_path,
-            format!("{new_root}/voice-profile/enrollment-sample.wav")
-        );
-        let imported_summary = test_repository
-            .repository
-            .get_imported_meeting_summary(&SummaryId::new("path-rewrite-summary"))
-            .expect("imported summary can be read")
-            .expect("imported summary exists");
-        assert_eq!(
-            imported_summary.extracted_audio_file_path,
-            format!("{new_root}/imported-recordings/path-rewrite.wav")
-        );
-        assert_eq!(
-            imported_summary.source_file_path,
-            "/Users/example/Downloads/source.mp4"
-        );
-    }
-
-    #[test]
     fn default_settings_are_returned_when_no_row_exists() {
         let test_repository = repository();
 
@@ -3650,14 +2721,14 @@ mod tests {
                 .repository
                 .get_settings()
                 .expect("settings defaults can be read"),
-            ResonanceSettings::default()
+            ScribeSettings::default()
         );
     }
 
     #[test]
     fn upsert_settings_persists_and_reads_back_values() {
         let test_repository = repository();
-        let initial_settings = ResonanceSettings {
+        let initial_settings = ScribeSettings {
             microphone_device_id: Some("microphone-1".to_string()),
             enable_system_audio: false,
             enable_echo_cancellation: false,
@@ -3678,7 +2749,7 @@ mod tests {
             summarizer_model: Some("llama3.2".to_string()),
             theme_preference: ThemePreference::Dark,
         };
-        let updated_settings = ResonanceSettings {
+        let updated_settings = ScribeSettings {
             microphone_device_id: Some("microphone-2".to_string()),
             enable_system_audio: true,
             enable_echo_cancellation: true,
@@ -3715,59 +2786,6 @@ mod tests {
                 .get_settings()
                 .expect("persisted settings can be read"),
             updated_settings
-        );
-    }
-
-    #[test]
-    fn voice_profile_persists_replaces_and_deletes_singleton_profile() {
-        let test_repository = repository();
-        let initial_profile = VoiceProfileRecord {
-            sample_audio_file_path: "/tmp/resonance/voice-sample-1.wav".to_string(),
-            sample_duration_ms: Some(10_000),
-            sample_byte_size: 320_000,
-            enrolled_at_ms: 50_000,
-            embedding_json: None,
-            embedding_dimension: None,
-            embedding_model_path: None,
-            embedding_computed_at_ms: None,
-        };
-        let updated_profile = VoiceProfileRecord {
-            sample_audio_file_path: "/tmp/resonance/voice-sample-2.wav".to_string(),
-            sample_duration_ms: Some(12_000),
-            sample_byte_size: 384_000,
-            enrolled_at_ms: 60_000,
-            embedding_json: Some("[0.1,0.2,0.3]".to_string()),
-            embedding_dimension: Some(3),
-            embedding_model_path: Some("/models/speaker.onnx".to_string()),
-            embedding_computed_at_ms: Some(61_000),
-        };
-
-        test_repository
-            .repository
-            .upsert_voice_profile(&initial_profile)
-            .expect("voice profile can be inserted");
-        test_repository
-            .repository
-            .upsert_voice_profile(&updated_profile)
-            .expect("voice profile can be replaced");
-
-        assert_eq!(
-            test_repository
-                .repository
-                .get_voice_profile()
-                .expect("voice profile can be read"),
-            Some(updated_profile)
-        );
-        assert!(test_repository
-            .repository
-            .delete_voice_profile()
-            .expect("voice profile can be deleted"));
-        assert_eq!(
-            test_repository
-                .repository
-                .get_voice_profile()
-                .expect("deleted voice profile can be queried"),
-            None
         );
     }
 

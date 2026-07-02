@@ -1,4 +1,4 @@
-# Resonance
+# Scribe
 
 ## Problem Statement
 
@@ -25,7 +25,7 @@ These decisions were stress-tested and locked in during design review:
 
 | Dimension | Decision | Rationale |
 |-----------|----------|-----------|
-| **Product name** | Resonance | Capture what happened. Improve what you said. |
+| **Product name** | Scribe | Capture what happened. Improve what you said. |
 | **Platform (V1)** | macOS only | Ship faster, validate on own machine. Windows in V2+ |
 | **Audio capture** | Mic + system audio, two-channel separation | Mic = "your voice," system audio = "others" for context |
 | **Echo cancellation** | AEC via SpeexDSP or WebRTC AEC3, Rust FFI bindings | Existing C/C++ library — don't build from scratch. Needed because users may not always use headphones |

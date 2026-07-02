@@ -2,7 +2,7 @@
 
 ## Objective
 
-Build **Record and Review** for Resonance: a self-practice mode where a user records a 1-15 minute camera video or imports an existing self-recorded video, then gets a full review of both **audio speech delivery** and **visual presentation**.
+Build **Record and Review** for Scribe: a self-practice mode where a user records a 1-15 minute camera video or imports an existing self-recorded video, then gets a full review of both **audio speech delivery** and **visual presentation**.
 
 The goal is to help the user answer:
 
@@ -18,7 +18,7 @@ The output should be a **full report plus timeline annotations**, not just a sco
 
 ## Confirmed product decisions
 
-- **Input modes:** support both camera recording inside Resonance and importing an existing self-recorded video file.
+- **Input modes:** support both camera recording inside Scribe and importing an existing self-recorded video file.
 - **Review output:** full report plus timeline annotations.
 - **Retention:** use the same raw-audio retention setting for review videos and derived review artifacts.
 - **Cloud policy:** cloud vision/video analysis is allowed only with explicit opt-in.
@@ -32,7 +32,7 @@ The output should be a **full report plus timeline annotations**, not just a sco
 3. A 15-minute maximum recording length is a hard v1 limit.
 4. Existing local transcription, metrics, scoring, retention, history, and privacy patterns should be reused.
 5. Robust visual feedback for posture, gestures, and eye contact requires either a local vision stack or a cloud multimodal model. Since cloud is allowed with explicit opt-in, v1 should create the interface and UI boundary for cloud video review, then add provider adapters incrementally.
-6. Audio review can be useful before visual review is fully implemented because Resonance already has local transcription, deterministic metrics, and Ollama-based text coaching.
+6. Audio review can be useful before visual review is fully implemented because Scribe already has local transcription, deterministic metrics, and Ollama-based text coaching.
 
 ## Non-goals for the first implementation wave
 
@@ -47,7 +47,7 @@ The output should be a **full report plus timeline annotations**, not just a sco
 
 The feature is done when:
 
-1. User can record a camera practice video up to 15 minutes from inside Resonance.
+1. User can record a camera practice video up to 15 minutes from inside Scribe.
 2. User can import an existing local practice video.
 3. Video and derived artifacts are stored under app data and cleaned up by the same retention policy used for raw audio.
 4. User can run an audio review locally using existing transcription, metrics, and local analysis.
@@ -145,7 +145,7 @@ Use a native macOS camera capture adapter rather than relying only on WebView `M
 
 Reason:
 
-- Resonance already uses native capture adapters for microphone and system audio.
+- Scribe already uses native capture adapters for microphone and system audio.
 - Tauri's WebView media APIs can vary across macOS/WebKit versions.
 - Native AVFoundation capture can write a predictable local `.mov` or `.mp4` file directly under app data.
 - The existing ScreenCaptureKit sidecar pattern proves this repo can safely isolate native Apple-framework code in a small helper boundary.
@@ -165,7 +165,7 @@ Reuse the existing imported-recording path pattern:
 
 - User provides an absolute local video path.
 - Rust validates the path and supported extension.
-- Resonance copies or references the source based on chosen storage policy.
+- Scribe copies or references the source based on chosen storage policy.
 - For retention consistency, v1 should copy imported practice videos into app data so cleanup can be reliable and path deletion remains app-data scoped.
 
 ## Analysis strategy
@@ -217,7 +217,7 @@ Implementation includes:
 
 - `OpenAiVideoReviewer`: extracts sampled frames with `ffmpeg`, sends them to OpenAI Responses API, and validates strict JSON before persistence.
 - `FixtureVideoReviewer` for tests.
-- Environment cost controls: `RESONANCE_OPENAI_MODEL`, `RESONANCE_OPENAI_MAX_FRAMES`, and `RESONANCE_OPENAI_FRAME_INTERVAL_SECONDS`.
+- Environment cost controls: `SCRIBE_OPENAI_MODEL`, `SCRIBE_OPENAI_MAX_FRAMES`, and `SCRIBE_OPENAI_FRAME_INTERVAL_SECONDS`.
 
 ### Explicit cloud-video consent
 
@@ -621,7 +621,7 @@ Extend `tests/frontend/components.test.tsx` to cover:
 
 ### Checkpoint: Camera + local audio review
 
-- User can record inside Resonance.
+- User can record inside Scribe.
 - User can import existing video.
 - Both paths can run local audio review.
 

@@ -10,10 +10,10 @@ Accepted
 
 ## Context
 
-Resonance needs to capture remote participant/system audio on macOS without installing an audio driver or asking for administrator privileges. The earlier ScreenCaptureKit spike proved that `SCStream` can capture non-silent system audio, but it also exposed two production constraints:
+Scribe needs to capture remote participant/system audio on macOS without installing an audio driver or asking for administrator privileges. The earlier ScreenCaptureKit spike proved that `SCStream` can capture non-silent system audio, but it also exposed two production constraints:
 
 - ScreenCaptureKit is a Swift/Apple-framework integration that is not directly available from the existing Rust audio backend.
-- macOS Screen Recording permission is tied to the app bundle identity, so the production flow must run from Resonance rather than a loose terminal binary.
+- macOS Screen Recording permission is tied to the app bundle identity, so the production flow must run from Scribe rather than a loose terminal binary.
 - Audio should remain separately identifiable from the microphone WAV so later echo cancellation, channel attribution, and privacy controls can reason about source channels.
 
 ## Decision
@@ -39,7 +39,7 @@ This keeps the Rust backend's Strategy/Adapter shape intact while isolating macO
 
 - Pros: Mature pattern for routing system audio into standard capture APIs.
 - Cons: Requires installation/admin-like setup, conflicts with the no-driver local-first V1 requirement.
-- Rejected because Resonance should work without requiring users to install audio infrastructure.
+- Rejected because Scribe should work without requiring users to install audio infrastructure.
 
 ### Merge mic and system audio immediately
 

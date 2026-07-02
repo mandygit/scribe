@@ -157,9 +157,9 @@ fn read_child_stderr(child: &mut Child) -> Option<String> {
 
 pub(crate) fn system_audio_helper_path() -> Result<PathBuf, AppError> {
     let helper_name =
-        option_env!("RESONANCE_SYSTEM_AUDIO_HELPER_NAME").ok_or_else(helper_unavailable)?;
+        option_env!("SCRIBE_SYSTEM_AUDIO_HELPER_NAME").ok_or_else(helper_unavailable)?;
     let target =
-        option_env!("RESONANCE_SYSTEM_AUDIO_HELPER_TARGET").ok_or_else(helper_unavailable)?;
+        option_env!("SCRIBE_SYSTEM_AUDIO_HELPER_TARGET").ok_or_else(helper_unavailable)?;
 
     let development_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("binaries")
@@ -171,7 +171,7 @@ pub(crate) fn system_audio_helper_path() -> Result<PathBuf, AppError> {
     let executable_path = std::env::current_exe().map_err(|error| {
         audio_error(
             "system_audio_helper_unavailable",
-            "Could not locate the current Resonance executable to resolve the bundled system audio helper.",
+            "Could not locate the current Scribe executable to resolve the bundled system audio helper.",
             Some(error.to_string()),
         )
     })?;
@@ -236,8 +236,8 @@ mod tests {
             let path = system_audio_helper_path().expect("macOS build includes helper path");
             assert!(path.ends_with(format!(
                 "{}-{}",
-                env!("RESONANCE_SYSTEM_AUDIO_HELPER_NAME"),
-                env!("RESONANCE_SYSTEM_AUDIO_HELPER_TARGET")
+                env!("SCRIBE_SYSTEM_AUDIO_HELPER_NAME"),
+                env!("SCRIBE_SYSTEM_AUDIO_HELPER_TARGET")
             )));
         }
     }

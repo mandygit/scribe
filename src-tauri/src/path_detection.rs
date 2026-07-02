@@ -5,7 +5,7 @@ use std::{
     sync::OnceLock,
 };
 
-use crate::domain::ResonanceSettings;
+use crate::domain::ScribeSettings;
 
 static DETECTED_LOCAL_PATHS: OnceLock<DetectedLocalPaths> = OnceLock::new();
 
@@ -31,14 +31,14 @@ enum ModelKind {
     SpeakerSegmentation,
 }
 
-pub fn hydrate_settings_with_local_defaults(mut settings: ResonanceSettings) -> ResonanceSettings {
+pub fn hydrate_settings_with_local_defaults(mut settings: ScribeSettings) -> ScribeSettings {
     let detected = detect_local_paths();
     hydrate_settings_with_detected_paths(&mut settings, &detected);
     settings
 }
 
 fn hydrate_settings_with_detected_paths(
-    settings: &mut ResonanceSettings,
+    settings: &mut ScribeSettings,
     detected: &DetectedLocalPaths,
 ) {
     if missing_path(&settings.transcriber_bin_path) {
@@ -359,10 +359,10 @@ mod tests {
                 "/Users/example/models/speaker-segmentation.onnx".to_string(),
             ),
         };
-        let mut hydrated = ResonanceSettings {
+        let mut hydrated = ScribeSettings {
             transcriber_bin_path: None,
             transcriber_model_path: Some("/Users/custom/model.bin".to_string()),
-            ..ResonanceSettings::default()
+            ..ScribeSettings::default()
         };
         hydrate_settings_with_detected_paths(&mut hydrated, &detected);
 

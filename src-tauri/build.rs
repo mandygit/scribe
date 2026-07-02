@@ -13,8 +13,8 @@ fn main() {
 fn build_system_audio_sidecar() {
     build_swift_sidecar(
         "native/system-audio-capture/main.swift",
-        "resonance-system-audio-capture",
-        "RESONANCE_SYSTEM_AUDIO_HELPER",
+        "scribe-system-audio-capture",
+        "SCRIBE_SYSTEM_AUDIO_HELPER",
         &["AVFoundation", "CoreGraphics", "CoreMedia", "ScreenCaptureKit"],
     );
 }
@@ -23,7 +23,7 @@ fn build_dictation_polish_sidecar() {
     build_swift_sidecar(
         "native/dictation-polish/main.swift",
         "scribe-dictation-polish",
-        "RESONANCE_DICTATION_POLISH_HELPER",
+        "SCRIBE_DICTATION_POLISH_HELPER",
         &["FoundationModels"],
     );
 }

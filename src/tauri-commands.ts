@@ -15,17 +15,17 @@ import type {
   PrivacySettingsUpdateResult,
   RecordingMetadata,
   RecordingStarted,
-  ResonanceSettings,
+  ScribeSettings,
   SummarizerProvider,
   TranscriptionResult,
   TranscriptStreamEvent,
   TranscriptStreamSummary,
 } from './contracts';
 
-export const TRANSCRIPT_SEGMENT_EVENT = 'resonance://transcript-segment';
-export const TRANSCRIPT_STREAM_COMPLETE_EVENT = 'resonance://transcript-stream-complete';
-export const LIVE_NUDGE_EVENT = 'resonance://live-nudge';
-export const DICTATION_STATE_EVENT = 'resonance://dictation-state';
+export const TRANSCRIPT_SEGMENT_EVENT = 'scribe://transcript-segment';
+export const TRANSCRIPT_STREAM_COMPLETE_EVENT = 'scribe://transcript-stream-complete';
+export const LIVE_NUDGE_EVENT = 'scribe://live-nudge';
+export const DICTATION_STATE_EVENT = 'scribe://dictation-state';
 
 export type DictationState = 'idle' | 'listening' | 'transcribing';
 
@@ -50,7 +50,7 @@ export type {
   PrivacySettingsUpdateResult,
   RecordingMetadata,
   RecordingStarted,
-  ResonanceSettings,
+  ScribeSettings,
   SummarizerProvider,
   ThemePreference,
   TranscriptionResult,
@@ -141,17 +141,17 @@ export const summarizeMeeting = async (meetingId: string, model?: string): Promi
 export const updateAudioProcessingSettings = async (
   enableSystemAudio: boolean,
   enableEchoCancellation: boolean,
-): Promise<ResonanceSettings> =>
-  invokeNative<ResonanceSettings>('update_audio_processing_settings', { enableSystemAudio, enableEchoCancellation });
+): Promise<ScribeSettings> =>
+  invokeNative<ScribeSettings>('update_audio_processing_settings', { enableSystemAudio, enableEchoCancellation });
 
 export const updateThemePreference = async (
-  themePreference: ResonanceSettings['themePreference'],
-): Promise<ResonanceSettings> =>
-  invokeNative<ResonanceSettings>('update_theme_preference', { themePreference });
+  themePreference: ScribeSettings['themePreference'],
+): Promise<ScribeSettings> =>
+  invokeNative<ScribeSettings>('update_theme_preference', { themePreference });
 
 export const updatePrivacySettings = async (
   rawAudioRetentionDays: number,
-  analyzerProvider: ResonanceSettings['analyzerProvider'],
+  analyzerProvider: ScribeSettings['analyzerProvider'],
   cloudAnalysisEnabled: boolean,
 ): Promise<PrivacySettingsUpdateResult> =>
   invokeNative<PrivacySettingsUpdateResult>('update_privacy_settings', {
@@ -165,8 +165,8 @@ export const updateTranscriberSettings = async (
   transcriberModelPath: string | null,
   speakerEmbeddingModelPath: string | null,
   speakerSegmentationModelPath: string | null,
-): Promise<ResonanceSettings> =>
-  invokeNative<ResonanceSettings>('update_transcriber_settings', {
+): Promise<ScribeSettings> =>
+  invokeNative<ScribeSettings>('update_transcriber_settings', {
     transcriberBinPath,
     transcriberModelPath,
     speakerEmbeddingModelPath,
@@ -176,16 +176,16 @@ export const updateTranscriberSettings = async (
 export const updateDictationSettings = async (
   dictationHotkey: string,
   dictationPolishEnabled: boolean,
-): Promise<ResonanceSettings> =>
-  invokeNative<ResonanceSettings>('update_dictation_settings', { dictationHotkey, dictationPolishEnabled });
+): Promise<ScribeSettings> =>
+  invokeNative<ScribeSettings>('update_dictation_settings', { dictationHotkey, dictationPolishEnabled });
 
 export const updateSummarizerSettings = async (
   summarizerProvider: SummarizerProvider,
   summarizerHost: string,
   summarizerPort: number,
   summarizerModel: string | null,
-): Promise<ResonanceSettings> =>
-  invokeNative<ResonanceSettings>('update_summarizer_settings', {
+): Promise<ScribeSettings> =>
+  invokeNative<ScribeSettings>('update_summarizer_settings', {
     summarizerProvider,
     summarizerHost,
     summarizerPort,

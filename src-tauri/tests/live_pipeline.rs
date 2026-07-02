@@ -4,31 +4,31 @@
 //! running LM Studio install. Run it with:
 //!
 //! ```sh
-//! RESONANCE_LIVE_WAV=/abs/meeting.wav \
-//! RESONANCE_WHISPER_MODEL=/abs/ggml-small.bin \
+//! SCRIBE_LIVE_WAV=/abs/meeting.wav \
+//! SCRIBE_WHISPER_MODEL=/abs/ggml-small.bin \
 //! cargo test --test live_pipeline -- --ignored --nocapture
 //! ```
 
 use std::path::Path;
 
-use resonance_lib::analysis::{AnalysisTranscriptSegment, MeetingSummarizer, TranscriptSpeakerRole};
-use resonance_lib::domain::ResonanceSettings;
-use resonance_lib::summarizer::{
+use scribe_lib::analysis::{AnalysisTranscriptSegment, MeetingSummarizer, TranscriptSpeakerRole};
+use scribe_lib::domain::ScribeSettings;
+use scribe_lib::summarizer::{
     LmStudioClient, LmStudioLifecycle, LmStudioSummarizer, DEFAULT_SUMMARIZER_MODEL,
 };
-use resonance_lib::transcription::{Transcriber, WhisperShellTranscriber};
+use scribe_lib::transcription::{Transcriber, WhisperShellTranscriber};
 
 #[test]
 #[ignore = "requires whisper-cli, a whisper model, and a running LM Studio install"]
 fn live_audio_to_notes() {
-    let wav = std::env::var("RESONANCE_LIVE_WAV").expect("set RESONANCE_LIVE_WAV to a 16 kHz wav");
+    let wav = std::env::var("SCRIBE_LIVE_WAV").expect("set SCRIBE_LIVE_WAV to a 16 kHz wav");
     let whisper_model =
-        std::env::var("RESONANCE_WHISPER_MODEL").expect("set RESONANCE_WHISPER_MODEL to a ggml model");
-    let summarizer_model = std::env::var("RESONANCE_SUMMARIZER_MODEL")
+        std::env::var("SCRIBE_WHISPER_MODEL").expect("set SCRIBE_WHISPER_MODEL to a ggml model");
+    let summarizer_model = std::env::var("SCRIBE_SUMMARIZER_MODEL")
         .unwrap_or_else(|_| DEFAULT_SUMMARIZER_MODEL.to_string());
 
     // 1. Real transcription via the same whisper path the app uses.
-    let mut settings = ResonanceSettings::default();
+    let mut settings = ScribeSettings::default();
     settings.transcriber_model_path = Some(whisper_model);
     let transcriber = WhisperShellTranscriber::from_settings(&settings).expect("build transcriber");
     let output = transcriber

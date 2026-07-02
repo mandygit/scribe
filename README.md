@@ -8,12 +8,6 @@ questions, action items) with a local LLM — nothing leaves your Mac. It also
 ships a system-wide dictation mode: hold a hotkey, speak, and the transcribed
 (optionally polished) text is pasted into whatever app you were typing into.
 
-The app is packaged under the product name **Scribe**, but the source still
-uses its original working name **Resonance** for the crate (`resonance_lib`),
-the app-data folder (`com.resonance.meetingcoach`), and some helper binaries
-(`resonance-system-audio-capture`). This is intentional and harmless — just
-don't be surprised to see both names in the codebase.
-
 ## What it does today
 
 | Capability | What it gives you |
@@ -29,16 +23,13 @@ don't be surprised to see both names in the codebase.
 | Retention controls | Configure how long raw audio is kept; transcripts and notes are kept regardless. |
 | Permission onboarding | First-run flow for Microphone / Screen Recording / Accessibility, with a clear explanation of what's degraded without each. |
 
-### Not implemented yet (schema exists, nothing wired up)
+### Not implemented yet
 
-The SQLite schema and some backend plumbing exist for a few features that
+A couple of things referenced in older docs or leftover code
 **have no UI and no reachable commands today** — don't be alarmed if you spot
 them while poking around:
 
-- **Record and Review** (practice video recording/import + local review report) — see `docs/record-and-review-plan.md` for the original spec.
-- **Voice-matched coaching** (speaker enrollment/diarization, `voice_profiles` table, the `speaker-matching-sherpa` Cargo feature) — schema-only.
 - **Cloud video review** (sampled-frame review via OpenAI) — mentioned in older docs, not present in code.
-- **Ollama-based coaching scorecard** (`analysis::OllamaAnalyzer`) — superseded by the generic summarizer path below; kept around but never invoked.
 
 See `docs/technical-architecture.md` § "Known dead code and unshipped features" for the full, current status of each.
 

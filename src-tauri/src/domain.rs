@@ -51,24 +51,6 @@ pub struct DictationSessionId(String);
 new_string_id!(DictationSessionId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct PracticeRecordingId(String);
-
-new_string_id!(PracticeRecordingId);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct PracticeReviewReportId(String);
-
-new_string_id!(PracticeReviewReportId);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct PracticeAnnotationId(String);
-
-new_string_id!(PracticeAnnotationId);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -185,7 +167,7 @@ pub enum ThemePreference {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ResonanceSettings {
+pub struct ScribeSettings {
     pub microphone_device_id: Option<String>,
     pub enable_system_audio: bool,
     pub enable_echo_cancellation: bool,
@@ -221,7 +203,7 @@ pub const DEFAULT_DICTATION_HOTKEY: &str = "cmd+shift+d";
 pub const DEFAULT_SUMMARIZER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_SUMMARIZER_PORT: u16 = 1234;
 
-impl Default for ResonanceSettings {
+impl Default for ScribeSettings {
     fn default() -> Self {
         Self {
             microphone_device_id: None,
@@ -574,7 +556,7 @@ mod tests {
 
     #[test]
     fn default_settings_are_local_first_and_private() {
-        let settings = ResonanceSettings::default();
+        let settings = ScribeSettings::default();
 
         assert_eq!(settings.raw_audio_retention_days, 7);
         assert!(settings.enable_system_audio);

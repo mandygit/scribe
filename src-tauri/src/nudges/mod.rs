@@ -11,7 +11,7 @@ use crate::{
     transcription::{TranscriptEventSink, TranscriptStreamEvent, TranscriptStreamSummary},
 };
 
-pub const LIVE_NUDGE_EVENT: &str = "resonance://live-nudge";
+pub const LIVE_NUDGE_EVENT: &str = "scribe://live-nudge";
 const DEFAULT_THROTTLE_WINDOW_MS: u64 = 30_000;
 const DEFAULT_WALL_CLOCK_THROTTLE_MS: u64 = 1_500;
 const MAX_RECENT_SEGMENTS: usize = 120;

@@ -512,16 +512,16 @@ mod tests {
 
     #[test]
     fn derives_echo_cancelled_path_next_to_microphone_wav() {
-        let path = Path::new("/tmp/resonance/meeting-1.wav");
+        let path = Path::new("/tmp/scribe/meeting-1.wav");
 
         let derived = echo_cancelled_path(path).expect("path is derived");
 
-        assert_eq!(derived, PathBuf::from("/tmp/resonance/meeting-1.aec.wav"));
+        assert_eq!(derived, PathBuf::from("/tmp/scribe/meeting-1.aec.wav"));
     }
 
     #[test]
     fn rejects_non_wav_microphone_input() {
-        let error = echo_cancelled_path(Path::new("/tmp/resonance/meeting-1.m4a"))
+        let error = echo_cancelled_path(Path::new("/tmp/scribe/meeting-1.m4a"))
             .expect_err("m4a microphone input is rejected");
 
         assert_eq!(error.code, "aec_unsupported_mic_format");

@@ -7,11 +7,11 @@
 	<key>CFBundleExecutable</key>
 	<string>SpikeAudioCapture</string>
 	<key>CFBundleIdentifier</key>
-	<string>dev.resonance.screencapturekit-audio-spike</string>
+	<string>dev.scribe.screencapturekit-audio-spike</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Resonance System Audio Spike</string>
+	<string>Scribe System Audio Spike</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

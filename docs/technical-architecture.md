@@ -30,14 +30,13 @@ Everything above runs on the user's Mac. No network calls are made except to
 no cloud fallback path currently wired up (an earlier product direction
 explored one; see §11).
 
-Internally the project is still named **Resonance** in a lot of places
-(crate name, app-data folder, bundle identifier `com.resonance.meetingcoach`,
-one of the two Swift sidecar binary names). The user-facing brand is
-**Scribe**. Both names are correct depending on which layer you're looking
-at — this isn't a half-finished rename, it's just been left alone because
-renaming an app-data identifier has real migration cost (see the legacy
-`rewrite_app_data_file_paths` path in `lib.rs`, a leftover from an even
-earlier rename, Orator → Resonance).
+The project has been renamed twice (Orator → Resonance → Scribe), but every
+current identifier — the Cargo crate (`scribe`/`scribe_lib`), bundle
+identifier (`com.scribe.app`), app-data folder, database file
+(`scribe.sqlite3`), both Swift sidecar binaries, and IPC event names — is
+now **Scribe**. There's no migration path from the old names; this is a
+single-user app, so a prior install's data was just moved by hand rather
+than kept in the codebase as a maintained upgrade path.
 
 ## 2. System architecture
 
@@ -69,7 +68,7 @@ flowchart TB
         LLM["LM Studio / Ollama / custom\n(/v1/chat/completions)"]
     end
 
-    DB[("resonance.sqlite3\nvia rusqlite")]
+    DB[("scribe.sqlite3\nvia rusqlite")]
 
     App -- "invoke()" --> Cmds
     Cmds -- "emit() events" --> App
@@ -133,7 +132,7 @@ flowchart LR
     Mic["Microphone\n(cpal input stream)"] -->|i16 mono samples,\nbounded channel| WavWriter["hound WAV writer\n(background thread)"]
     WavWriter --> MicFile[("{meetingId}.wav")]
 
-    SysAudio["Remote/system audio"] -->|ScreenCaptureKit| SidecarProc["Swift sidecar process\n(resonance-system-audio-capture)"]
+    SysAudio["Remote/system audio"] -->|ScreenCaptureKit| SidecarProc["Swift sidecar process\n(scribe-system-audio-capture)"]
     SidecarProc --> SysFile[("{meetingId}.system.m4a")]
 
     MicFile --> AEC{"AEC enabled\nand reference\ncompatible?"}
@@ -199,8 +198,8 @@ sequenceDiagram
     Whisper-->>Blocking: JSON transcript (whole file, on process exit)
     Blocking-->>Cmd: TranscriptionOutput
     Cmd->>DB: persist transcript_segments, clear/record pipeline_failure
-    Cmd->>FE: emit resonance://transcript-segment (per segment)
-    Cmd->>FE: emit resonance://transcript-stream-complete
+    Cmd->>FE: emit scribe://transcript-segment (per segment)
+    Cmd->>FE: emit scribe://transcript-stream-complete
     Cmd-->>FE: TranscriptionResult (command return value)
 ```
 
@@ -405,9 +404,6 @@ executive summary and extracting decisions/action items from free text.
   `transcript_segments`, `metrics`, `reports`, `meeting_summaries`,
   `audio_metadata`, `settings`, `pipeline_failures`, `dictation_sessions`,
   `schema_versions`.
-- **Schema-only tables** (exist, have no CRUD methods or reachable command
-  wired to them): `practice_recordings`, `practice_review_reports`,
-  `practice_timeline_annotations`, `voice_profiles`. See §11.
 - **Retention**: a background job removes raw audio files older than the
   configured retention window (`rawAudioRetentionDays`), while keeping
   transcripts/notes indefinitely — audio is the bulky, re-derivable
@@ -422,9 +418,6 @@ when really they're a deliberate, paused product direction.
 
 | Item | Status | Where |
 | --- | --- | --- |
-| **`analysis::OllamaAnalyzer`** (post-meeting coaching scorecard) | Dead code. Superseded by the generic `summarizer` provider path (§7); the `MeetingSummarizer` trait it implements is still used, but nothing calls `OllamaAnalyzer` itself. `run_blocking_ollama_summary` and `ensure_analysis_provider_available` are `#[allow(dead_code)]`. | `src-tauri/src/analysis/` |
-| **Record and Review** (practice video recording/import, local review report) | Schema exists (`practice_recordings`, `practice_review_reports`, `practice_timeline_annotations`), and some backend plumbing (`media_import.rs` has `copy_practice_video`/`extract_practice_video_audio`), but there is no Tauri command wired to any of it and no frontend view. Original spec: `docs/record-and-review-plan.md`. | `src-tauri/src/media_import.rs`, `docs/record-and-review-plan.md` |
-| **Voice-matched coaching** (speaker enrollment, embeddings, diarization) | Schema-only (`voice_profiles` table, no CRUD methods). The `speaker-matching-sherpa` Cargo feature gates an optional `sherpa-onnx` dependency but is never enabled by default and nothing in the active command surface uses it. | `Cargo.toml` (`speaker-matching-sherpa` feature) |
 | **Cloud video review** (sampled-frame review via OpenAI) | Absent from the current codebase — no `video_review.rs`, no OpenAI API wiring, no frame sampling. Referenced in `docs/ideas/meeting-coach.md` as original product intent. | `docs/ideas/meeting-coach.md` |
 
 If reviving any of these, start from the linked plan/idea doc for the
@@ -448,13 +441,13 @@ All commands are registered in `lib.rs`'s `invoke_handler`. Grouped by area:
 
 Events (one-way, `app.emit()` to frontend `listen()`):
 
-- `resonance://transcript-segment` — one per transcript segment, emitted
+- `scribe://transcript-segment` — one per transcript segment, emitted
   during transcript replay (see §6; despite the name suggesting live
   streaming, these currently all fire in a burst once whisper-cli's full
   output is ready).
-- `resonance://transcript-stream-complete` — end-of-replay marker, includes
+- `scribe://transcript-stream-complete` — end-of-replay marker, includes
   segment count and any dropped-event count from the bounded event sink.
-- `resonance://live-nudge` — one per nudge from `LiveNudgePipeline` (§9).
+- `scribe://live-nudge` — one per nudge from `LiveNudgePipeline` (§9).
 
 **The `spawn_blocking` pattern**: any command that does real, possibly
 long-running work outside pure DB reads/writes — `transcribe_meeting`
@@ -511,7 +504,6 @@ directly in a synchronous command body.
 | `rusqlite` | Embedded SQLite driver — all persistence. No ORM (see §10). |
 | `serde` / `serde_json` | (De)serialization for Tauri command DTOs, whisper-cli's JSON output, and the summarizer's chat-completion JSON. |
 | `tempfile` | Scratch directories for whisper-cli's JSON output and AEC intermediates. |
-| `sherpa-onnx` (optional, `speaker-matching-sherpa` feature) | ONNX runtime bindings for the never-enabled-by-default voice-matching feature (§11). Feature-gated specifically so normal builds don't pull in ONNX Runtime's native binary. |
 | `tauri-build` (build-dependency) | Tauri's code-generation step; also where `build.rs` hooks in the Swift sidecar compilation. |
 
 No HTTP client crate (`reqwest` etc.) — the summarizer hand-rolls HTTP/1.1
