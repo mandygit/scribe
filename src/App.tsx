@@ -102,6 +102,15 @@ export default function App() {
     }
   }, [tauri]);
 
+  const refreshDevices = useCallback(async () => {
+    if (!tauri) return;
+    try {
+      setDevices(await listAudioDevices());
+    } catch {
+      /* device list is non-critical */
+    }
+  }, [tauri]);
+
   const refreshHistory = useCallback(async () => {
     if (!tauri) return;
     try {
@@ -145,11 +154,7 @@ export default function App() {
       } catch (cause) {
         setError(messageFromUnknownError(cause, 'Could not reach the desktop backend.'));
       }
-      try {
-        setDevices(await listAudioDevices());
-      } catch {
-        /* device list is non-critical */
-      }
+      await refreshDevices();
       try {
         const snapshot = await checkPermissions();
         setPermissions(snapshot);
@@ -163,7 +168,14 @@ export default function App() {
       }
       await refreshHistory();
     })();
-  }, [tauri, refreshHistory]);
+  }, [tauri, refreshHistory, refreshDevices]);
+
+  useEffect(() => {
+    if (!tauri || view !== 'settings') return;
+    void refreshDevices();
+    const intervalId = window.setInterval(() => void refreshDevices(), 3000);
+    return () => window.clearInterval(intervalId);
+  }, [tauri, view, refreshDevices]);
 
   useEffect(() => {
     const applyResolvedTheme = (query: MediaQueryList | MediaQueryListEvent) => {
@@ -267,7 +279,13 @@ export default function App() {
     setSummarizing(true);
     try {
       await summarizeMeeting(meetingId);
-      setDetail(await getMeetingHistoryDetail(meetingId));
+      const updated = await getMeetingHistoryDetail(meetingId);
+      setDetail(updated);
+      setHistory((current) =>
+        current.map((item) =>
+          item.meetingId === meetingId ? { ...item, title: updated.meeting.title } : item,
+        ),
+      );
     } catch (cause) {
       setError(messageFromUnknownError(cause, 'Could not generate notes. Is LM Studio installed?'));
     } finally {
