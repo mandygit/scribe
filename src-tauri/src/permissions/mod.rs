@@ -1,12 +1,19 @@
 //! macOS permission priming for first-run onboarding: microphone, screen
 //! recording, and Accessibility.
 //!
-//! Microphone and Accessibility checks reuse the same capture/injection code
-//! paths the app already runs during normal use — starting (and immediately
-//! discarding) a short real capture, or a read-only Accessibility query, is
-//! what actually triggers the OS's permission prompt for those categories.
+//! Microphone reuses the same capture code path the app already runs during
+//! normal use — starting (and immediately discarding) a short real capture
+//! is what actually triggers the OS's permission prompt for that category.
 //!
-//! Screen Recording is different: `CGRequestScreenCaptureAccess()` (what a
+//! Accessibility is different: it goes through `osascript`/System Events
+//! rather than a native Accessibility API call, and macOS does not show an
+//! automatic system prompt (or add the app to the Accessibility list) for
+//! that indirect path — only for a direct `AXIsProcessTrustedWithOptions`
+//! call, which this app does not make. `probe_accessibility` only reports
+//! current status; granting it requires the user to add the app themselves
+//! in System Settings.
+//!
+//! Screen Recording is different again: `CGRequestScreenCaptureAccess()` (what a
 //! real capture attempt triggers) shows the system prompt and returns
 //! immediately, before the user answers it. Calling that from an automatic
 //! background check — which runs on every app launch — would silently

@@ -95,16 +95,23 @@ fn paste_with_keystroke() -> Result<(), AppError> {
     })
 }
 
-/// Checks (and, the first time it's called, prompts for) the Accessibility
-/// permission via a read-only System Events query — no clipboard writes, no
-/// synthesized keystrokes, nothing visible in the focused app. Used to prime
-/// permissions during onboarding without performing a real paste, since
-/// `inject_text` is a no-op for blank input and would otherwise paste whatever
-/// is on the clipboard into the user's focused app for non-blank input.
+/// Checks the Accessibility permission via `System Events`'s `UI elements
+/// enabled` property — a read-only query with no clipboard writes, no
+/// synthesized keystrokes, nothing visible in the focused app. Unlike
+/// Microphone/Screen Recording, macOS does not show an automatic system
+/// prompt (or add the app to the Accessibility list) for this indirect,
+/// AppleScript-mediated path — the user has to add the app themselves via
+/// System Settings. This only reports the current status; it does not
+/// trigger that dialog.
+///
+/// Deliberately does *not* use `get name of first process whose frontmost is
+/// true`: that query only requires the Automation permission (Scribe talking
+/// to System Events), not real Accessibility, so it would report "granted"
+/// even when Accessibility itself is missing.
 pub fn probe_accessibility() -> Result<(), AppError> {
     let output = Command::new("osascript")
         .arg("-e")
-        .arg(r#"tell application "System Events" to get name of first process whose frontmost is true"#)
+        .arg(r#"tell application "System Events" to UI elements enabled"#)
         .output()
         .map_err(|error| AppError {
             code: "dictation_accessibility_probe_failed".to_string(),
@@ -112,12 +119,13 @@ pub fn probe_accessibility() -> Result<(), AppError> {
             details: Some(error.to_string()),
         })?;
 
-    if output.status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() && stdout == "true" {
         return Ok(());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let code = if is_accessibility_denied(&stderr) {
+    let code = if stdout == "false" || is_accessibility_denied(&stderr) {
         "dictation_accessibility_permission_required"
     } else {
         "dictation_accessibility_probe_failed"
