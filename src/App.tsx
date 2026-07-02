@@ -91,6 +91,7 @@ export default function App() {
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; onConfirm: () => void } | null>(null);
   const [transcribingMeetingId, setTranscribingMeetingId] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
+  const recordingStartedAtRef = useRef<number | null>(null);
   const detailMeetingIdRef = useRef<string | null>(null);
 
   const refreshPermissions = useCallback(async () => {
@@ -295,7 +296,12 @@ export default function App() {
 
   const startTimer = useCallback(() => {
     setElapsed(0);
-    timerRef.current = window.setInterval(() => setElapsed((value) => value + 1), 1000);
+    recordingStartedAtRef.current = Date.now();
+    timerRef.current = window.setInterval(() => {
+      const startedAt = recordingStartedAtRef.current;
+      if (startedAt === null) return;
+      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
   }, []);
 
   const stopTimer = useCallback(() => {
@@ -303,6 +309,7 @@ export default function App() {
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
+    recordingStartedAtRef.current = null;
   }, []);
 
   useEffect(() => () => stopTimer(), [stopTimer]);
