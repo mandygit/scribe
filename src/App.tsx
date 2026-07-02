@@ -27,7 +27,7 @@ import {
   type MeetingTrendPoint,
   openPermissionSettings,
   type PermissionsSnapshot,
-  type ResonanceSettings,
+  type ScribeSettings,
   sendCompletionNotification,
   startRecording,
   stopRecording,
@@ -44,7 +44,7 @@ import {
 
 const PERMISSIONS_ONBOARDING_SEEN_KEY = 'scribe-permissions-onboarding-seen';
 
-const FALLBACK_SETTINGS: ResonanceSettings = {
+const FALLBACK_SETTINGS: ScribeSettings = {
   microphoneDeviceId: null,
   enableSystemAudio: true,
   enableEchoCancellation: true,
@@ -74,7 +74,7 @@ type RecordPhase = 'idle' | 'recording' | 'stopping';
 export default function App() {
   const tauri = useMemo(() => isTauriRuntime(), []);
   const [view, setView] = useState<View>('meetings');
-  const [settings, setSettings] = useState<ResonanceSettings>(FALLBACK_SETTINGS);
+  const [settings, setSettings] = useState<ScribeSettings>(FALLBACK_SETTINGS);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [history, setHistory] = useState<MeetingHistoryItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -516,6 +516,7 @@ export default function App() {
               processing={transcribingMeetingId === detail.meeting.meetingId}
               summarizing={summarizing}
               canSummarize={tauri}
+              modelName={settings.summarizerModel?.trim() || 'the local model'}
               onSummarize={() => void handleSummarize(detail.meeting.meetingId)}
               onDelete={() => void handleDeleteMeeting(detail.meeting.meetingId)}
               onRename={(title) => void handleRenameMeeting(detail.meeting.meetingId, title)}
@@ -836,6 +837,7 @@ function MeetingDetailView({
   processing,
   summarizing,
   canSummarize,
+  modelName,
   onSummarize,
   onDelete,
   onRename,
@@ -844,6 +846,7 @@ function MeetingDetailView({
   processing: boolean;
   summarizing: boolean;
   canSummarize: boolean;
+  modelName: string;
   onSummarize: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
@@ -944,7 +947,7 @@ function MeetingDetailView({
         <div className="pending">
           <Spinner />
           <span className="label" style={{ flex: 1 }}>
-            Summarizing with Gemma on device…
+            Summarizing with {modelName} on device…
             <br />
             <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
               Loading the model can take up to a minute the first time.
@@ -952,7 +955,7 @@ function MeetingDetailView({
           </span>
         </div>
       ) : summary ? (
-        <NotesView summary={summary} />
+        <NotesView summary={summary} modelName={modelName} />
       ) : processing ? (
         <div className="pending">
           <Spinner />
@@ -962,7 +965,7 @@ function MeetingDetailView({
         <div className="pending">
           <Icon name="sparkles" />
           <span className="label" style={{ flex: 1 }}>
-            Generate on-device notes from this transcript with Gemma.
+            Generate on-device notes from this transcript with {modelName}.
           </span>
           <button type="button" className="primary-btn" disabled={!canSummarize} onClick={onSummarize}>
             <Icon name="sparkles" />
@@ -1001,7 +1004,7 @@ function MeetingDetailView({
   );
 }
 
-function NotesView({ summary }: { summary: MeetingSummary }) {
+function NotesView({ summary, modelName }: { summary: MeetingSummary; modelName: string }) {
   return (
     <div>
       <div className="notes">
@@ -1046,7 +1049,7 @@ function NotesView({ summary }: { summary: MeetingSummary }) {
       <div className="provenance">
         <span />
         <span className="on-device">
-          <span className="seed" /> Summarized by Gemma · on device
+          <span className="seed" /> Summarized by {modelName} · on device
         </span>
       </div>
     </div>
@@ -1167,9 +1170,9 @@ function SettingsView({
   onError,
   onReviewPermissions,
 }: {
-  settings: ResonanceSettings;
+  settings: ScribeSettings;
   devices: AudioDevice[];
-  onSettings: (settings: ResonanceSettings) => void;
+  onSettings: (settings: ScribeSettings) => void;
   onError: (message: string | null) => void;
   onReviewPermissions: () => void;
 }) {
@@ -1183,7 +1186,7 @@ function SettingsView({
   const [detectStatus, setDetectStatus] = useState<string | null>(null);
 
   const saveAudio = useCallback(
-    async (next: Partial<Pick<ResonanceSettings, 'enableSystemAudio' | 'enableEchoCancellation'>>) => {
+    async (next: Partial<Pick<ScribeSettings, 'enableSystemAudio' | 'enableEchoCancellation'>>) => {
       onError(null);
       try {
         const updated = await updateAudioProcessingSettings(
@@ -1199,7 +1202,7 @@ function SettingsView({
   );
 
   const saveDictation = useCallback(
-    async (next: Partial<Pick<ResonanceSettings, 'dictationHotkey' | 'dictationPolishEnabled'>>) => {
+    async (next: Partial<Pick<ScribeSettings, 'dictationHotkey' | 'dictationPolishEnabled'>>) => {
       onError(null);
       try {
         const updated = await updateDictationSettings(
@@ -1217,7 +1220,7 @@ function SettingsView({
   const saveSummarizer = useCallback(
     async (
       next: Partial<
-        Pick<ResonanceSettings, 'summarizerProvider' | 'summarizerHost' | 'summarizerPort' | 'summarizerModel'>
+        Pick<ScribeSettings, 'summarizerProvider' | 'summarizerHost' | 'summarizerPort' | 'summarizerModel'>
       >,
     ) => {
       onError(null);
@@ -1267,7 +1270,7 @@ function SettingsView({
   }, [settings.summarizerPort, settings.summarizerProvider, summarizerHostInput, summarizerPortInput]);
 
   const saveTheme = useCallback(
-    async (themePreference: ResonanceSettings['themePreference']) => {
+    async (themePreference: ScribeSettings['themePreference']) => {
       onError(null);
       try {
         onSettings(await updateThemePreference(themePreference));
@@ -1333,7 +1336,7 @@ function SettingsView({
           <select
             value={settings.themePreference}
             onChange={(event) =>
-              void saveTheme(event.target.value as ResonanceSettings['themePreference'])
+              void saveTheme(event.target.value as ScribeSettings['themePreference'])
             }
           >
             {THEME_PREFERENCES.map((option) => (
@@ -1435,7 +1438,7 @@ function SettingsView({
           <select
             value={settings.summarizerProvider}
             onChange={(event) => {
-              const provider = event.target.value as ResonanceSettings['summarizerProvider'];
+              const provider = event.target.value as ScribeSettings['summarizerProvider'];
               const preset = SUMMARIZER_PROVIDERS.find((entry) => entry.value === provider);
               setModelOptions([]);
               setDetectStatus(null);
