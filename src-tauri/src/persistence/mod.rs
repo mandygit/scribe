@@ -9,7 +9,7 @@ use crate::domain::{
     ThemePreference,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 16;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 const SETTINGS_ID: &str = "default";
 
 /// SQLite-backed repository for local Scribe data.
@@ -1203,7 +1203,8 @@ impl SqliteRepository {
                     summarizer_port,
                     summarizer_model,
                     theme_preference,
-                    polish_selection_hotkey
+                    polish_selection_hotkey,
+                    prompt_on_teams_meeting
                 FROM settings
                 WHERE id = ?1",
                 params![SETTINGS_ID],
@@ -1244,8 +1245,9 @@ impl SqliteRepository {
                     summarizer_model,
                     theme_preference,
                     polish_selection_hotkey,
+                    prompt_on_teams_meeting,
                     updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
                 ON CONFLICT(id) DO UPDATE SET
                     microphone_device_id = excluded.microphone_device_id,
                     enable_system_audio = excluded.enable_system_audio,
@@ -1267,6 +1269,7 @@ impl SqliteRepository {
                     summarizer_model = excluded.summarizer_model,
                     theme_preference = excluded.theme_preference,
                     polish_selection_hotkey = excluded.polish_selection_hotkey,
+                    prompt_on_teams_meeting = excluded.prompt_on_teams_meeting,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     SETTINGS_ID,
@@ -1290,6 +1293,7 @@ impl SqliteRepository {
                     settings.summarizer_model.as_deref(),
                     theme_preference_to_db(settings.theme_preference),
                     settings.polish_selection_hotkey.as_str(),
+                    bool_to_db(settings.prompt_on_teams_meeting),
                     to_db_i64(updated_at_ms)?,
                 ],
             )
@@ -1536,6 +1540,11 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         "theme_preference",
         "TEXT NOT NULL DEFAULT 'system'",
     )?;
+    ensure_settings_column(
+        connection,
+        "prompt_on_teams_meeting",
+        "INTEGER NOT NULL DEFAULT 1 CHECK (prompt_on_teams_meeting IN (0, 1))",
+    )?;
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (2)",
@@ -1626,6 +1635,12 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
             [],
         )
         .map_err(map_db_error)?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO schema_versions(version) VALUES (17)",
+            [],
+        )
+        .map_err(map_db_error)?;
 
     let version = connection
         .query_row(
@@ -1713,6 +1728,7 @@ fn validate_migration_column_type(column_type: &str) -> Result<(), AppError> {
         | "INTEGER NOT NULL DEFAULT 1 CHECK (enable_echo_cancellation IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 0 CHECK (cloud_video_review_enabled IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))"
+        | "INTEGER NOT NULL DEFAULT 1 CHECK (prompt_on_teams_meeting IN (0, 1))"
         | "TEXT NOT NULL DEFAULT 'lm_studio'"
         | "TEXT NOT NULL DEFAULT '127.0.0.1'"
         | "TEXT NOT NULL DEFAULT 'system'"
@@ -1966,6 +1982,7 @@ fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScribeSettings> {
         summarizer_model: row.get(17)?,
         theme_preference: theme_preference_from_db(row.get::<_, String>(18)?, 18)?,
         polish_selection_hotkey: row.get(19)?,
+        prompt_on_teams_meeting: db_to_bool(row.get(20)?, 20)?,
     })
 }
 
@@ -2761,6 +2778,7 @@ mod tests {
             summarizer_model: Some("llama3.2".to_string()),
             theme_preference: ThemePreference::Dark,
             polish_selection_hotkey: "ctrl+option+p".to_string(),
+            prompt_on_teams_meeting: false,
         };
         let updated_settings = ScribeSettings {
             microphone_device_id: Some("microphone-2".to_string()),
@@ -2783,6 +2801,7 @@ mod tests {
             summarizer_model: Some("custom-model".to_string()),
             theme_preference: ThemePreference::Light,
             polish_selection_hotkey: "ctrl+option+d".to_string(),
+            prompt_on_teams_meeting: true,
         };
 
         test_repository

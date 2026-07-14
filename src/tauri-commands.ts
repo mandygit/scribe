@@ -27,6 +27,10 @@ export const TRANSCRIPT_STREAM_COMPLETE_EVENT = 'scribe://transcript-stream-comp
 export const LIVE_NUDGE_EVENT = 'scribe://live-nudge';
 export const DICTATION_STATE_EVENT = 'scribe://dictation-state';
 export const POLISH_SELECTION_NOTICE_EVENT = 'scribe://polish-selection-notice';
+export const MEETING_DETECTED_EVENT = 'scribe://meeting-detected';
+export const MEETING_CALL_ENDED_EVENT = 'scribe://meeting-call-ended';
+export const RECORDING_STARTED_EVENT = 'scribe://recording-started';
+export const RECORDING_STOPPED_EVENT = 'scribe://recording-stopped';
 
 export type DictationState = 'idle' | 'listening' | 'transcribing';
 
@@ -145,10 +149,14 @@ export const updateAudioProcessingSettings = async (
 ): Promise<ScribeSettings> =>
   invokeNative<ScribeSettings>('update_audio_processing_settings', { enableSystemAudio, enableEchoCancellation });
 
+export const updateMeetingDetectionSettings = async (promptOnTeamsMeeting: boolean): Promise<ScribeSettings> =>
+  invokeNative<ScribeSettings>('update_meeting_detection_settings', { promptOnTeamsMeeting });
+
+export const dismissMeetingPrompt = async (): Promise<void> => invokeNative<void>('dismiss_meeting_prompt');
+
 export const updateThemePreference = async (
   themePreference: ScribeSettings['themePreference'],
-): Promise<ScribeSettings> =>
-  invokeNative<ScribeSettings>('update_theme_preference', { themePreference });
+): Promise<ScribeSettings> => invokeNative<ScribeSettings>('update_theme_preference', { themePreference });
 
 export const updatePrivacySettings = async (
   rawAudioRetentionDays: number,
@@ -219,6 +227,35 @@ export const listenToDictationState = async (onState: (state: DictationState) =>
 export const listenToPolishSelectionNotice = async (onNotice: (message: string) => void): Promise<UnlistenFn> => {
   assertTauriRuntime();
   return listen<{ message: string }>(POLISH_SELECTION_NOTICE_EVENT, (event) => onNotice(event.payload.message));
+};
+
+export const listenToMeetingDetected = async (onDetected: (meetingId: string) => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen<{ meetingId: string }>(MEETING_DETECTED_EVENT, (event) => onDetected(event.payload.meetingId));
+};
+
+export const listenToMeetingCallEnded = async (onEnded: () => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen(MEETING_CALL_ENDED_EVENT, () => onEnded());
+};
+
+/**
+ * Fires whenever a recording starts, from any window (the main window's
+ * Start button or the meeting-detection popup's Record button) — lets every
+ * window stay in sync with actual recording state instead of only the one
+ * that initiated it.
+ */
+export const listenToRecordingStarted = async (onStarted: (started: RecordingStarted) => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen<RecordingStarted>(RECORDING_STARTED_EVENT, (event) => onStarted(event.payload));
+};
+
+/** Fires whenever a recording stops, from any window. See `listenToRecordingStarted`. */
+export const listenToRecordingStopped = async (
+  onStopped: (metadata: RecordingMetadata) => void,
+): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen<RecordingMetadata>(RECORDING_STOPPED_EVENT, (event) => onStopped(event.payload));
 };
 
 export const listenToTranscriptStream = async (listeners: TranscriptStreamListeners): Promise<UnlistenFn> => {

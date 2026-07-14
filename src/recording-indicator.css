@@ -1,0 +1,117 @@
+/* Recording indicator window. The window itself is transparent; only the
+   .rindicator capsule paints, so it reads as a small free-floating vertical
+   bar pinned to the right edge of the screen. Classes are namespaced
+   (rindicator*) so they never collide with the app's own styles. */
+
+:root {
+  --rindicator-bg: rgba(28, 27, 23, 0.86);
+  --rindicator-dot: #e0533f;
+  --rindicator-grip: rgba(244, 243, 238, 0.35);
+  --rindicator-stop-bg: #e0533f;
+  --rindicator-stop-bg-hover: #c8452f;
+}
+
+.recording-indicator-view,
+.recording-indicator-view body,
+.recording-indicator-view #root {
+  height: 100%;
+  margin: 0;
+  background: transparent;
+}
+
+.recording-indicator-view body {
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+.recording-indicator-view #root {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rindicator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  width: 40px;
+  height: 116px;
+  padding: 10px 0;
+  border-radius: 20px;
+  background: var(--rindicator-bg);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+  border: 0.5px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.32);
+}
+
+.rindicator__handle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  cursor: grab;
+}
+
+.rindicator__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--rindicator-dot);
+  animation: rindicator-pulse 1.2s ease-in-out infinite;
+}
+
+.rindicator__grip {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.rindicator__grip span {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--rindicator-grip);
+}
+
+.rindicator__stop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--rindicator-stop-bg);
+}
+
+.rindicator__stop:hover {
+  background: var(--rindicator-stop-bg-hover);
+}
+
+.rindicator__stop:disabled {
+  opacity: 0.6;
+}
+
+.rindicator__stop-icon {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  background: #f4f3ee;
+}
+
+@keyframes rindicator-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.7);
+  }
+}

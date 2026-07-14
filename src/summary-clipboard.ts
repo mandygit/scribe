@@ -1,4 +1,4 @@
-import type { MeetingActionItem, MeetingSummary } from './contracts';
+import type { KeyTopic, MeetingActionItem, MeetingSummary } from './contracts';
 
 const escapeHtml = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -16,19 +16,27 @@ const htmlSection = (title: string, items: string[]): string =>
 const textSection = (title: string, items: string[]): string =>
   items.length === 0 ? '' : `${title}:\n${items.map((item) => `- ${item}`).join('\n')}\n`;
 
+const htmlKeyTopics = (topics: KeyTopic[]): string =>
+  topics.map((topic) => htmlSection(topic.topic, topic.points)).join('');
+
+const textKeyTopics = (topics: KeyTopic[]): string =>
+  topics.map((topic) => textSection(topic.topic, topic.points)).join('');
+
 export interface SummaryClipboardPayload {
   html: string;
   text: string;
 }
 
-// Mirrors NotesView's sections exactly (executive summary, decisions, open
-// questions, action items) as plain bullet points and bold section labels —
-// deliberately no tables/borders, since those paste badly into Slack/Teams.
+// Mirrors NotesView's sections exactly (executive summary, key topics,
+// decisions, open questions, action items) as plain bullet points and bold
+// section labels - deliberately no tables/borders, since those paste badly
+// into Slack/Teams.
 export const buildSummaryClipboardPayload = (summary: MeetingSummary): SummaryClipboardPayload => {
   const actionItemLines = summary.actionItems.map(actionItemLine);
 
   const html = [
     summary.executiveSummary ? `<p>${escapeHtml(summary.executiveSummary)}</p>` : '',
+    htmlKeyTopics(summary.keyTopics),
     htmlSection('Decisions', summary.decisions),
     htmlSection('Open questions', summary.openQuestions),
     htmlSection('Action items', actionItemLines),
@@ -38,6 +46,7 @@ export const buildSummaryClipboardPayload = (summary: MeetingSummary): SummaryCl
 
   const text = [
     summary.executiveSummary,
+    textKeyTopics(summary.keyTopics),
     textSection('Decisions', summary.decisions),
     textSection('Open questions', summary.openQuestions),
     textSection('Action items', actionItemLines),

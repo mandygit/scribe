@@ -7,6 +7,7 @@ use std::{
 fn main() {
     build_system_audio_sidecar();
     build_dictation_polish_sidecar();
+    build_meeting_detector_sidecar();
     tauri_build::build();
 }
 
@@ -25,6 +26,15 @@ fn build_dictation_polish_sidecar() {
         "scribe-dictation-polish",
         "SCRIBE_DICTATION_POLISH_HELPER",
         &["FoundationModels"],
+    );
+}
+
+fn build_meeting_detector_sidecar() {
+    build_swift_sidecar(
+        "native/meeting-detector/main.swift",
+        "scribe-meeting-detector",
+        "SCRIBE_MEETING_DETECTOR_HELPER",
+        &["AppKit", "CoreGraphics"],
     );
 }
 

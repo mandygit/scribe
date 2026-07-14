@@ -43,7 +43,8 @@
     "longDescription": "Scribe records meetings on device, transcribes them with whisper.cpp, and writes concise notes with a local model — your audio never leaves your Mac.",
     "externalBin": [
       "binaries/scribe-system-audio-capture",
-      "binaries/scribe-dictation-polish"
+      "binaries/scribe-dictation-polish",
+      "binaries/scribe-meeting-detector"
     ],
     "macOS": {
       "minimumSystemVersion": "13.0",

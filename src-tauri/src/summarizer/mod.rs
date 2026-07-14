@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::analysis::{AnalysisTranscriptSegment, MeetingActionItem, MeetingSummary, MeetingSummarizer};
+use crate::analysis::{AnalysisTranscriptSegment, KeyTopic, MeetingActionItem, MeetingSummary, MeetingSummarizer};
 use crate::domain::{AppError, SummarizerProvider};
 
 pub const DEFAULT_SUMMARIZER_MODEL: &str = "qwen3-14b-mlx";
@@ -29,15 +29,20 @@ const SINGLE_SHOT_CHAR_BUDGET: usize = 36_000;
 const CHUNK_CHAR_TARGET: usize = 12_000;
 
 const SUMMARY_SYSTEM: &str =
-    "You write concise, accurate meeting notes as strict JSON. Use only the provided text. \
-Never invent owners, dates, decisions, or facts. Output a single JSON object and nothing else.";
+    "You write thorough, accurate meeting notes as strict JSON, grounded only in the provided text. \
+Prefer specific, granular detail (names, numbers, tool/system names, concrete reasoning) over vague \
+generalities, and do not stop at the first few points, decisions, or action items when more were \
+stated. Never invent owners, dates, decisions, or facts. Output a single JSON object and nothing else.";
 const MAP_SYSTEM: &str =
-    "You condense one portion of a meeting transcript into terse, factual bullet notes. \
-Capture key points, decisions, and action items with owners and due dates when stated. \
+    "You condense one portion of a meeting transcript into thorough, factual bullet notes. \
+Capture every distinct point, decision, and action item with owners and due dates when stated, \
+preserving specific names, numbers, and tool/system names rather than generalizing them away. \
 Plain text only, no preamble.";
 
 const SUMMARY_SCHEMA: &str = "{\"meetingTitle\":\"3-6 word descriptive title, no quotes or punctuation\",\
-\"executiveSummary\":\"2-4 sentence overview\",\
+\"executiveSummary\":\"2-4 sentence overview of what the meeting was and why it happened\",\
+\"keyTopics\":[{\"topic\":\"short label for one thread of discussion\",\
+\"points\":[\"specific, granular point from that thread, grounded in the transcript\"]}],\
 \"actionItems\":[{\"owner\":\"person or null\",\"task\":\"specific action\",\"due\":\"date or null\"}],\
 \"decisions\":[\"decision\"],\"openQuestions\":[\"question\"],\"speakingImprovements\":[]}";
 
@@ -128,9 +133,14 @@ const NO_THINK_DIRECTIVE: &str = "\n\n/no_think";
 
 fn single_shot_prompt(transcript: &str) -> String {
     format!(
-        "Summarize this meeting for someone who missed it.\n\
+        "Summarize this meeting for someone who missed it, thoroughly enough that they don't need \
+to read the transcript.\n\
 Return exactly one strict JSON object matching this schema and no Markdown:\n{SUMMARY_SCHEMA}\n\
-Use null for an unknown owner or due date. Keep action item tasks concrete.\n\
+Break keyTopics into as many distinct threads of discussion as the transcript actually covers \
+(do not compress everything into one or two topics), and give each thread every specific, \
+concrete point made about it, not just a headline takeaway. Do the same for actionItems, \
+decisions, and openQuestions: include every one that was actually stated, not only the most \
+obvious few. Use null for an unknown owner or due date. Keep action item tasks concrete.\n\
 meetingTitle should identify the meeting's actual subject (e.g. \"Q3 Budget Review\"), not a generic label like \"Meeting Notes\".\n\n\
 Transcript:\n{transcript}{NO_THINK_DIRECTIVE}"
     )
@@ -144,9 +154,12 @@ fn map_prompt(chunk: &str) -> String {
 
 fn reduce_prompt(digests: &str) -> String {
     format!(
-        "Combine these section notes from one meeting into a single set of meeting notes.\n\
+        "Combine these section notes from one meeting into a single, thorough set of meeting notes.\n\
 Return exactly one strict JSON object matching this schema and no Markdown:\n{SUMMARY_SCHEMA}\n\
-Merge duplicates, use null for an unknown owner or due date, and keep tasks concrete.\n\
+Break keyTopics into as many distinct threads of discussion as the notes actually cover, each with \
+every specific point from that thread, not a one-line generalization. Carry forward every action \
+item, decision, and open question mentioned across all sections, not just the most obvious ones. \
+Merge only true duplicates, use null for an unknown owner or due date, and keep tasks concrete.\n\
 meetingTitle should identify the meeting's actual subject (e.g. \"Q3 Budget Review\"), not a generic label like \"Meeting Notes\".\n\n\
 Section notes:\n{digests}{NO_THINK_DIRECTIVE}"
     )
@@ -181,6 +194,11 @@ fn meeting_summary_from_value(value: &Value) -> MeetingSummary {
             .unwrap_or_default()
             .trim()
             .to_string(),
+        key_topics: value
+            .get("keyTopics")
+            .and_then(Value::as_array)
+            .map(|topics| topics.iter().filter_map(key_topic_from_value).collect())
+            .unwrap_or_default(),
         action_items: value
             .get("actionItems")
             .and_then(Value::as_array)
@@ -190,6 +208,14 @@ fn meeting_summary_from_value(value: &Value) -> MeetingSummary {
         open_questions: string_list(value.get("openQuestions")),
         speaking_improvements: Vec::new(),
     }
+}
+
+fn key_topic_from_value(value: &Value) -> Option<KeyTopic> {
+    let topic = value.get("topic").and_then(Value::as_str)?.trim().to_string();
+    if topic.is_empty() {
+        return None;
+    }
+    Some(KeyTopic { topic, points: string_list(value.get("points")) })
 }
 
 fn action_item_from_value(value: &Value) -> Option<MeetingActionItem> {
@@ -560,6 +586,27 @@ mod tests {
         assert_eq!(summary.action_items.len(), 1);
         assert_eq!(summary.action_items[0].owner.as_deref(), Some("Dana"));
         assert_eq!(summary.decisions, vec!["Cut saved cards".to_string()]);
+    }
+
+    #[test]
+    fn extracts_key_topics_when_present() {
+        let summary = parse_summary(
+            "{\"executiveSummary\":\"Overview.\",\"keyTopics\":[{\"topic\":\"Budget\",\"points\":[\"Cut cloud spend by 10%\",\"Delayed the Q3 hire\"]},{\"topic\":\"Empty\",\"points\":[]}],\"actionItems\":[],\"decisions\":[],\"openQuestions\":[]}",
+        )
+        .expect("valid json parses");
+        assert_eq!(summary.key_topics.len(), 2);
+        assert_eq!(summary.key_topics[0].topic, "Budget");
+        assert_eq!(summary.key_topics[0].points, vec!["Cut cloud spend by 10%", "Delayed the Q3 hire"]);
+        assert!(summary.key_topics[1].points.is_empty());
+    }
+
+    #[test]
+    fn missing_key_topics_defaults_to_empty() {
+        let summary = parse_summary(
+            "{\"executiveSummary\":\"Overview.\",\"actionItems\":[],\"decisions\":[],\"openQuestions\":[]}",
+        )
+        .expect("valid json parses");
+        assert!(summary.key_topics.is_empty());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use domain::{
     AnalyzerProvider, AppError, DictationSessionId, MeetingId, MeetingLifecycleState,
     ProcessingStage, ReportId, ScribeSettings, SummarizerProvider, ThemePreference,
 };
+use meeting_detection::{advance, CallPromptState, DetectorEvent, PromptAction, TeamsCallDetector};
 use nudges::{
     LiveNudgeEvent, LiveNudgePipeline, NudgeEventSink, NudgeTranscriptEventSink, LIVE_NUDGE_EVENT,
 };
@@ -44,6 +45,7 @@ pub mod audio;
 pub mod dictation;
 pub mod domain;
 pub mod media_import;
+pub mod meeting_detection;
 pub mod nudges;
 pub mod path_detection;
 pub mod permissions;
@@ -60,6 +62,12 @@ struct AppState {
     /// Counts consecutive polish-selection presses with nothing selected, so
     /// the notice can start friendly and get terser after a few repeats.
     polish_selection_notice_count: Mutex<u32>,
+    /// Owns the Teams-call-detector sidecar process, if currently running
+    /// (only when the `promptOnTeamsMeeting` setting is on).
+    meeting_detector: Mutex<TeamsCallDetector>,
+    /// The "record this meeting?" prompt's state machine (see
+    /// `meeting_detection::advance`).
+    meeting_call_state: Mutex<CallPromptState>,
 }
 
 fn load_effective_settings(repository: &SqliteRepository) -> Result<ScribeSettings, AppError> {
@@ -492,7 +500,17 @@ fn start_recording(
         ensure_meeting_exists(&repository, &meeting_id_value, started_at_ms)?;
     }
 
-    recordings.start_recording(meeting_id, file_path, system_audio_file_path, device_id)
+    let started = recordings.start_recording(meeting_id, file_path, system_audio_file_path, device_id)?;
+
+    // Broadcast to every window, not just whichever one called this command —
+    // the main window and the floating recording indicator both need to know
+    // a recording is active regardless of whether it was started from the
+    // main window's button or the meeting-detection popup.
+    emit_recording_started(&app, &started);
+    #[cfg(target_os = "macos")]
+    set_recording_indicator_visible(&app, true);
+
+    Ok(started)
 }
 
 #[tauri::command]
@@ -848,6 +866,59 @@ struct PolishSelectionNoticeEvent {
     message: String,
 }
 
+/// Event the meeting popup listens to: a live Teams call was just detected
+/// and it should show itself with the given (not-yet-started) meeting id.
+const MEETING_DETECTED_EVENT: &str = "scribe://meeting-detected";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MeetingDetectedEvent {
+    meeting_id: String,
+}
+
+/// Broadcasts a freshly detected call to the meeting popup. Fire-and-forget,
+/// same as `emit_dictation_state`.
+fn emit_meeting_detected(app: &AppHandle, meeting_id: &str) {
+    let _ = app.emit(
+        MEETING_DETECTED_EVENT,
+        MeetingDetectedEvent {
+            meeting_id: meeting_id.to_string(),
+        },
+    );
+}
+
+/// Event the meeting popup listens to: the call it was showing itself for
+/// ended before the user chose Record or Dismiss, so it should hide itself.
+const MEETING_CALL_ENDED_EVENT: &str = "scribe://meeting-call-ended";
+
+/// Broadcasts that the current call ended. Fire-and-forget, same as
+/// `emit_dictation_state`.
+fn emit_meeting_call_ended(app: &AppHandle) {
+    let _ = app.emit(MEETING_CALL_ENDED_EVENT, ());
+}
+
+/// Event broadcast to every window when a recording starts, regardless of
+/// which window's button triggered it (the main window's Start button, or
+/// the meeting-detection popup's Record button) — both the main window and
+/// the floating recording indicator need to stay in sync.
+const RECORDING_STARTED_EVENT: &str = "scribe://recording-started";
+
+/// Broadcasts that a recording started. Fire-and-forget, same as
+/// `emit_dictation_state`.
+fn emit_recording_started(app: &AppHandle, started: &RecordingStarted) {
+    let _ = app.emit(RECORDING_STARTED_EVENT, started);
+}
+
+/// Event broadcast to every window when a recording stops, regardless of
+/// which window's stop button triggered it.
+const RECORDING_STOPPED_EVENT: &str = "scribe://recording-stopped";
+
+/// Broadcasts that a recording stopped. Fire-and-forget, same as
+/// `emit_dictation_state`.
+fn emit_recording_stopped(app: &AppHandle, metadata: &RecordingMetadata) {
+    let _ = app.emit(RECORDING_STOPPED_EVENT, metadata);
+}
+
 /// Broadcasts a short-lived polish-selection notice to the pill. Fire-and-forget,
 /// same as `emit_dictation_state`.
 fn emit_polish_selection_notice(app: &AppHandle, message: impl Into<String>) {
@@ -859,16 +930,17 @@ fn emit_polish_selection_notice(app: &AppHandle, message: impl Into<String>) {
     );
 }
 
-/// Shows or hides the dictation pill panel on the main thread (AppKit calls must
-/// run there). Hiding it hands key focus back to the user's previously-active
-/// window so a synthesised paste lands in their field; `order_front_regardless`
-/// brings the pill back without making it the key window again.
+/// Shows or hides a floating panel window (the dictation pill or the meeting
+/// popup) on the main thread (AppKit calls must run there). Hiding it hands
+/// key focus back to the user's previously-active window so e.g. a
+/// synthesised paste lands in their field; `order_front_regardless` brings it
+/// back without making it the key window again.
 #[cfg(target_os = "macos")]
-fn set_pill_visible(app: &AppHandle, visible: bool) {
+fn set_panel_visible(app: &AppHandle, label: &'static str, visible: bool) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         use tauri_nspanel::ManagerExt;
-        if let Ok(panel) = app.get_webview_panel(DICTATION_PILL_WINDOW) {
+        if let Ok(panel) = app.get_webview_panel(label) {
             if visible {
                 panel.order_front_regardless();
             } else {
@@ -876,6 +948,25 @@ fn set_pill_visible(app: &AppHandle, visible: bool) {
             }
         }
     });
+}
+
+/// Shows or hides the dictation pill. Thin wrapper over [`set_panel_visible`]
+/// kept as a named function since most call sites only care about the pill.
+#[cfg(target_os = "macos")]
+fn set_pill_visible(app: &AppHandle, visible: bool) {
+    set_panel_visible(app, DICTATION_PILL_WINDOW, visible);
+}
+
+/// Shows or hides the "Record this meeting?" popup.
+#[cfg(target_os = "macos")]
+fn set_meeting_popup_visible(app: &AppHandle, visible: bool) {
+    set_panel_visible(app, MEETING_POPUP_WINDOW, visible);
+}
+
+/// Shows or hides the recording-in-progress indicator.
+#[cfg(target_os = "macos")]
+fn set_recording_indicator_visible(app: &AppHandle, visible: bool) {
+    set_panel_visible(app, RECORDING_INDICATOR_WINDOW, visible);
 }
 
 /// Shows or clears a "listening" indicator in the menu bar by setting the tray
@@ -903,9 +994,45 @@ const PILL_HEIGHT: f64 = 40.0;
 #[cfg(desktop)]
 const PILL_BOTTOM_MARGIN: f64 = 8.0;
 
+/// Label of the meeting-detected prompt window (the small bar pinned to the
+/// top-center of the screen, like the dictation pill but anchored opposite).
+#[cfg(desktop)]
+const MEETING_POPUP_WINDOW: &str = "meeting-popup";
+
+/// Logical size of the meeting popup and the gap kept below the menu bar.
+#[cfg(desktop)]
+const MEETING_POPUP_WIDTH: f64 = 360.0;
+#[cfg(desktop)]
+const MEETING_POPUP_HEIGHT: f64 = 64.0;
+#[cfg(desktop)]
+const MEETING_POPUP_TOP_MARGIN: f64 = 8.0;
+
+/// Label of the recording-in-progress indicator window (the small vertical
+/// capsule pinned to the right-center of the screen, with a stop button).
+#[cfg(desktop)]
+const RECORDING_INDICATOR_WINDOW: &str = "recording-indicator";
+
+/// Logical size of the recording indicator and the gap kept clear of the
+/// screen's right edge.
+#[cfg(desktop)]
+const RECORDING_INDICATOR_WIDTH: f64 = 56.0;
+#[cfg(desktop)]
+const RECORDING_INDICATOR_HEIGHT: f64 = 132.0;
+#[cfg(desktop)]
+const RECORDING_INDICATOR_RIGHT_MARGIN: f64 = 10.0;
+
+/// Which edge of the primary monitor's work area a floating window is pinned to.
+#[cfg(desktop)]
+#[derive(Clone, Copy)]
+enum WindowAnchor {
+    BottomCenter,
+    TopCenter,
+    RightCenter,
+}
+
 /// Creates the floating dictation pill: a small, transparent, always-on-top bar
 /// pinned to the bottom-center of the primary screen. On macOS it is converted to
-/// a non-activating panel (see `make_pill_non_activating`) so clicking it never
+/// a non-activating panel (see `make_window_non_activating`) so clicking it never
 /// activates Scribe; `accept_first_mouse` lets the mic button fire on the first
 /// click even though the panel isn't the key window (otherwise the first click is
 /// swallowed just to focus the webview).
@@ -932,57 +1059,140 @@ fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
     .visible(true)
     .build()?;
 
-    position_pill_bottom_center(&pill);
+    position_window(&pill, WindowAnchor::BottomCenter, PILL_BOTTOM_MARGIN);
     Ok(())
 }
 
-/// Pins the pill to the bottom-center of the primary monitor's work area —
-/// the visible region that already excludes the Dock and menu bar — lifted a
-/// little further by [`PILL_BOTTOM_MARGIN`] so it floats clear of the Dock
-/// rather than being clipped behind it. Positions in physical pixels so it
-/// lands correctly on Retina displays. Best-effort: leaves the pill at its
-/// default position if monitor info is unavailable.
+/// Creates the floating "Record this meeting?" prompt: a small, transparent,
+/// always-on-top bar pinned to the top-center of the primary screen (matching
+/// where meeting apps' own notification bars typically sit) — hidden until a
+/// live Teams call is detected. Same non-activating-panel treatment as the
+/// dictation pill, for the same reason: a click must not steal focus from the
+/// meeting app the user is currently in.
 #[cfg(desktop)]
-fn position_pill_bottom_center(pill: &tauri::WebviewWindow) {
-    let Ok(Some(monitor)) = pill.primary_monitor() else {
+fn create_meeting_popup(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let popup = WebviewWindowBuilder::new(
+        app,
+        MEETING_POPUP_WINDOW,
+        WebviewUrl::App("index.html?view=meeting-popup".into()),
+    )
+    .title("Scribe Meeting Prompt")
+    .inner_size(MEETING_POPUP_WIDTH, MEETING_POPUP_HEIGHT)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .shadow(false)
+    .resizable(false)
+    .focusable(false)
+    .focused(false)
+    .accept_first_mouse(true)
+    .visible(false)
+    .build()?;
+
+    position_window(&popup, WindowAnchor::TopCenter, MEETING_POPUP_TOP_MARGIN);
+    Ok(())
+}
+
+/// Creates the floating recording-in-progress indicator: a small, transparent,
+/// always-on-top vertical capsule pinned to the right-center of the primary
+/// screen — hidden until a recording is active (see `emit_recording_started`/
+/// `emit_recording_stopped`), and shown for *any* active recording, not just
+/// ones started from the meeting-detection popup. Same non-activating-panel
+/// treatment as the pill and the meeting popup.
+#[cfg(desktop)]
+fn create_recording_indicator(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let indicator = WebviewWindowBuilder::new(
+        app,
+        RECORDING_INDICATOR_WINDOW,
+        WebviewUrl::App("index.html?view=recording-indicator".into()),
+    )
+    .title("Scribe Recording Indicator")
+    .inner_size(RECORDING_INDICATOR_WIDTH, RECORDING_INDICATOR_HEIGHT)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .shadow(false)
+    .resizable(false)
+    .focusable(false)
+    .focused(false)
+    .accept_first_mouse(true)
+    .visible(false)
+    .build()?;
+
+    position_window(&indicator, WindowAnchor::RightCenter, RECORDING_INDICATOR_RIGHT_MARGIN);
+    Ok(())
+}
+
+/// Pins `window` to the given edge of the primary monitor's work area — the
+/// visible region that already excludes the Dock and menu bar — offset by
+/// `margin` so it floats clear of that edge rather than being clipped behind
+/// it. Positions in physical pixels so it lands correctly on Retina displays.
+/// Best-effort: leaves the window at its default position if monitor info is
+/// unavailable.
+#[cfg(desktop)]
+fn position_window(window: &tauri::WebviewWindow, anchor: WindowAnchor, margin: f64) {
+    let Ok(Some(monitor)) = window.primary_monitor() else {
         return;
     };
     let scale = monitor.scale_factor();
     let work_area = monitor.work_area();
-    let Ok(pill_size) = pill.outer_size() else {
+    let Ok(window_size) = window.outer_size() else {
         return;
     };
-    let margin = (PILL_BOTTOM_MARGIN * scale) as i32;
-    let x = work_area.position.x
-        + (work_area.size.width as i32 - pill_size.width as i32) / 2;
-    let y = work_area.position.y + work_area.size.height as i32
-        - pill_size.height as i32
-        - margin;
-    let _ = pill.set_position(tauri::PhysicalPosition::new(x, y));
+    let margin_px = (margin * scale) as i32;
+    let (x, y) = match anchor {
+        WindowAnchor::BottomCenter | WindowAnchor::TopCenter => {
+            let x = work_area.position.x
+                + (work_area.size.width as i32 - window_size.width as i32) / 2;
+            let y = if matches!(anchor, WindowAnchor::BottomCenter) {
+                work_area.position.y + work_area.size.height as i32
+                    - window_size.height as i32
+                    - margin_px
+            } else {
+                work_area.position.y + margin_px
+            };
+            (x, y)
+        }
+        WindowAnchor::RightCenter => {
+            let x = work_area.position.x + work_area.size.width as i32
+                - window_size.width as i32
+                - margin_px;
+            let y = work_area.position.y
+                + (work_area.size.height as i32 - window_size.height as i32) / 2;
+            (x, y)
+        }
+    };
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
-/// Converts the dictation pill window into a non-activating NSPanel. A normal
-/// macOS window activates its owning app when clicked, which would raise Scribe's
-/// main window over the pill and steal focus from whatever app the user is
-/// dictating into. The non-activating panel style mask lets the pill receive
-/// clicks without ever activating the app. Best-effort: logs and returns if the
-/// window is missing or the swizzle fails.
+/// Converts a floating window (the dictation pill or the meeting popup) into a
+/// non-activating NSPanel. A normal macOS window activates its owning app when
+/// clicked, which would raise Scribe's main window over the floating bar and
+/// steal focus from whatever app the user is currently in. The non-activating
+/// panel style mask lets it receive clicks without ever activating the app.
+/// Best-effort: logs and returns if the window is missing or the swizzle fails.
 #[cfg(target_os = "macos")]
 // tauri-nspanel's public API is built on the older `cocoa` crate, which is now
 // deprecated in favour of objc2-app-kit; the plugin still requires these types.
 #[allow(deprecated)]
-fn make_pill_non_activating(app: &AppHandle) {
+fn make_window_non_activating(app: &AppHandle, label: &str) {
     use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
     use tauri_nspanel::WebviewWindowExt;
 
-    let Some(window) = app.get_webview_window(DICTATION_PILL_WINDOW) else {
-        eprintln!("dictation pill: window missing, cannot convert to panel");
+    let Some(window) = app.get_webview_window(label) else {
+        eprintln!("{label}: window missing, cannot convert to panel");
         return;
     };
     let panel = match window.to_panel() {
         Ok(panel) => panel,
         Err(error) => {
-            eprintln!("dictation pill: to_panel failed: {error}");
+            eprintln!("{label}: to_panel failed: {error}");
             return;
         }
     };
@@ -992,19 +1202,99 @@ fn make_pill_non_activating(app: &AppHandle) {
     panel.set_level(NS_FLOATING_WINDOW_LEVEL);
 
     // NSWindowStyleMaskNonactivatingPanel — a click must not activate Scribe (the
-    // app stays in the background; only its key window changes). The pill is
-    // borderless, so this is the only style bit it needs. The pill still briefly
-    // takes *key* focus on click, so the dictation flow re-activates the user's
-    // previous app before pasting (see `start_dictation_session` / inject).
+    // app stays in the background; only its key window changes). Both floating
+    // windows are borderless, so this is the only style bit either needs. The
+    // dictation pill still briefly takes *key* focus on click, so the dictation
+    // flow re-activates the user's previous app before pasting (see
+    // `start_dictation_session` / inject).
     const NS_NONACTIVATING_PANEL: i32 = 1 << 7;
     panel.set_style_mask(NS_NONACTIVATING_PANEL);
 
-    // Keep the pill visible across spaces and alongside other apps' full-screen
+    // Keep the window visible across spaces and alongside other apps' full-screen
     // windows, matching its always-on-top intent.
     panel.set_collection_behaviour(
         NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
     );
+}
+
+/// Handles one line of output from the meeting-detector sidecar: advances the
+/// call-prompt state machine (`meeting_detection::advance`) and shows/hides
+/// the popup accordingly. Runs on the sidecar's own reader thread, so all
+/// AppKit-touching work goes through `set_meeting_popup_visible`, which hops
+/// to the main thread itself.
+fn on_meeting_detector_line(app: &AppHandle, line: &str) {
+    let Some(event) = DetectorEvent::from_sidecar_line(line) else {
+        return;
+    };
+    let state = app.state::<AppState>();
+    let recording_already_active = state
+        .recordings
+        .lock()
+        .map(|recordings| recordings.is_recording())
+        .unwrap_or(false);
+    let action = {
+        let Ok(mut call_state) = state.meeting_call_state.lock() else {
+            eprintln!("meeting detector: call state lock poisoned");
+            return;
+        };
+        let (next_state, action) = advance(*call_state, event, recording_already_active);
+        *call_state = next_state;
+        action
+    };
+
+    match action {
+        PromptAction::ShowPrompt => {
+            let meeting_id = match current_time_ms() {
+                Ok(now_ms) => format!("meeting-{now_ms}"),
+                Err(error) => {
+                    eprintln!("meeting detector: could not id meeting: {}", error.message);
+                    return;
+                }
+            };
+            emit_meeting_detected(app, &meeting_id);
+            #[cfg(target_os = "macos")]
+            set_meeting_popup_visible(app, true);
+        }
+        PromptAction::HidePrompt => {
+            emit_meeting_call_ended(app);
+            #[cfg(target_os = "macos")]
+            set_meeting_popup_visible(app, false);
+        }
+        PromptAction::None => {}
+    }
+}
+
+/// Starts the meeting-detector sidecar if `promptOnTeamsMeeting` is enabled
+/// and it isn't already running. Best-effort: a failed start is logged, not
+/// propagated, since it must never block app startup or a settings save.
+fn start_meeting_detection_if_enabled(app: &AppHandle, settings: &ScribeSettings) {
+    if !settings.prompt_on_teams_meeting {
+        return;
+    }
+    let state = app.state::<AppState>();
+    let Ok(mut detector) = state.meeting_detector.lock() else {
+        eprintln!("meeting detector: lock poisoned, not starting");
+        return;
+    };
+    let app_for_thread = app.clone();
+    if let Err(error) = detector.start(move |line| on_meeting_detector_line(&app_for_thread, &line)) {
+        eprintln!("meeting_detector_start_failed: {} ({})", error.message, error.code);
+    }
+}
+
+/// Stops the meeting-detector sidecar (if running) and resets the prompt
+/// state, hiding the popup if it happened to be showing.
+fn stop_meeting_detection(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(mut detector) = state.meeting_detector.lock() {
+        detector.stop();
+    }
+    if let Ok(mut call_state) = state.meeting_call_state.lock() {
+        *call_state = CallPromptState::default();
+    }
+    #[cfg(target_os = "macos")]
+    set_meeting_popup_visible(app, false);
 }
 
 /// Maps a persisted hotkey token (dictation or polish-selection) to a
@@ -1477,6 +1767,49 @@ fn update_theme_preference(
     Ok(hydrate_settings_with_local_defaults(settings))
 }
 
+/// Persists whether a live Teams call should prompt to record, and starts or
+/// stops the detector sidecar immediately so the change takes effect without
+/// an app restart.
+#[tauri::command]
+fn update_meeting_detection_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    prompt_on_teams_meeting: bool,
+) -> Result<ScribeSettings, AppError> {
+    let updated = {
+        let repository = state.repository.lock().map_err(map_lock_error)?;
+        let mut settings = repository.get_settings()?;
+        settings.prompt_on_teams_meeting = prompt_on_teams_meeting;
+        repository.upsert_settings(&settings, current_time_ms()?)?;
+        hydrate_settings_with_local_defaults(settings)
+    };
+
+    if prompt_on_teams_meeting {
+        start_meeting_detection_if_enabled(&app, &updated);
+    } else {
+        stop_meeting_detection(&app);
+    }
+
+    Ok(updated)
+}
+
+/// Dismisses the currently showing "record this meeting?" popup: the call
+/// keeps running, but the prompt won't reappear until it ends and a new one
+/// starts.
+#[tauri::command]
+fn dismiss_meeting_prompt(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
+    {
+        let mut call_state = state.meeting_call_state.lock().map_err(map_lock_error)?;
+        let (next_state, _action) = advance(*call_state, DetectorEvent::Dismissed, false);
+        *call_state = next_state;
+    }
+    #[cfg(target_os = "macos")]
+    set_meeting_popup_visible(&app, false);
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+    Ok(())
+}
+
 #[tauri::command]
 fn update_privacy_settings(
     app: AppHandle,
@@ -1590,7 +1923,7 @@ fn apple_script_string_literal(value: &str) -> String {
 }
 
 #[tauri::command]
-fn stop_recording(state: State<'_, AppState>) -> Result<RecordingMetadata, AppError> {
+fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<RecordingMetadata, AppError> {
     let stopped_at_ms = current_time_ms()?;
     let metadata = state
         .recordings
@@ -1614,6 +1947,14 @@ fn stop_recording(state: State<'_, AppState>) -> Result<RecordingMetadata, AppEr
             created_at_ms: stopped_at_ms,
         })?;
     }
+
+    // Broadcast to every window (see `start_recording`'s matching comment) —
+    // whichever window the user clicked Stop from (the main window or the
+    // floating recording indicator), all windows need to learn the recording
+    // ended so their UI stays in sync.
+    emit_recording_stopped(&app, &metadata);
+    #[cfg(target_os = "macos")]
+    set_recording_indicator_visible(&app, false);
 
     Ok(metadata)
 }
@@ -1656,6 +1997,8 @@ pub fn run() {
             update_audio_processing_settings,
             update_theme_preference,
             update_privacy_settings,
+            update_meeting_detection_settings,
+            dismiss_meeting_prompt,
             send_completion_notification
         ])
         .setup(|app| {
@@ -1686,6 +2029,8 @@ pub fn run() {
                 dictation: Mutex::new(DictationRecorder::new(CpalCaptureBackend::new())),
                 dictation_hotkey: Mutex::new(DictationHotkey::new()),
                 polish_selection_notice_count: Mutex::new(0),
+                meeting_detector: Mutex::new(TeamsCallDetector::new()),
+                meeting_call_state: Mutex::new(CallPromptState::default()),
             });
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
 
@@ -1744,7 +2089,30 @@ pub fn run() {
                 // activates Scribe (which would raise the main window over the pill
                 // and steal focus). focusable(false) alone does not prevent that.
                 #[cfg(target_os = "macos")]
-                make_pill_non_activating(app.handle());
+                make_window_non_activating(app.handle(), DICTATION_PILL_WINDOW);
+            }
+
+            #[cfg(desktop)]
+            {
+                // Floating "record this meeting?" popup, pinned top-center and
+                // hidden until a live Teams call is detected below.
+                if let Err(error) = create_meeting_popup(app.handle()) {
+                    eprintln!("meeting_popup_create_failed: {error}");
+                }
+                #[cfg(target_os = "macos")]
+                make_window_non_activating(app.handle(), MEETING_POPUP_WINDOW);
+            }
+
+            #[cfg(desktop)]
+            {
+                // Floating recording-in-progress indicator, pinned right-center
+                // and hidden until any recording is active (see
+                // `emit_recording_started`/`emit_recording_stopped`).
+                if let Err(error) = create_recording_indicator(app.handle()) {
+                    eprintln!("recording_indicator_create_failed: {error}");
+                }
+                #[cfg(target_os = "macos")]
+                make_window_non_activating(app.handle(), RECORDING_INDICATOR_WINDOW);
             }
 
             #[cfg(desktop)]
@@ -1767,10 +2135,24 @@ pub fn run() {
                 }
             }
 
+            // Starts the Teams-call-detector sidecar if the setting is on. Best
+            // effort: logged, not fatal, since detection is a nice-to-have on
+            // top of manual recording, never a prerequisite for it.
+            start_meeting_detection_if_enabled(app.handle(), &hydrated_settings);
+
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Scribe");
+        .build(tauri::generate_context!())
+        .expect("error while building Scribe")
+        .run(|app_handle, event| {
+            // The meeting-detector sidecar loops forever; without an explicit
+            // stop here it would leak as an orphaned process after Scribe
+            // quits (unlike the system-audio-capture sidecar, which only runs
+            // for the bounded duration of an active recording).
+            if let tauri::RunEvent::Exit = event {
+                stop_meeting_detection(app_handle);
+            }
+        });
 }
 
 #[cfg(test)]

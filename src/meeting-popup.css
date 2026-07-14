@@ -1,0 +1,104 @@
+/* Meeting popup window. The window itself is transparent; only the .mpopup bar
+   paints, so it reads as a small free-floating banner -- like Notion's meeting
+   note prompt. Classes are namespaced (mpopup*) so they never collide with the
+   app's own styles. */
+
+:root {
+  --mpopup-bg: rgba(28, 27, 23, 0.86);
+  --mpopup-text: #f4f3ee;
+  --mpopup-muted: rgba(244, 243, 238, 0.7);
+  --mpopup-record-bg: #c96442;
+  --mpopup-record-bg-hover: #b3562f;
+  --mpopup-dismiss-border: rgba(255, 255, 255, 0.18);
+}
+
+/* Page-level rules are scoped to .meeting-popup-view (added to <html> only in
+   this window). This entry's CSS is bundled globally by Vite, so without the
+   scope these would leak into the main window and break its layout. */
+.meeting-popup-view,
+.meeting-popup-view body,
+.meeting-popup-view #root {
+  height: 100%;
+  margin: 0;
+  background: transparent;
+}
+
+.meeting-popup-view body {
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+.meeting-popup-view #root {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mpopup {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  height: 44px;
+  padding: 0 10px 0 16px;
+  border-radius: 22px;
+  background: var(--mpopup-bg);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+  border: 0.5px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.32);
+  color: var(--mpopup-text);
+}
+
+.mpopup[data-visible="false"] {
+  visibility: hidden;
+}
+
+.mpopup__label {
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.mpopup__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mpopup__btn {
+  height: 30px;
+  padding: 0 14px;
+  border: none;
+  border-radius: 15px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.mpopup__btn--dismiss {
+  background: transparent;
+  color: var(--mpopup-muted);
+  border: 1px solid var(--mpopup-dismiss-border);
+}
+
+.mpopup__btn--dismiss:hover {
+  color: var(--mpopup-text);
+  border-color: rgba(255, 255, 255, 0.32);
+}
+
+.mpopup__btn--record {
+  background: var(--mpopup-record-bg);
+  color: var(--mpopup-text);
+}
+
+.mpopup__btn--record:hover {
+  background: var(--mpopup-record-bg-hover);
+}
+
+.mpopup__btn--record:disabled {
+  opacity: 0.6;
+}

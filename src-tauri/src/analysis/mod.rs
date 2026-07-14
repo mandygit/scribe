@@ -36,6 +36,11 @@ pub enum TranscriptSpeakerRole {
 #[serde(rename_all = "camelCase")]
 pub struct MeetingSummary {
     pub executive_summary: String,
+    /// Thematic breakdown of the discussion, each with granular,
+    /// transcript-grounded bullets. Defaulted for backward compatibility
+    /// with summaries persisted before this field existed.
+    #[serde(default)]
+    pub key_topics: Vec<KeyTopic>,
     pub action_items: Vec<MeetingActionItem>,
     pub decisions: Vec<String>,
     pub open_questions: Vec<String>,
@@ -45,6 +50,15 @@ pub struct MeetingSummary {
     /// `SqliteRepository::set_meeting_title_if_absent`.
     #[serde(default)]
     pub meeting_title: Option<String>,
+}
+
+/// One thematic section of a meeting summary, e.g. "Cybersecurity review" or
+/// "Model migration", with specific bullets grounded in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyTopic {
+    pub topic: String,
+    pub points: Vec<String>,
 }
 
 /// One action item extracted from a downloaded meeting recording.

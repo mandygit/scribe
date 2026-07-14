@@ -28,12 +28,12 @@ A macOS desktop app (Tauri: React frontend + Rust backend) that:
 Everything above runs on the user's Mac. No network calls are made except to
 `127.0.0.1`-bound local model servers the user installs themselves. There is
 no cloud fallback path currently wired up (an earlier product direction
-explored one; see §11).
+explored one; see §12).
 
 The project has been renamed twice (Orator → Resonance → Scribe), but every
 current identifier — the Cargo crate (`scribe`/`scribe_lib`), bundle
 identifier (`com.scribe.app`), app-data folder, database file
-(`scribe.sqlite3`), both Swift sidecar binaries, and IPC event names — is
+(`scribe.sqlite3`), all three Swift sidecar binaries, and IPC event names — is
 now **Scribe**. There's no migration path from the old names; this is a
 single-user app, so a prior install's data was just moved by hand rather
 than kept in the codebase as a maintained upgrade path.
@@ -45,6 +45,7 @@ flowchart TB
     subgraph UI["Frontend — React 19 + TypeScript (Tauri WebView)"]
         App["App.tsx\n(recording, history, trends, settings)"]
         Pill["DictationPill.tsx\n(floating NSPanel window)"]
+        MeetingPopup["MeetingPopup.tsx\n(floating NSPanel window)"]
         Contracts["contracts.ts / tauri-commands.ts\n(typed IPC boundary)"]
     end
 
@@ -54,6 +55,7 @@ flowchart TB
         Trans["transcription/\nwhisper-cli wrapper"]
         Summ["summarizer/\nLM Studio / Ollama / Custom client"]
         Dict["dictation/\nhotkey, capture, injection"]
+        MeetDet["meeting_detection/\nTeams call state machine"]
         Rules["rules/ + nudges/\ndeterministic metrics + live coaching"]
         Persist["persistence/\nSqliteRepository"]
     end
@@ -61,6 +63,7 @@ flowchart TB
     subgraph Native["Native helpers"]
         SCK["Swift: system-audio-capture\n(ScreenCaptureKit sidecar)"]
         Polish["Swift: dictation-polish\n(Apple Intelligence sidecar)"]
+        MeetSidecar["Swift: meeting-detector\n(CGWindowList sidecar)"]
     end
 
     subgraph External["External local processes"]
@@ -73,16 +76,20 @@ flowchart TB
     App -- "invoke()" --> Cmds
     Cmds -- "emit() events" --> App
     Pill -- "invoke()" --> Cmds
+    MeetingPopup -- "invoke()" --> Cmds
+    Cmds -- "emit() events" --> MeetingPopup
 
     Cmds --> Audio
     Cmds --> Trans
     Cmds --> Summ
     Cmds --> Dict
+    Cmds --> MeetDet
     Cmds --> Rules
     Cmds --> Persist
 
     Audio -- "spawn process" --> SCK
     Dict -- "spawn process" --> Polish
+    MeetDet -- "spawn process, read stdout" --> MeetSidecar
     Trans -- "spawn process" --> Whisper
     Summ -- "HTTP (raw TCP)" --> LLM
     Persist --> DB
@@ -91,7 +98,7 @@ flowchart TB
 **IPC shape**: the frontend never talks to Rust directly except through two
 channels — `invoke()` for request/response commands, and `emit()`/`listen()`
 for one-way events (transcript segments streaming in, live nudges, etc). See
-§9 for the full command/event surface.
+§13 for the full command/event surface.
 
 ## 3. Why Tauri (not Electron)
 
@@ -120,6 +127,8 @@ library, no router, no component framework — plain `useState`/`useCallback`.
 | --- | --- |
 | `src/App.tsx` | The entire UI. Recording controls, meeting history/detail, trends, settings, dictation stats. This is a single ~1600-line component tree, not split into `src/components/*` — an earlier version of this doc (and an earlier README) described a `src/components/` directory that no longer exists; the app was consolidated into `App.tsx` at some point and never split back out. Worth revisiting if this file keeps growing, but not urgent — React's re-render cost here is small (a handful of settings screens and lists, not a data-heavy app). |
 | `src/DictationPill.tsx` | A second, tiny React entry point rendered into its own Tauri window — the floating dictation status pill (see §8). |
+| `src/MeetingPopup.tsx` | A third tiny React entry point, same shape as the dictation pill — the floating "Record this meeting?" prompt shown when a live Microsoft Teams call is detected (see §9). |
+| `src/RecordingIndicator.tsx` | A fourth tiny React entry point — a floating vertical capsule with a stop button, shown for any active recording (manually started or Teams-detected). Unlike the other three, it needs no backend event listener of its own: Rust drives the window's visibility directly from `start_recording`/`stop_recording`. |
 | `src/contracts.ts` | Hand-written TypeScript interfaces mirroring every `#[derive(Serialize)]` struct on the Rust side (`MeetingSummary`, `MeetingHistoryDetail`, etc). This is the actual type-safety boundary between frontend and backend — there's no codegen keeping these in sync, so a Rust DTO change requires a manual matching edit here. |
 | `src/tauri-commands.ts` | One thin async wrapper per Tauri command, typed against `contracts.ts`. Nothing else in the frontend calls `invoke()` directly. |
 | `src/summary-clipboard.ts` | Builds the HTML + plain-text clipboard payload for the "Copy" button on generated notes — deliberately bullet lists and bold labels, no tables, so it pastes cleanly into Slack/Teams. |
@@ -265,7 +274,7 @@ flowchart TB
     Map --> Reduce["One 'reduce' chat completion\nover all chunk digests + /no_think"]
     SingleShot --> Parse["Parse strict-JSON reply\n(tolerates code fences/preamble)"]
     Reduce --> Parse
-    Parse --> MeetingSummary["MeetingSummary\n(executiveSummary, decisions,\nopenQuestions, actionItems)"]
+    Parse --> MeetingSummary["MeetingSummary\n(executiveSummary, keyTopics,\ndecisions, openQuestions, actionItems)"]
 
     Client["LmStudioClient / OpenAiCompatibleClient\n(raw TCP + hand-rolled HTTP/1.1)"] -. serves .-> SingleShot
     Client -. serves .-> Map
@@ -365,7 +374,62 @@ flowchart LR
   transcripts, and there's no product need to keep the text around after
   it's been pasted.
 
-## 9. Deterministic metrics and live nudges
+## 9. Meeting detection (Microsoft Teams)
+
+```mermaid
+flowchart LR
+    Poll["Poll every ~2s:\nNSWorkspace running apps"] --> TeamsRunning{"Teams\nrunning?"}
+    TeamsRunning -- no --> NotInCall["NOT_IN_CALL"]
+    TeamsRunning -- yes --> Windows["CGWindowListCopyWindowInfo\n(Teams-owned windows)"]
+    Windows --> Toolbar{"Call-toolbar\ngeometry match?"}
+    Toolbar -- yes --> InCall["IN_CALL"]
+    Toolbar -- no --> NotInCall
+
+    InCall -- "stdout line,\non transition only" --> Advance["meeting_detection::advance\n(pure state machine)"]
+    NotInCall -- "stdout line,\non transition only" --> Advance
+    Advance -- ShowPrompt --> Popup["MeetingPopup.tsx\n(floating NSPanel)"]
+    Advance -- HidePrompt --> Popup
+```
+
+- **Detects a live call, not the pre-join screen.** Notion's equivalent
+  popup appears before the user clicks "Join"; reaching that exact moment
+  would need Accessibility-API text-scraping of Teams' own UI (fragile,
+  breaks on Teams UI updates). Scribe instead detects "the user is now in a
+  call" via window geometry — a few seconds later, but far more durable. See
+  **ADR-004** for the full reasoning.
+- **All privileged window inspection lives in a third Swift sidecar**
+  (`native/meeting-detector/main.swift`), matching ADR-001's precedent —
+  `NSWorkspace` for "is Teams running" (no permission needed) and
+  `CGWindowListCopyWindowInfo` for its on-screen window geometry (gated by
+  the same Screen Recording permission system audio capture already
+  requests, so this adds no new permission prompt for most users).
+- **The sidecar prints only on transitions** (`IN_CALL` / `NOT_IN_CALL`),
+  not on every poll tick, so the Rust side (`meeting_detection::advance`, a
+  pure, unit-tested state machine) reacts to state changes rather than
+  de-duplicating a stream of repeated lines itself.
+- **The popup never prompts while a recording is already active** —
+  `advance`'s `NotInCall -> InCall` transition checks
+  `RecordingManager::is_recording()` first and silently suppresses the
+  prompt for that call if so, whether the recording was started manually or
+  from an earlier prompt.
+- **The popup window follows the dictation pill's exact template**
+  (`create_meeting_popup` / `set_meeting_popup_visible` in `lib.rs`): a
+  `WebviewWindowBuilder` window converted to a non-activating `NSPanel`, so
+  a click never activates Scribe and steals focus from the Teams call the
+  user is in. Positioning logic is shared with the pill via a
+  `WindowAnchor`-parameterized helper (`position_window`) — the pill pins to
+  bottom-center, the popup to top-center.
+- **Opt-in via `promptOnTeamsMeeting`** (`ScribeSettings`, default `true`),
+  toggleable live from Settings — `update_meeting_detection_settings`
+  starts/stops the sidecar immediately rather than requiring an app
+  restart.
+- **Explicit shutdown on app quit.** Unlike `system-audio-capture` (which
+  only runs for the bounded duration of an active recording), the
+  meeting-detector sidecar loops for the app's entire lifetime whenever the
+  setting is on, so it's stopped explicitly via a `tauri::RunEvent::Exit`
+  handler to avoid leaking an orphaned process after Scribe quits.
+
+## 10. Deterministic metrics and live nudges
 
 Two small, deliberately non-LLM modules:
 
@@ -388,7 +452,7 @@ depend on whether a model server happens to be running. Reserve the LLM
 call (§7) for the one thing rules genuinely can't do well: synthesizing an
 executive summary and extracting decisions/action items from free text.
 
-## 10. Persistence
+## 11. Persistence
 
 - **`rusqlite` directly, no ORM.** `SqliteRepository` hand-writes every
   query with `params![]` bound parameters — appropriate for a single-user,
@@ -409,7 +473,7 @@ executive summary and extracting decisions/action items from free text.
   transcripts/notes indefinitely — audio is the bulky, re-derivable
   artifact; transcripts and notes are the durable value.
 
-## 11. Known dead code and unshipped features
+## 12. Known dead code and unshipped features
 
 Documenting this honestly matters more than it might seem — without it, the
 schema-only tables and feature-gated code below look like bugs or
@@ -425,7 +489,7 @@ original intent, but verify against current code — none of it has been kept
 in sync with the Scribe-era pipeline (dictation, the generic summarizer
 provider, the async transcription fix) described above.
 
-## 12. Tauri command and event surface
+## 13. Tauri command and event surface
 
 All commands are registered in `lib.rs`'s `invoke_handler`. Grouped by area:
 
@@ -436,7 +500,8 @@ All commands are registered in `lib.rs`'s `invoke_handler`. Grouped by area:
 | Transcription/analysis | `transcribe_meeting`, `calculate_metrics`, `summarize_meeting` |
 | History | `list_meeting_history`, `get_meeting_history_detail`, `delete_meeting`, `list_meeting_trends` |
 | Dictation | `start_dictation`, `stop_dictation`, `toggle_dictation`, `list_dictation_sessions`, `delete_dictation_session`, `get_dictation_stats_summary`, `inject_dictation_text`, `polish_dictation`, `update_dictation_settings` |
-| Settings | `update_summarizer_settings`, `list_summarizer_models`, `update_transcriber_settings`, `update_audio_processing_settings`, `update_privacy_settings` |
+| Settings | `update_summarizer_settings`, `list_summarizer_models`, `update_transcriber_settings`, `update_audio_processing_settings`, `update_privacy_settings`, `update_meeting_detection_settings` |
+| Meeting detection | `dismiss_meeting_prompt` |
 | Misc | `send_completion_notification` |
 
 Events (one-way, `app.emit()` to frontend `listen()`):
@@ -447,7 +512,21 @@ Events (one-way, `app.emit()` to frontend `listen()`):
   output is ready).
 - `scribe://transcript-stream-complete` — end-of-replay marker, includes
   segment count and any dropped-event count from the bounded event sink.
-- `scribe://live-nudge` — one per nudge from `LiveNudgePipeline` (§9).
+- `scribe://live-nudge` — one per nudge from `LiveNudgePipeline` (§10).
+- `scribe://meeting-detected` — a live Teams call was just detected;
+  payload carries the not-yet-started `meetingId` the popup's Record button
+  should pass to `start_recording` (see §9).
+- `scribe://meeting-call-ended` — the call ended before the user responded
+  to the popup, which should auto-hide (see §9).
+- `scribe://recording-started` / `scribe://recording-stopped` — emitted from
+  inside the `start_recording`/`stop_recording` commands themselves (not
+  from the calling window's own success handler), so every window —
+  main, meeting popup, recording indicator — learns a recording
+  started/stopped regardless of which one triggered it. The main window's
+  `phase`/timer state and the recording indicator's visibility are both
+  driven by these events rather than by each window tracking its own local
+  optimistic state, which would otherwise drift out of sync whenever a
+  recording is started or stopped from a window other than the main one.
 
 **The `spawn_blocking` pattern**: any command that does real, possibly
 long-running work outside pure DB reads/writes — `transcribe_meeting`
@@ -461,16 +540,17 @@ deliberate, repeated pattern: **new commands that shell out to a subprocess
 or make a network call should follow it too**, rather than doing that work
 directly in a synchronous command body.
 
-## 13. Build and packaging
+## 14. Build and packaging
 
 - **Frontend**: Vite builds `src/` to `dist/`, which Tauri's bundler embeds.
-- **Swift sidecars**: `src-tauri/build.rs` compiles both
-  `native/system-audio-capture/main.swift` and
-  `native/dictation-polish/main.swift` via `xcrun swiftc -parse-as-library -O`
+- **Swift sidecars**: `src-tauri/build.rs` compiles all three of
+  `native/system-audio-capture/main.swift`,
+  `native/dictation-polish/main.swift`, and
+  `native/meeting-detector/main.swift` via `xcrun swiftc -parse-as-library -O`
   into `src-tauri/binaries/<name>-<target>`, skipping recompilation if the
   output is already newer than the source. `tauri.conf.json`'s
-  `bundle.externalBin` lists both so Tauri copies the right target's binary
-  into the app bundle.
+  `bundle.externalBin` lists all three so Tauri copies the right target's
+  binaries into the app bundle.
 - **Signing**: ad-hoc signed only (Tauri's default when no `signingIdentity`
   is set) — no Apple Developer ID yet. This has a real, recurring cost: see
   the README's "Building and installing a distributable build" section for
@@ -490,7 +570,7 @@ directly in a synchronous command body.
 - **Packaging scripts**: `bun run package:mac` (`.app` only) and
   `bun run package:mac:dmg` (`.dmg`, what you'd hand to a teammate).
 
-## 14. Dependency reference
+## 15. Dependency reference
 
 ### Rust (`src-tauri/Cargo.toml`)
 
@@ -501,7 +581,7 @@ directly in a synchronous command body.
 | `tauri-nspanel` (macOS-only, git dependency) | Converts the dictation pill's window into a non-activating `NSPanel` at runtime — not available as a published crate at the version needed, hence the git dependency pinned to the `v2` branch. |
 | `cpal` (pinned `=0.17.1`) | Cross-platform low-level audio input callback API — mic capture and dictation capture both go through it. |
 | `hound` | WAV file reading/writing (PCM 16-bit mono), used for mic recordings, AEC input/output, and dictation capture. |
-| `rusqlite` | Embedded SQLite driver — all persistence. No ORM (see §10). |
+| `rusqlite` | Embedded SQLite driver — all persistence. No ORM (see §11). |
 | `serde` / `serde_json` | (De)serialization for Tauri command DTOs, whisper-cli's JSON output, and the summarizer's chat-completion JSON. |
 | `tempfile` | Scratch directories for whisper-cli's JSON output and AEC intermediates. |
 | `tauri-build` (build-dependency) | Tauri's code-generation step; also where `build.rs` hooks in the Swift sidecar compilation. |
@@ -521,7 +601,7 @@ already pulls in — `tauri::async_runtime::spawn_blocking` is used directly.
 | `@biomejs/biome` | Combined linter + formatter (replaces ESLint + Prettier with one faster tool). |
 | `@tauri-apps/cli` | `tauri dev` / `tauri build` commands. |
 
-## 15. Testing and verification
+## 16. Testing and verification
 
 - **Rust**: `cargo test` (150+ tests) covers domain logic, parsing (whisper
   JSON, chat-completion responses), the recording manager's fallback
@@ -543,5 +623,6 @@ already pulls in — `tauri::async_runtime::spawn_blocking` is used directly.
 - `docs/decisions/adr-001-system-audio-sidecar.md` — why a Swift sidecar for system audio, not FFI or a virtual driver.
 - `docs/decisions/adr-002-offline-aec-adapter.md` — why offline SpeexDSP AEC, dlopen'd rather than linked.
 - `docs/decisions/adr-003-summarizer-model-and-timeout.md` — the 26B-model timeout incident, and why the default model/timeout/`/no_think` are set the way they are.
-- `docs/record-and-review-plan.md`, `docs/ideas/meeting-coach.md` — original product direction for the unshipped features in §11.
+- `docs/decisions/adr-004-teams-meeting-detection.md` — why detection fires on a live call rather than the pre-join screen, and why it's window geometry, not Accessibility text-scraping.
+- `docs/record-and-review-plan.md`, `docs/ideas/meeting-coach.md` — original product direction for the unshipped features in §12.
 - `docs/distributing.md` — the team-facing version of the ad-hoc-signing workaround.

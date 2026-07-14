@@ -198,6 +198,9 @@ pub struct ScribeSettings {
     pub summarizer_model: Option<String>,
     /// UI appearance preference; defaults to following the OS setting.
     pub theme_preference: ThemePreference,
+    /// When true, a live Microsoft Teams call pops up a "Record this
+    /// meeting?" prompt (see `crate::meeting_detection`).
+    pub prompt_on_teams_meeting: bool,
 }
 
 /// Default token for the dictation hotkey: double-press Control+Option+D.
@@ -233,6 +236,7 @@ impl Default for ScribeSettings {
             summarizer_port: DEFAULT_SUMMARIZER_PORT,
             summarizer_model: None,
             theme_preference: ThemePreference::System,
+            prompt_on_teams_meeting: true,
         }
     }
 }
@@ -577,6 +581,7 @@ mod tests {
         assert_eq!(settings.transcriber_model_path, None);
         assert_eq!(settings.speaker_embedding_model_path, None);
         assert_eq!(settings.speaker_segmentation_model_path, None);
+        assert!(settings.prompt_on_teams_meeting);
     }
 
     #[test]

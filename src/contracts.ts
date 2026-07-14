@@ -40,6 +40,7 @@ export interface ScribeSettings {
   summarizerPort: number;
   summarizerModel: string | null;
   themePreference: ThemePreference;
+  promptOnTeamsMeeting: boolean;
 }
 
 /** Selectable appearance preferences shown in Settings. */
@@ -194,8 +195,14 @@ export interface SpeakingImprovement {
   suggestion: string;
 }
 
+export interface KeyTopic {
+  topic: string;
+  points: string[];
+}
+
 export interface MeetingSummary {
   executiveSummary: string;
+  keyTopics: KeyTopic[];
   actionItems: MeetingActionItem[];
   decisions: string[];
   openQuestions: string[];

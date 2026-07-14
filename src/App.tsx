@@ -24,6 +24,8 @@ import {
   isTauriRuntime,
   listAudioDevices,
   listDictationSessions,
+  listenToRecordingStarted,
+  listenToRecordingStopped,
   listMeetingHistory,
   listMeetingTrends,
   listSummarizerModels,
@@ -41,8 +43,9 @@ import {
   transcribeMeeting,
   updateAudioProcessingSettings,
   updateDictationSettings,
-  updatePrivacySettings,
+  updateMeetingDetectionSettings,
   updateMeetingTitle,
+  updatePrivacySettings,
   updateSummarizerSettings,
   updateThemePreference,
   updateTranscriberSettings,
@@ -71,6 +74,7 @@ const FALLBACK_SETTINGS: ScribeSettings = {
   summarizerPort: 1234,
   summarizerModel: null,
   themePreference: 'system',
+  promptOnTeamsMeeting: true,
 };
 
 type View = 'meetings' | 'trends' | 'dictation' | 'settings';
@@ -188,9 +192,7 @@ export default function App() {
   useEffect(() => {
     const applyResolvedTheme = (query: MediaQueryList | MediaQueryListEvent) => {
       const resolved =
-        settings.themePreference === 'system'
-          ? (query.matches ? 'dark' : 'light')
-          : settings.themePreference;
+        settings.themePreference === 'system' ? (query.matches ? 'dark' : 'light') : settings.themePreference;
       document.documentElement.dataset.theme = resolved;
     };
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -290,9 +292,7 @@ export default function App() {
       const updated = await getMeetingHistoryDetail(meetingId);
       setDetail(updated);
       setHistory((current) =>
-        current.map((item) =>
-          item.meetingId === meetingId ? { ...item, title: updated.meeting.title } : item,
-        ),
+        current.map((item) => (item.meetingId === meetingId ? { ...item, title: updated.meeting.title } : item)),
       );
     } catch (cause) {
       setError(messageFromUnknownError(cause, 'Could not generate notes. Is LM Studio installed?'));
@@ -301,13 +301,14 @@ export default function App() {
     }
   }, []);
 
-  const startTimer = useCallback(() => {
-    setElapsed(0);
-    recordingStartedAtRef.current = Date.now();
+  const startTimer = useCallback((startedAtMs?: number) => {
+    const startedAt = startedAtMs ?? Date.now();
+    recordingStartedAtRef.current = startedAt;
+    setElapsed(Math.floor((Date.now() - startedAt) / 1000));
     timerRef.current = window.setInterval(() => {
-      const startedAt = recordingStartedAtRef.current;
-      if (startedAt === null) return;
-      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+      const currentStartedAt = recordingStartedAtRef.current;
+      if (currentStartedAt === null) return;
+      setElapsed(Math.floor((Date.now() - currentStartedAt) / 1000));
     }, 1000);
   }, []);
 
@@ -326,12 +327,14 @@ export default function App() {
     const meetingId = `meeting-${Date.now()}`;
     try {
       await startRecording(meetingId, settings.microphoneDeviceId ?? undefined);
-      setPhase('recording');
-      startTimer();
+      // `phase` and the timer are driven by the `recording-started` broadcast
+      // event (see the effect below), which fires for every start regardless
+      // of which window initiated it -- so this window stays in sync even
+      // when a recording is started from the meeting-detection popup instead.
     } catch (cause) {
       setError(messageFromUnknownError(cause, 'Could not start recording.'));
     }
-  }, [settings.microphoneDeviceId, startTimer]);
+  }, [settings.microphoneDeviceId]);
 
   // Transcribing a long meeting can take much longer than the meeting
   // itself (a slow local whisper-cli run), so it happens in the background
@@ -364,16 +367,51 @@ export default function App() {
     setPhase('stopping');
     stopTimer();
     try {
-      const recording = await stopRecording();
-      await refreshHistory();
-      await openMeeting(recording.meetingId);
-      void transcribeInBackground(recording.meetingId);
+      await stopRecording();
+      // History refresh, opening the meeting, and kicking off background
+      // transcription all happen via the `recording-stopped` broadcast event
+      // (see the effect below), which fires regardless of which window's
+      // stop button was clicked.
     } catch (cause) {
       setError(messageFromUnknownError(cause, 'Could not stop recording.'));
-    } finally {
       setPhase('idle');
     }
-  }, [openMeeting, refreshHistory, stopTimer, transcribeInBackground]);
+  }, [stopTimer]);
+
+  // Keeps this window's phase/timer in sync with the actual recording state
+  // no matter which window started or stopped it -- the main window's own
+  // button, or the meeting-detection popup / recording indicator.
+  useEffect(() => {
+    if (!tauri) return;
+    let unlistenStarted: (() => void) | undefined;
+    let unlistenStopped: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
+      const startedHandle = await listenToRecordingStarted((started) => {
+        setPhase('recording');
+        startTimer(started.startedAtMs);
+      });
+      const stoppedHandle = await listenToRecordingStopped((metadata) => {
+        stopTimer();
+        setPhase('idle');
+        void refreshHistory();
+        void openMeeting(metadata.meetingId);
+        void transcribeInBackground(metadata.meetingId);
+      });
+      if (cancelled) {
+        startedHandle();
+        stoppedHandle();
+      } else {
+        unlistenStarted = startedHandle;
+        unlistenStopped = stoppedHandle;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlistenStarted?.();
+      unlistenStopped?.();
+    };
+  }, [tauri, startTimer, stopTimer, refreshHistory, openMeeting, transcribeInBackground]);
 
   const dismissOnboarding = useCallback(() => {
     window.localStorage.setItem(PERMISSIONS_ONBOARDING_SEEN_KEY, 'true');
@@ -515,6 +553,7 @@ export default function App() {
                 void refreshPermissions();
                 setShowOnboarding(true);
               }}
+              permissions={permissions}
             />
           ) : view === 'dictation' ? (
             <DictationView
@@ -1023,6 +1062,16 @@ function NotesView({ summary, modelName }: { summary: MeetingSummary; modelName:
     <div>
       <div className="notes">
         {summary.executiveSummary && <p className="tldr">{summary.executiveSummary}</p>}
+        {summary.keyTopics.map((topic) => (
+          <div key={topic.topic}>
+            <h2>{topic.topic}</h2>
+            <ul>
+              {topic.points.map((point) => (
+                <li key={point}>{point}</li>
+              ))}
+            </ul>
+          </div>
+        ))}
         {summary.decisions.length > 0 && (
           <>
             <h2>Decisions</h2>
@@ -1183,12 +1232,14 @@ function SettingsView({
   onSettings,
   onError,
   onReviewPermissions,
+  permissions,
 }: {
   settings: ScribeSettings;
   devices: AudioDevice[];
   onSettings: (settings: ScribeSettings) => void;
   onError: (message: string | null) => void;
   onReviewPermissions: () => void;
+  permissions: PermissionsSnapshot | null;
 }) {
   const [transcriberBin, setTranscriberBin] = useState(settings.transcriberBinPath ?? '');
   const [transcriberModel, setTranscriberModel] = useState(settings.transcriberModelPath ?? '');
@@ -1229,6 +1280,19 @@ function SettingsView({
       }
     },
     [onError, onSettings, settings.dictationHotkey, settings.dictationPolishEnabled],
+  );
+
+  const saveMeetingDetection = useCallback(
+    async (promptOnTeamsMeeting: boolean) => {
+      onError(null);
+      try {
+        const updated = await updateMeetingDetectionSettings(promptOnTeamsMeeting);
+        onSettings(updated);
+      } catch (cause) {
+        onError(messageFromUnknownError(cause, 'Could not update meeting detection settings.'));
+      }
+    },
+    [onError, onSettings],
   );
 
   const saveSummarizer = useCallback(
@@ -1400,6 +1464,26 @@ function SettingsView({
           <Toggle
             on={settings.enableEchoCancellation}
             onClick={() => void saveAudio({ enableEchoCancellation: !settings.enableEchoCancellation })}
+          />
+        </div>
+      </section>
+
+      <section className="settings-group">
+        <h2>Meeting detection</h2>
+        <p className="hint">Get prompted to record as soon as you join a Microsoft Teams call.</p>
+        <div className="field">
+          <div>
+            <div className="field-label">Prompt to record Teams meetings</div>
+            <p className="field-desc">
+              Shows a small "Record this meeting?" popup a few seconds after you join a live Teams call.
+              {permissions?.screenRecording !== 'granted' && (
+                <> Needs Screen Recording permission to detect the call reliably.</>
+              )}
+            </p>
+          </div>
+          <Toggle
+            on={settings.promptOnTeamsMeeting}
+            onClick={() => void saveMeetingDetection(!settings.promptOnTeamsMeeting)}
           />
         </div>
       </section>
