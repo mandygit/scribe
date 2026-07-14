@@ -57,6 +57,9 @@ struct AppState {
     recordings: Mutex<RecordingManager<CpalCaptureBackend, ScreenCaptureKitSystemAudioBackend>>,
     dictation: Mutex<DictationRecorder<CpalCaptureBackend>>,
     dictation_hotkey: Mutex<DictationHotkey>,
+    /// Counts consecutive polish-selection presses with nothing selected, so
+    /// the notice can start friendly and get terser after a few repeats.
+    polish_selection_notice_count: Mutex<u32>,
 }
 
 fn load_effective_settings(repository: &SqliteRepository) -> Result<ScribeSettings, AppError> {
@@ -835,6 +838,27 @@ fn emit_dictation_state(app: &AppHandle, state: &'static str) {
     let _ = app.emit(DICTATION_STATE_EVENT, DictationStateEvent { state });
 }
 
+/// Event the pill listens to for brief polish-selection feedback: "nothing
+/// selected" nudges and the "couldn't paste, saved to clipboard" fallback.
+const POLISH_SELECTION_NOTICE_EVENT: &str = "scribe://polish-selection-notice";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PolishSelectionNoticeEvent {
+    message: String,
+}
+
+/// Broadcasts a short-lived polish-selection notice to the pill. Fire-and-forget,
+/// same as `emit_dictation_state`.
+fn emit_polish_selection_notice(app: &AppHandle, message: impl Into<String>) {
+    let _ = app.emit(
+        POLISH_SELECTION_NOTICE_EVENT,
+        PolishSelectionNoticeEvent {
+            message: message.into(),
+        },
+    );
+}
+
 /// Shows or hides the dictation pill panel on the main thread (AppKit calls must
 /// run there). Hiding it hands key focus back to the user's previously-active
 /// window so a synthesised paste lands in their field; `order_front_regardless`
@@ -983,44 +1007,133 @@ fn make_pill_non_activating(app: &AppHandle) {
     );
 }
 
-/// Maps a persisted dictation-hotkey token to a registrable global shortcut. The
-/// set is deliberately small and vetted to avoid the bare F-keys (media keys on
-/// Mac laptops) and F5 (Apple Dictation). Returns None for an unknown token.
+/// Maps a persisted hotkey token (dictation or polish-selection) to a
+/// registrable global shortcut. The set is deliberately small and vetted to
+/// avoid the bare F-keys (media keys on Mac laptops) and F5 (Apple Dictation).
+/// Returns None for an unknown token.
 #[cfg(desktop)]
-fn dictation_shortcut_for(token: &str) -> Option<tauri_plugin_global_shortcut::Shortcut> {
+fn hotkey_shortcut_for(token: &str) -> Option<tauri_plugin_global_shortcut::Shortcut> {
     use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
     let (modifiers, code) = match token {
         "cmd+shift+d" => (Modifiers::SUPER | Modifiers::SHIFT, Code::KeyD),
         "ctrl+option+d" => (Modifiers::CONTROL | Modifiers::ALT, Code::KeyD),
         "cmd+shift+space" => (Modifiers::SUPER | Modifiers::SHIFT, Code::Space),
+        "ctrl+option+p" => (Modifiers::CONTROL | Modifiers::ALT, Code::KeyP),
         _ => return None,
     };
     Some(Shortcut::new(Some(modifiers), code))
 }
 
-/// Registers (or re-registers) the dictation hotkey, replacing any previously
-/// registered one so a settings change takes effect immediately.
+/// Registers `new_token` as a global shortcut, first unregistering
+/// `previous_token`'s binding if it differs. Targets only its own shortcut
+/// (never `unregister_all`) so the dictation and polish-selection hotkeys —
+/// each registered independently — never clobber one another.
 #[cfg(desktop)]
-fn register_dictation_hotkey(app: &AppHandle, token: &str) -> Result<(), AppError> {
+fn register_hotkey<F>(
+    app: &AppHandle,
+    previous_token: Option<&str>,
+    new_token: &str,
+    error_code: &str,
+    on_press: F,
+) -> Result<(), AppError>
+where
+    F: Fn(&AppHandle) + Send + Sync + 'static,
+{
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-    let shortcut = dictation_shortcut_for(token).ok_or_else(|| AppError {
-        code: "dictation_hotkey_unsupported".to_string(),
-        message: format!("Unsupported dictation hotkey: {token}"),
+    let shortcut = hotkey_shortcut_for(new_token).ok_or_else(|| AppError {
+        code: format!("{error_code}_unsupported"),
+        message: format!("Unsupported hotkey: {new_token}"),
         details: None,
     })?;
     let global_shortcut = app.global_shortcut();
-    let _ = global_shortcut.unregister_all();
+    if let Some(previous) = previous_token {
+        if previous != new_token {
+            if let Some(previous_shortcut) = hotkey_shortcut_for(previous) {
+                let _ = global_shortcut.unregister(previous_shortcut);
+            }
+        }
+    }
     global_shortcut
-        .on_shortcut(shortcut, |app, _shortcut, event| {
+        .on_shortcut(shortcut, move |app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
-                on_dictation_hotkey_press(app);
+                on_press(app);
             }
         })
         .map_err(|error| AppError {
-            code: "dictation_hotkey_register_failed".to_string(),
-            message: "Could not register the dictation hotkey.".to_string(),
+            code: format!("{error_code}_register_failed"),
+            message: "Could not register the hotkey.".to_string(),
             details: Some(error.to_string()),
         })
+}
+
+/// Registers (or re-registers) the dictation hotkey.
+#[cfg(desktop)]
+fn register_dictation_hotkey(
+    app: &AppHandle,
+    previous_token: Option<&str>,
+    token: &str,
+) -> Result<(), AppError> {
+    register_hotkey(app, previous_token, token, "dictation_hotkey", |app| {
+        on_dictation_hotkey_press(app);
+    })
+}
+
+/// Registers the polish-selection hotkey: polishes whatever text is selected
+/// in the focused app and pastes the result back in place.
+#[cfg(desktop)]
+fn register_polish_selection_hotkey(app: &AppHandle, token: &str) -> Result<(), AppError> {
+    register_hotkey(app, None, token, "polish_selection_hotkey", |app| {
+        on_polish_selection_hotkey_press(app);
+    })
+}
+
+/// Handles the polish-selection hotkey: copies whatever is selected in the
+/// focused app, polishes it, and pastes the result back in place. Runs off
+/// the main thread since it shells out to `osascript`/`pbpaste` and the
+/// Apple Intelligence sidecar. No pill focus-handback is needed here — unlike
+/// dictation, the trigger is a hotkey, not a click on Scribe's own UI, so
+/// focus never leaves the app the user is selecting text in.
+fn on_polish_selection_hotkey_press(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        match dictation::polish_selection() {
+            Ok(dictation::SelectionPolishOutcome::Applied) => {
+                let mut count = state
+                    .polish_selection_notice_count
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *count = 0;
+            }
+            Ok(dictation::SelectionPolishOutcome::NoSelection) => {
+                let mut count = state
+                    .polish_selection_notice_count
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *count += 1;
+                let message = if *count <= 3 {
+                    "Select some text first, then try again."
+                } else {
+                    "Select text to polish it."
+                };
+                drop(count);
+                emit_polish_selection_notice(&app, message);
+            }
+            Ok(dictation::SelectionPolishOutcome::PasteFailed) => {
+                emit_polish_selection_notice(
+                    &app,
+                    "Couldn't paste right now — the polished text is on your clipboard.",
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "polish selection failed: {} ({})",
+                    error.message, error.code
+                );
+                emit_polish_selection_notice(&app, "Couldn't polish the selection. Try again.");
+            }
+        }
+    });
 }
 
 /// Starts a dictation session: begins microphone capture and signals the
@@ -1197,7 +1310,7 @@ fn update_dictation_settings(
     dictation_polish_enabled: bool,
 ) -> Result<ScribeSettings, AppError> {
     #[cfg(desktop)]
-    if dictation_shortcut_for(&dictation_hotkey).is_none() {
+    if hotkey_shortcut_for(&dictation_hotkey).is_none() {
         return Err(AppError {
             code: "dictation_hotkey_unsupported".to_string(),
             message: format!("Unsupported dictation hotkey: {dictation_hotkey}"),
@@ -1205,17 +1318,18 @@ fn update_dictation_settings(
         });
     }
 
-    let updated = {
+    let (previous_hotkey, updated) = {
         let repository = state.repository.lock().map_err(map_lock_error)?;
         let mut settings = repository.get_settings()?;
+        let previous_hotkey = settings.dictation_hotkey.clone();
         settings.dictation_hotkey = dictation_hotkey;
         settings.dictation_polish_enabled = dictation_polish_enabled;
         repository.upsert_settings(&settings, current_time_ms()?)?;
-        hydrate_settings_with_local_defaults(settings)
+        (previous_hotkey, hydrate_settings_with_local_defaults(settings))
     };
 
     #[cfg(desktop)]
-    register_dictation_hotkey(&app, &updated.dictation_hotkey)?;
+    register_dictation_hotkey(&app, Some(&previous_hotkey), &updated.dictation_hotkey)?;
 
     Ok(updated)
 }
@@ -1571,6 +1685,7 @@ pub fn run() {
                 )),
                 dictation: Mutex::new(DictationRecorder::new(CpalCaptureBackend::new())),
                 dictation_hotkey: Mutex::new(DictationHotkey::new()),
+                polish_selection_notice_count: Mutex::new(0),
             });
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
 
@@ -1637,8 +1752,17 @@ pub fn run() {
                 // Register the saved dictation hotkey (double-press to start, single
                 // press to stop). Configurable from Settings.
                 if let Err(error) =
-                    register_dictation_hotkey(app.handle(), &hydrated_settings.dictation_hotkey)
+                    register_dictation_hotkey(app.handle(), None, &hydrated_settings.dictation_hotkey)
                 {
+                    eprintln!("{}: {}", error.code, error.message);
+                }
+                // Register the polish-selection hotkey (single press): polishes
+                // whatever text is selected in the focused app and pastes the
+                // result back in place.
+                if let Err(error) = register_polish_selection_hotkey(
+                    app.handle(),
+                    &hydrated_settings.polish_selection_hotkey,
+                ) {
                     eprintln!("{}: {}", error.code, error.message);
                 }
             }
@@ -2626,14 +2750,15 @@ mod tests {
 
     #[cfg(desktop)]
     #[test]
-    fn dictation_shortcut_mapping_accepts_known_tokens_only() {
-        assert!(super::dictation_shortcut_for("cmd+shift+d").is_some());
-        assert!(super::dictation_shortcut_for("ctrl+option+d").is_some());
-        assert!(super::dictation_shortcut_for("cmd+shift+space").is_some());
+    fn hotkey_shortcut_mapping_accepts_known_tokens_only() {
+        assert!(super::hotkey_shortcut_for("cmd+shift+d").is_some());
+        assert!(super::hotkey_shortcut_for("ctrl+option+d").is_some());
+        assert!(super::hotkey_shortcut_for("cmd+shift+space").is_some());
+        assert!(super::hotkey_shortcut_for("ctrl+option+p").is_some());
         // Unknown / unsafe tokens are rejected so the update command can validate.
-        assert!(super::dictation_shortcut_for("cmd+space").is_none());
-        assert!(super::dictation_shortcut_for("f5").is_none());
-        assert!(super::dictation_shortcut_for("").is_none());
+        assert!(super::hotkey_shortcut_for("cmd+space").is_none());
+        assert!(super::hotkey_shortcut_for("f5").is_none());
+        assert!(super::hotkey_shortcut_for("").is_none());
     }
 
     #[test]

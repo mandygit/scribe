@@ -1,7 +1,10 @@
 //! Text injection: drop dictated text into whatever app currently has focus by
-//! placing it on the clipboard and synthesising a Cmd+V paste. This needs the
-//! Accessibility permission (System Events keystroke); without it macOS blocks
-//! the paste and `osascript` reports an error we surface with a stable code.
+//! placing it on the clipboard and synthesising a Cmd+V paste. Also used in
+//! reverse by polish-selection: Cmd+C copies the focused app's current
+//! selection out to the clipboard so it can be read back and polished. Both
+//! need the Accessibility permission (System Events keystroke); without it
+//! macOS blocks the keystroke and `osascript` reports an error we surface
+//! with a stable code.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -15,7 +18,33 @@ pub fn inject_text(text: &str) -> Result<(), AppError> {
         return Ok(());
     }
     set_clipboard(text)?;
-    paste_with_keystroke()
+    send_cmd_keystroke("v", "dictation_paste_failed")
+}
+
+/// Sends Cmd+C to the focused app via System Events, so its current selection
+/// (if any) lands on the clipboard. Used by polish-selection to read out
+/// whatever the user has highlighted.
+pub fn copy_selection() -> Result<(), AppError> {
+    send_cmd_keystroke("c", "polish_selection_copy_failed")
+}
+
+/// Reads the current macOS clipboard contents via `pbpaste`.
+pub fn read_clipboard() -> Result<String, AppError> {
+    let output = Command::new("pbpaste").output().map_err(|error| AppError {
+        code: "polish_selection_clipboard_read_failed".to_string(),
+        message: "Could not start pbpaste to read the clipboard.".to_string(),
+        details: Some(error.to_string()),
+    })?;
+
+    if !output.status.success() {
+        return Err(AppError {
+            code: "polish_selection_clipboard_read_failed".to_string(),
+            message: "pbpaste failed to read the clipboard.".to_string(),
+            details: output.status.code().map(|code| format!("exit_code={code}")),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Copies `text` to the macOS clipboard via `pbcopy`.
@@ -61,16 +90,20 @@ fn set_clipboard(text: &str) -> Result<(), AppError> {
     }
 }
 
-/// Synthesises a Cmd+V paste into the focused app via System Events. A failure
-/// here usually means the Accessibility permission has not been granted.
-fn paste_with_keystroke() -> Result<(), AppError> {
+/// Synthesises a Cmd+`key` keystroke into the focused app via System Events —
+/// `"v"` to paste, `"c"` to copy. A failure here usually means the
+/// Accessibility permission has not been granted; `failure_code` is returned
+/// for any other failure so callers can tell the two apart.
+fn send_cmd_keystroke(key: &str, failure_code: &str) -> Result<(), AppError> {
     let output = Command::new("osascript")
         .arg("-e")
-        .arg(r#"tell application "System Events" to keystroke "v" using command down"#)
+        .arg(format!(
+            r#"tell application "System Events" to keystroke "{key}" using command down"#
+        ))
         .output()
         .map_err(|error| AppError {
-            code: "dictation_paste_failed".to_string(),
-            message: "Could not start osascript to paste the dictation.".to_string(),
+            code: failure_code.to_string(),
+            message: format!("Could not start osascript to send Cmd+{}.", key.to_uppercase()),
             details: Some(error.to_string()),
         })?;
 
@@ -86,11 +119,14 @@ fn paste_with_keystroke() -> Result<(), AppError> {
     let code = if is_accessibility_denied(&stderr) {
         "dictation_accessibility_permission_required"
     } else {
-        "dictation_paste_failed"
+        failure_code
     };
     Err(AppError {
         code: code.to_string(),
-        message: "Could not paste the dictation into the focused app.".to_string(),
+        message: format!(
+            "Could not send Cmd+{} to the focused app.",
+            key.to_uppercase()
+        ),
         details: if stderr.is_empty() { None } else { Some(stderr) },
     })
 }

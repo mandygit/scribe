@@ -99,30 +99,10 @@
   color: var(--dpill-text);
 }
 
-/* Polish toggle: a small chip that fills in when on. Pushed to the right edge. */
-.dpill__polish {
-  margin-left: auto;
-  padding: 3px 9px;
-  border: 0.5px solid rgba(255, 255, 255, 0.16);
-  border-radius: 11px;
-  background: transparent;
-  color: var(--dpill-muted);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  white-space: nowrap;
-  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
-}
-
-.dpill__polish:hover {
-  color: var(--dpill-text);
-  border-color: rgba(255, 255, 255, 0.28);
-}
-
-.dpill__polish.is-on {
-  background: var(--dpill-polish);
-  border-color: transparent;
-  color: #fff;
+/* Brief polish-selection feedback ("select text first", "saved to clipboard")
+   shown in place of the normal state label. */
+.dpill__label--notice {
+  color: var(--dpill-polish);
 }
 
 @keyframes dpill-pulse {

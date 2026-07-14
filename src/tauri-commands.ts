@@ -26,6 +26,7 @@ export const TRANSCRIPT_SEGMENT_EVENT = 'scribe://transcript-segment';
 export const TRANSCRIPT_STREAM_COMPLETE_EVENT = 'scribe://transcript-stream-complete';
 export const LIVE_NUDGE_EVENT = 'scribe://live-nudge';
 export const DICTATION_STATE_EVENT = 'scribe://dictation-state';
+export const POLISH_SELECTION_NOTICE_EVENT = 'scribe://polish-selection-notice';
 
 export type DictationState = 'idle' | 'listening' | 'transcribing';
 
@@ -213,6 +214,11 @@ export const toggleDictation = async (): Promise<void> => invokeNative<void>('to
 export const listenToDictationState = async (onState: (state: DictationState) => void): Promise<UnlistenFn> => {
   assertTauriRuntime();
   return listen<{ state: DictationState }>(DICTATION_STATE_EVENT, (event) => onState(event.payload.state));
+};
+
+export const listenToPolishSelectionNotice = async (onNotice: (message: string) => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen<{ message: string }>(POLISH_SELECTION_NOTICE_EVENT, (event) => onNotice(event.payload.message));
 };
 
 export const listenToTranscriptStream = async (listeners: TranscriptStreamListeners): Promise<UnlistenFn> => {

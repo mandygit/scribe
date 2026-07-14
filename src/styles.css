@@ -769,6 +769,11 @@ button {
   border-radius: var(--radius);
   background: var(--surface-2);
 }
+.field-static-value {
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 
 /* Toggle */
 .toggle {

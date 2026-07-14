@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './styles.css';
-import { DICTATION_HOTKEYS, PERMISSION_ROWS, SUMMARIZER_PROVIDERS, THEME_PREFERENCES } from './contracts';
+import {
+  DICTATION_HOTKEYS,
+  PERMISSION_ROWS,
+  POLISH_SELECTION_HOTKEYS,
+  SUMMARIZER_PROVIDERS,
+  THEME_PREFERENCES,
+} from './contracts';
 import { messageFromUnknownError } from './error-utils';
 import { formatClock, formatDate, formatDuration, meetingTitle } from './format';
 import { copySummaryToClipboard } from './summary-clipboard';
@@ -57,8 +63,9 @@ const FALLBACK_SETTINGS: ScribeSettings = {
   transcriberModelPath: null,
   speakerEmbeddingModelPath: null,
   speakerSegmentationModelPath: null,
-  dictationHotkey: 'cmd+shift+d',
+  dictationHotkey: 'ctrl+option+d',
   dictationPolishEnabled: false,
+  polishSelectionHotkey: 'ctrl+option+p',
   summarizerProvider: 'lmStudio',
   summarizerHost: '127.0.0.1',
   summarizerPort: 1234,
@@ -1427,6 +1434,19 @@ function SettingsView({
             on={settings.dictationPolishEnabled}
             onClick={() => void saveDictation({ dictationPolishEnabled: !settings.dictationPolishEnabled })}
           />
+        </div>
+        <div className="field">
+          <div>
+            <div className="field-label">Polish selected text</div>
+            <p className="field-desc">
+              Select text in any app, then press this to polish it and paste the result back in place. Always polishes,
+              regardless of the toggle above.
+            </p>
+          </div>
+          <span className="field-static-value">
+            {POLISH_SELECTION_HOTKEYS.find((hotkey) => hotkey.value === settings.polishSelectionHotkey)?.label ??
+              settings.polishSelectionHotkey}
+          </span>
         </div>
       </section>
 

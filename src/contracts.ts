@@ -34,6 +34,7 @@ export interface ScribeSettings {
   speakerSegmentationModelPath: string | null;
   dictationHotkey: string;
   dictationPolishEnabled: boolean;
+  polishSelectionHotkey: string;
   summarizerProvider: SummarizerProvider;
   summarizerHost: string;
   summarizerPort: number;
@@ -66,6 +67,12 @@ export const DICTATION_HOTKEYS = [
   { value: 'ctrl+option+d', label: '⌃⌥D (double-press)' },
   { value: 'cmd+shift+space', label: '⌘⇧Space (double-press)' },
 ] as const;
+
+/**
+ * Polish-selection hotkeys, matching the Rust allowlist. Only one binding is
+ * supported today (not user-configurable), shown read-only in Settings.
+ */
+export const POLISH_SELECTION_HOTKEYS = [{ value: 'ctrl+option+p', label: '⌃⌥P (single-press)' }] as const;
 
 export interface RetentionCleanupSummary {
   deletedAudioFileCount: number;

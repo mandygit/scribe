@@ -185,6 +185,10 @@ pub struct ScribeSettings {
     /// When true, dictation runs Apple Intelligence polish before inserting;
     /// otherwise the raw transcript is inserted.
     pub dictation_polish_enabled: bool,
+    /// Canonical token for the global hotkey that polishes whatever text is
+    /// currently selected in the focused app, pasting the result back in
+    /// place. Always applies polish, regardless of `dictation_polish_enabled`.
+    pub polish_selection_hotkey: String,
     /// Which local model server to summarize meetings with.
     pub summarizer_provider: SummarizerProvider,
     pub summarizer_host: String,
@@ -196,8 +200,11 @@ pub struct ScribeSettings {
     pub theme_preference: ThemePreference,
 }
 
-/// Default token for the dictation hotkey: double-press Cmd+Shift+D.
-pub const DEFAULT_DICTATION_HOTKEY: &str = "cmd+shift+d";
+/// Default token for the dictation hotkey: double-press Control+Option+D.
+pub const DEFAULT_DICTATION_HOTKEY: &str = "ctrl+option+d";
+
+/// Default token for the polish-selection hotkey: single-press Control+Option+P.
+pub const DEFAULT_POLISH_SELECTION_HOTKEY: &str = "ctrl+option+p";
 
 /// Default LM Studio host/port, matching `summarizer::LmStudioClient`'s default.
 pub const DEFAULT_SUMMARIZER_HOST: &str = "127.0.0.1";
@@ -220,6 +227,7 @@ impl Default for ScribeSettings {
             speaker_segmentation_model_path: None,
             dictation_hotkey: DEFAULT_DICTATION_HOTKEY.to_string(),
             dictation_polish_enabled: false,
+            polish_selection_hotkey: DEFAULT_POLISH_SELECTION_HOTKEY.to_string(),
             summarizer_provider: SummarizerProvider::LmStudio,
             summarizer_host: DEFAULT_SUMMARIZER_HOST.to_string(),
             summarizer_port: DEFAULT_SUMMARIZER_PORT,

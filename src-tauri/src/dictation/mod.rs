@@ -11,6 +11,7 @@ use crate::domain::AppError;
 pub mod capture;
 pub mod hotkey;
 pub mod inject;
+pub mod selection;
 
 pub use capture::{
     new_dictation_session_id, new_dictation_wav_path, session_stats, transcribe_clip,
@@ -18,6 +19,7 @@ pub use capture::{
 };
 pub use hotkey::{DictationHotkey, HotkeyAction};
 pub use inject::{inject_text, probe_accessibility};
+pub use selection::{polish_selection, SelectionPolishOutcome};
 
 fn polish_helper_unavailable() -> AppError {
     AppError {
@@ -113,7 +115,10 @@ fn run_polish_helper(helper_path: &Path, raw: &str) -> Result<String, AppError> 
 
     if output.status.success() {
         let cleaned = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if cleaned.is_empty() {
+        if cleaned.is_empty() || !is_plausible_cleanup(raw, &cleaned) {
+            // The model answered/acted on the text instead of cleaning it up
+            // (or produced nothing) — fall back to the raw transcript so
+            // dictation always pastes what was actually said.
             return Ok(raw.trim().to_string());
         }
         return Ok(cleaned);
@@ -131,6 +136,39 @@ fn run_polish_helper(helper_path: &Path, raw: &str) -> Result<String, AppError> 
         message: "Apple Intelligence could not polish the dictation.".to_string(),
         details: if stderr.is_empty() { None } else { Some(stderr) },
     })
+}
+
+/// True if `cleaned` looks like a cleanup of `raw` rather than a fabricated
+/// reply. The polish instructions forbid the model from adding new ideas, so
+/// a real cleanup only reuses `raw`'s words (minus filler) plus incidental
+/// punctuation/number tokens; a model that answered the dictation instead
+/// introduces a lot of vocabulary that was never spoken.
+fn is_plausible_cleanup(raw: &str, cleaned: &str) -> bool {
+    const MAX_NEW_WORD_RATIO: f64 = 0.25;
+
+    let cleaned_words = normalized_words(cleaned);
+    if cleaned_words.is_empty() {
+        return true;
+    }
+    let raw_words = normalized_words(raw);
+
+    let new_words = cleaned_words
+        .iter()
+        .filter(|word| !raw_words.contains(*word))
+        .count();
+
+    (new_words as f64) / (cleaned_words.len() as f64) <= MAX_NEW_WORD_RATIO
+}
+
+/// Lowercased, punctuation-stripped words, deduplicated for set comparison.
+fn normalized_words(text: &str) -> std::collections::HashSet<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -152,5 +190,26 @@ mod tests {
                 .map(|name| name.contains("scribe-dictation-polish"))
                 .unwrap_or(false));
         }
+    }
+
+    #[test]
+    fn cleanup_that_keeps_the_speakers_words_passes() {
+        let raw = "so um first we need to uh fix the login bug";
+        let cleaned = "First, we need to fix the login bug.";
+        assert!(is_plausible_cleanup(raw, cleaned));
+    }
+
+    #[test]
+    fn answer_instead_of_cleanup_is_rejected() {
+        let raw = "what's the capital of france";
+        let answer = "The capital of France is Paris.";
+        assert!(!is_plausible_cleanup(raw, answer));
+    }
+
+    #[test]
+    fn fabricated_reply_to_a_request_is_rejected() {
+        let raw = "hey can you draft an email to john about the meeting";
+        let answer = "Dear John, following up on our conversation, I wanted to confirm the meeting time.";
+        assert!(!is_plausible_cleanup(raw, answer));
     }
 }

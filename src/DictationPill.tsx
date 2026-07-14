@@ -1,13 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import './pill.css';
 import {
   type DictationState,
-  getAppStatus,
   isTauriRuntime,
   listenToDictationState,
+  listenToPolishSelectionNotice,
   toggleDictation,
-  updateDictationSettings,
 } from './tauri-commands';
+
+/** How long a polish-selection notice (e.g. "select text first") stays visible. */
+const NOTICE_DURATION_MS = 2500;
 
 const LABELS: Record<DictationState, string> = {
   idle: 'Dictation',
@@ -18,52 +20,51 @@ const LABELS: Record<DictationState, string> = {
 /**
  * The floating dictation pill: a small Wispr-style bar in its own always-on-top,
  * non-focusable window. The mic button toggles dictation (same flow as the global
- * hotkey); the pill reflects idle → listening → transcribing via backend events.
- * The Polish toggle mirrors the app's dictation-polish setting.
+ * hotkey); the pill reflects idle → listening → transcribing via backend events,
+ * and briefly shows polish-selection feedback (e.g. "select text first").
+ * Dictation polish itself is configured from Settings, not from the pill.
  */
 export default function DictationPill() {
   const [state, setState] = useState<DictationState>('idle');
-  const [polishEnabled, setPolishEnabled] = useState(false);
-  const [hotkey, setHotkey] = useState('cmd+shift+d');
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!isTauriRuntime()) {
       return;
     }
-    let unlisten: (() => void) | undefined;
+    let unlistenState: (() => void) | undefined;
+    let unlistenNotice: (() => void) | undefined;
     let cancelled = false;
     void (async () => {
-      try {
-        const status = await getAppStatus();
-        if (!cancelled) {
-          setPolishEnabled(status.defaultSettings.dictationPolishEnabled);
-          setHotkey(status.defaultSettings.dictationHotkey);
+      const stateHandle = await listenToDictationState((next) => setState(next));
+      const noticeHandle = await listenToPolishSelectionNotice((message) => {
+        if (noticeTimeoutRef.current !== null) {
+          window.clearTimeout(noticeTimeoutRef.current);
         }
-      } catch {
-        // Fall back to defaults; the pill still works without prior settings.
-      }
-      const handle = await listenToDictationState((next) => setState(next));
+        setNotice(message);
+        noticeTimeoutRef.current = window.setTimeout(() => setNotice(null), NOTICE_DURATION_MS);
+      });
       if (cancelled) {
-        handle();
+        stateHandle();
+        noticeHandle();
       } else {
-        unlisten = handle;
+        unlistenState = stateHandle;
+        unlistenNotice = noticeHandle;
       }
     })();
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlistenState?.();
+      unlistenNotice?.();
+      if (noticeTimeoutRef.current !== null) {
+        window.clearTimeout(noticeTimeoutRef.current);
+      }
     };
   }, []);
 
   const handleMic = () => {
     void toggleDictation();
-  };
-
-  const handlePolish = () => {
-    const next = !polishEnabled;
-    setPolishEnabled(next);
-    // Optimistic; revert if the persist fails.
-    void updateDictationSettings(hotkey, next).catch(() => setPolishEnabled(!next));
   };
 
   return (
@@ -76,16 +77,7 @@ export default function DictationPill() {
       >
         <span className="dpill__mic-dot" />
       </button>
-      <span className="dpill__label">{LABELS[state]}</span>
-      <button
-        type="button"
-        className={`dpill__polish${polishEnabled ? ' is-on' : ''}`}
-        onClick={handlePolish}
-        aria-pressed={polishEnabled}
-        title="Polish dictation with Apple Intelligence"
-      >
-        Polish
-      </button>
+      <span className={`dpill__label${notice ? ' dpill__label--notice' : ''}`}>{notice ?? LABELS[state]}</span>
     </div>
   );
 }

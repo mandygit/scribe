@@ -1202,7 +1202,8 @@ impl SqliteRepository {
                     summarizer_host,
                     summarizer_port,
                     summarizer_model,
-                    theme_preference
+                    theme_preference,
+                    polish_selection_hotkey
                 FROM settings
                 WHERE id = ?1",
                 params![SETTINGS_ID],
@@ -1242,8 +1243,9 @@ impl SqliteRepository {
                     summarizer_port,
                     summarizer_model,
                     theme_preference,
+                    polish_selection_hotkey,
                     updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
                 ON CONFLICT(id) DO UPDATE SET
                     microphone_device_id = excluded.microphone_device_id,
                     enable_system_audio = excluded.enable_system_audio,
@@ -1264,6 +1266,7 @@ impl SqliteRepository {
                     summarizer_port = excluded.summarizer_port,
                     summarizer_model = excluded.summarizer_model,
                     theme_preference = excluded.theme_preference,
+                    polish_selection_hotkey = excluded.polish_selection_hotkey,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     SETTINGS_ID,
@@ -1286,6 +1289,7 @@ impl SqliteRepository {
                     i64::from(settings.summarizer_port),
                     settings.summarizer_model.as_deref(),
                     theme_preference_to_db(settings.theme_preference),
+                    settings.polish_selection_hotkey.as_str(),
                     to_db_i64(updated_at_ms)?,
                 ],
             )
@@ -1414,6 +1418,7 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 speaker_segmentation_model_path TEXT,
                 dictation_hotkey TEXT NOT NULL DEFAULT 'cmd+shift+d',
                 dictation_polish_enabled INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1)),
+                polish_selection_hotkey TEXT NOT NULL DEFAULT 'ctrl+option+p',
                 summarizer_provider TEXT NOT NULL DEFAULT 'lm_studio',
                 summarizer_host TEXT NOT NULL DEFAULT '127.0.0.1',
                 summarizer_port INTEGER NOT NULL DEFAULT 1234,
@@ -1504,6 +1509,11 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         connection,
         "dictation_polish_enabled",
         "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))",
+    )?;
+    ensure_settings_column(
+        connection,
+        "polish_selection_hotkey",
+        "TEXT NOT NULL DEFAULT 'ctrl+option+p'",
     )?;
     ensure_settings_column(
         connection,
@@ -1698,6 +1708,7 @@ fn validate_migration_column_type(column_type: &str) -> Result<(), AppError> {
         | "INTEGER"
         | "TEXT NOT NULL DEFAULT 'none'"
         | "TEXT NOT NULL DEFAULT 'cmd+shift+d'"
+        | "TEXT NOT NULL DEFAULT 'ctrl+option+p'"
         | "INTEGER NOT NULL DEFAULT 1 CHECK (enable_system_audio IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 1 CHECK (enable_echo_cancellation IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 0 CHECK (cloud_video_review_enabled IN (0, 1))"
@@ -1954,6 +1965,7 @@ fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScribeSettings> {
         summarizer_port: from_db_u16(row.get(16)?, 16)?,
         summarizer_model: row.get(17)?,
         theme_preference: theme_preference_from_db(row.get::<_, String>(18)?, 18)?,
+        polish_selection_hotkey: row.get(19)?,
     })
 }
 
@@ -2748,6 +2760,7 @@ mod tests {
             summarizer_port: 11434,
             summarizer_model: Some("llama3.2".to_string()),
             theme_preference: ThemePreference::Dark,
+            polish_selection_hotkey: "ctrl+option+p".to_string(),
         };
         let updated_settings = ScribeSettings {
             microphone_device_id: Some("microphone-2".to_string()),
@@ -2769,6 +2782,7 @@ mod tests {
             summarizer_port: 8080,
             summarizer_model: Some("custom-model".to_string()),
             theme_preference: ThemePreference::Light,
+            polish_selection_hotkey: "ctrl+option+d".to_string(),
         };
 
         test_repository
