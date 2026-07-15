@@ -1,5 +1,6 @@
 //! Text injection: drop dictated text into whatever app currently has focus by
-//! placing it on the clipboard and synthesising a Cmd+V paste. Also used in
+//! placing it on the clipboard, synthesising a Cmd+V paste, and then restoring
+//! the clipboard's previous contents. Also used in
 //! reverse by polish-selection: Cmd+C copies the focused app's current
 //! selection out to the clipboard so it can be read back and polished. Both
 //! need the Accessibility permission (System Events keystroke); without it
@@ -8,17 +9,89 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardWriting};
+use objc2_foundation::{NSArray, NSData, NSString};
 
 use crate::domain::AppError;
 
+/// How long to wait after the Cmd+V keystroke before restoring the previous
+/// clipboard. The keystroke call returning only means the event was posted;
+/// the target app reads the clipboard asynchronously, and restoring too early
+/// would paste the old contents instead of the transcript.
+const PASTE_SETTLE: Duration = Duration::from_millis(300);
+
+/// Every flavor of every item on the pasteboard, as raw bytes keyed by UTI.
+/// Full fidelity — screenshots, rich text, and multi-item copies all survive.
+type ClipboardSnapshot = Vec<Vec<(String, Vec<u8>)>>;
+
 /// Injects `text` into the focused app. Blank text is a no-op so a silent
 /// dictation doesn't clear the clipboard or fire a stray paste.
+///
+/// The previous clipboard contents — including images and other non-text
+/// flavors — are saved first and put back once the paste has landed, so
+/// dictating doesn't eat whatever the user last copied.
 pub fn inject_text(text: &str) -> Result<(), AppError> {
     if text.trim().is_empty() {
         return Ok(());
     }
+    // Best-effort save: an unreadable pasteboard just means there is nothing
+    // to put back.
+    let saved = snapshot_clipboard();
     set_clipboard(text)?;
-    send_cmd_keystroke("v", "dictation_paste_failed")
+    // On paste failure, return with the transcript still on the clipboard so
+    // the user can paste it by hand instead of losing the dictation outright.
+    send_cmd_keystroke("v", "dictation_paste_failed")?;
+    if !saved.is_empty() {
+        std::thread::sleep(PASTE_SETTLE);
+        // Best-effort restore: the paste already succeeded, and failing the
+        // whole dictation over a restore hiccup would be worse than leaving
+        // the transcript on the clipboard.
+        restore_clipboard(&saved);
+    }
+    Ok(())
+}
+
+/// Reads every item and flavor off the general pasteboard. Lazily-promised
+/// flavors are materialised by `dataForType`; anything unreadable is skipped.
+fn snapshot_clipboard() -> ClipboardSnapshot {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            item.types()
+                .iter()
+                .filter_map(|flavor| {
+                    item.dataForType(&flavor)
+                        .map(|data| (flavor.to_string(), data.to_vec()))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Replaces the general pasteboard's contents with a previously captured
+/// snapshot. Returns whether the write was accepted.
+fn restore_clipboard(snapshot: &ClipboardSnapshot) -> bool {
+    let objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = snapshot
+        .iter()
+        .map(|flavors| {
+            let item = NSPasteboardItem::new();
+            for (flavor, bytes) in flavors {
+                item.setData_forType(&NSData::with_bytes(bytes), &NSString::from_str(flavor));
+            }
+            ProtocolObject::from_retained(item)
+        })
+        .collect();
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    pasteboard.writeObjects(&NSArray::from_retained_slice(&objects))
 }
 
 /// Sends Cmd+C to the focused app via System Events, so its current selection
@@ -202,6 +275,42 @@ mod tests {
     fn blank_text_is_a_no_op() {
         // No clipboard write and no paste keystroke should fire for blank input.
         inject_text("   \n\t").expect("blank input is a no-op");
+    }
+
+    /// Minimal valid 1x1 transparent PNG, standing in for a screenshot.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// Flavor order within an item is not guaranteed across the pasteboard
+    /// round-trip, so compare snapshots with each item's flavors sorted.
+    fn sorted(mut snapshot: ClipboardSnapshot) -> ClipboardSnapshot {
+        for item in &mut snapshot {
+            item.sort();
+        }
+        snapshot
+    }
+
+    #[test]
+    #[ignore = "mutates the real macOS general pasteboard"]
+    fn snapshot_restore_round_trips_non_text_flavors() {
+        let original = snapshot_clipboard();
+
+        let planted: ClipboardSnapshot = vec![vec![
+            ("public.png".to_string(), TINY_PNG.to_vec()),
+            ("public.utf8-plain-text".to_string(), b"round-trip".to_vec()),
+        ]];
+        assert!(restore_clipboard(&planted), "planting test flavors failed");
+        assert_eq!(sorted(snapshot_clipboard()), sorted(planted));
+
+        // Put the user's clipboard back the way we found it.
+        if !original.is_empty() {
+            assert!(restore_clipboard(&original), "restoring original failed");
+        }
     }
 
     #[test]

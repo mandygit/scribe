@@ -27,6 +27,12 @@ tempfile = "3.27.0"
 # clicking it never activates Scribe or steals focus from the user's app.
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2" }
+# Native NSPasteboard access so dictation can snapshot and restore the
+# clipboard with full fidelity (images, rich text, multiple items) — pbpaste
+# round-trips only plain text.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSString"] }
 
 [profile.dev]
 debug = 1
