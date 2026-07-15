@@ -37,20 +37,28 @@ export default function DictationPill() {
     let unlistenNotice: (() => void) | undefined;
     let cancelled = false;
     void (async () => {
-      const stateHandle = await listenToDictationState((next) => setState(next));
-      const noticeHandle = await listenToPolishSelectionNotice((message) => {
-        if (noticeTimeoutRef.current !== null) {
-          window.clearTimeout(noticeTimeoutRef.current);
+      try {
+        const stateHandle = await listenToDictationState((next) => setState(next));
+        const noticeHandle = await listenToPolishSelectionNotice((message) => {
+          if (noticeTimeoutRef.current !== null) {
+            window.clearTimeout(noticeTimeoutRef.current);
+          }
+          setNotice(message);
+          noticeTimeoutRef.current = window.setTimeout(() => setNotice(null), NOTICE_DURATION_MS);
+        });
+        if (cancelled) {
+          stateHandle();
+          noticeHandle();
+        } else {
+          unlistenState = stateHandle;
+          unlistenNotice = noticeHandle;
         }
-        setNotice(message);
-        noticeTimeoutRef.current = window.setTimeout(() => setNotice(null), NOTICE_DURATION_MS);
-      });
-      if (cancelled) {
-        stateHandle();
-        noticeHandle();
-      } else {
-        unlistenState = stateHandle;
-        unlistenNotice = noticeHandle;
+      } catch (cause) {
+        // A rejection here means the event plugin denied the registration --
+        // almost certainly this window's label missing from
+        // src-tauri/capabilities/default.json. Without this catch that
+        // rejection is swallowed and looks like events silently never firing.
+        console.error('DictationPill: event listener registration failed', cause);
       }
     })();
     return () => {
