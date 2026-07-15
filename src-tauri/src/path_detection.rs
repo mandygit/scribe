@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn whisper_model_ranking_prefers_base_q5_variants() {
-        let candidates = vec![
+        let candidates = [
             PathBuf::from("/Users/example/models/ggml-small.bin"),
             PathBuf::from("/Users/example/models/ggml-base-q5_1.bin"),
             PathBuf::from("/Users/example/models/ggml-medium.bin"),
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn speaker_segmentation_ranking_avoids_embedding_models() {
-        let candidates = vec![
+        let candidates = [
             PathBuf::from("/Users/example/models/speaker-embedding.onnx"),
             PathBuf::from("/Users/example/models/pyannote-segmentation-3.0.onnx"),
         ];

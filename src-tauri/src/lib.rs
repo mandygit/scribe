@@ -554,11 +554,8 @@ async fn transcribe_meeting(
     // tie up the invoke thread for the whole duration, the way it used to
     // when "stop meeting" awaited this synchronously.
     let transcription_output = tauri::async_runtime::spawn_blocking(move || {
-        let audio_path = select_transcription_audio_path(
-            &settings,
-            &metadata,
-            &SpeexEchoCancellationBackend::default(),
-        );
+        let audio_path =
+            select_transcription_audio_path(&settings, &metadata, &SpeexEchoCancellationBackend);
         transcribe_audio_with_retry(&transcriber, std::path::Path::new(&audio_path))
     })
     .await
@@ -2126,8 +2123,7 @@ fn apple_script_string_literal(value: &str) -> String {
         value
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
-            .replace('\n', " ")
-            .replace('\r', " ")
+            .replace(['\n', '\r'], " ")
     )
 }
 
@@ -2241,13 +2237,9 @@ pub fn run() {
                 repository
                     .upsert_settings(
                         &hydrated_settings,
-                        current_time_ms().map_err(|error| {
-                            std::io::Error::other(error.message)
-                        })?,
+                        current_time_ms().map_err(|error| std::io::Error::other(error.message))?,
                     )
-                    .map_err(|error| {
-                        std::io::Error::other(error.message)
-                    })?;
+                    .map_err(|error| std::io::Error::other(error.message))?;
             }
             app.manage(AppState {
                 repository: Mutex::new(repository),
