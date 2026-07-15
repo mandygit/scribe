@@ -123,3 +123,30 @@ constants before the detection can be trusted end-to-end.
 - The meeting-detector sidecar is the first long-lived (app-lifetime)
   child process Scribe manages, which is why it needed explicit
   `RunEvent::Exit` cleanup that the bounded-lifetime sidecars didn't.
+
+## Addendum (2026-07-14/15): signals confirmed against real Teams sessions
+
+The toolbar-geometry heuristic above never matched: the new Teams client has
+no separate floating call-controls window at all. Two live sessions
+(diagnostic log `~/Library/Logs/Scribe/meeting-detector.log`) established
+what actually exists, and detection now works as follows:
+
+1. **Primary signal — audio input.** Any Core Audio HAL process entry whose
+   bundle id belongs to Teams (`com.microsoft.teams2`, including `.helper`
+   subprocesses, where the capture actually runs) with
+   `kAudioProcessPropertyIsRunningInput` true. This is the same mechanism as
+   the system's orange mic indicator, and fires from the pre-join mic check
+   onward.
+2. **Fallback signal — a meeting window.** Joining a call opens a *second*
+   Teams window titled `<Meeting Name> | Microsoft Teams`, alongside the
+   main nav window that stays open throughout.
+
+The nav window's own title is `<Tab> | Microsoft Teams` while idling on a
+left-rail tab (`Chat`, `Calendar`, …) **and `<Tab> | <open item> |
+Microsoft Teams` when something is open in that tab** — e.g. viewing the
+conversation "AIE" titles it `Chat | AIE | Microsoft Teams`. A window is
+therefore treated as a meeting window only when the *first* `" | "`-separated
+segment of its title is not a known nav-tab name. Comparing the whole
+prefix (the original implementation) misread every open conversation as a
+live call, popping the record prompt when the user merely clicked around
+Teams.

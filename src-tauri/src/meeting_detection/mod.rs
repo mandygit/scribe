@@ -220,7 +220,11 @@ mod tests {
 
     #[test]
     fn call_started_shows_prompt_when_idle() {
-        let (state, action) = advance(CallPromptState::NotInCall, DetectorEvent::CallStarted, false);
+        let (state, action) = advance(
+            CallPromptState::NotInCall,
+            DetectorEvent::CallStarted,
+            false,
+        );
         assert_eq!(state, CallPromptState::InCall);
         assert_eq!(action, PromptAction::ShowPrompt);
     }
@@ -266,7 +270,13 @@ mod tests {
         let mut state = CallPromptState::NotInCall;
         let mut shows = 0;
         let mut hides = 0;
-        let lines = ["IN_CALL", "IN_CALL", "NOT_IN_CALL", "IN_CALL", "NOT_IN_CALL"];
+        let lines = [
+            "IN_CALL",
+            "IN_CALL",
+            "NOT_IN_CALL",
+            "IN_CALL",
+            "NOT_IN_CALL",
+        ];
         for line in lines {
             let event = DetectorEvent::from_sidecar_line(line).expect("valid line");
             let (next_state, action) = advance(state, event, false);

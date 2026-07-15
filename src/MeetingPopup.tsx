@@ -28,17 +28,25 @@ export default function MeetingPopup() {
     let unlistenEnded: (() => void) | undefined;
     let cancelled = false;
     void (async () => {
-      const detectedHandle = await listenToMeetingDetected((id) => {
-        setStarting(false);
-        setMeetingId(id);
-      });
-      const endedHandle = await listenToMeetingCallEnded(() => setMeetingId(null));
-      if (cancelled) {
-        detectedHandle();
-        endedHandle();
-      } else {
-        unlistenDetected = detectedHandle;
-        unlistenEnded = endedHandle;
+      try {
+        const detectedHandle = await listenToMeetingDetected((id) => {
+          setStarting(false);
+          setMeetingId(id);
+        });
+        const endedHandle = await listenToMeetingCallEnded(() => setMeetingId(null));
+        if (cancelled) {
+          detectedHandle();
+          endedHandle();
+        } else {
+          unlistenDetected = detectedHandle;
+          unlistenEnded = endedHandle;
+        }
+      } catch (cause) {
+        // A rejection here means the event plugin denied the registration --
+        // almost certainly this window's label missing from
+        // src-tauri/capabilities/default.json. Without this catch that
+        // rejection is swallowed and looks like events silently never firing.
+        console.error('MeetingPopup: event listener registration failed', cause);
       }
     })();
     return () => {

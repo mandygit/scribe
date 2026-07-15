@@ -16,7 +16,12 @@ fn build_system_audio_sidecar() {
         "native/system-audio-capture/main.swift",
         "scribe-system-audio-capture",
         "SCRIBE_SYSTEM_AUDIO_HELPER",
-        &["AVFoundation", "CoreGraphics", "CoreMedia", "ScreenCaptureKit"],
+        &[
+            "AVFoundation",
+            "CoreGraphics",
+            "CoreMedia",
+            "ScreenCaptureKit",
+        ],
     );
 }
 
@@ -34,7 +39,7 @@ fn build_meeting_detector_sidecar() {
         "native/meeting-detector/main.swift",
         "scribe-meeting-detector",
         "SCRIBE_MEETING_DETECTOR_HELPER",
-        &["AppKit", "CoreGraphics"],
+        &["AppKit", "CoreAudio", "CoreGraphics"],
     );
 }
 
