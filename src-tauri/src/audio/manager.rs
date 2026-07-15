@@ -42,7 +42,9 @@ impl<B: AudioCaptureBackend, S: SystemAudioCaptureBackend> RecordingManager<B, S
     /// The meeting id currently being recorded, if any — used to block
     /// deleting a meeting while its audio is still being written.
     pub fn active_meeting_id(&self) -> Option<&str> {
-        self.active.as_ref().map(|active| active.meeting_id.as_str())
+        self.active
+            .as_ref()
+            .map(|active| active.meeting_id.as_str())
     }
 
     pub fn list_audio_devices(&self) -> Result<Vec<AudioDevice>, AppError> {
@@ -419,7 +421,10 @@ mod tests {
             .stop_recording(260)
             .expect("mic-only recording can stop");
         assert_eq!(metadata.system_audio_file_path, None);
-        assert_eq!(metadata.system_audio_stream_error.as_deref(), Some("Screen Recording permission was denied."));
+        assert_eq!(
+            metadata.system_audio_stream_error.as_deref(),
+            Some("Screen Recording permission was denied.")
+        );
         // The microphone track itself is unaffected by the system-audio failure.
         assert_eq!(metadata.duration_ms, 250);
         assert_eq!(metadata.stream_error, None);

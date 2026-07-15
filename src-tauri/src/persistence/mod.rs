@@ -4,9 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::domain::{
-    AnalyzerProvider, AppError, DictationSessionId, MeetingId, MetricId, ProcessingStage,
-    ReportId, ScribeSettings, Score, SegmentId, SummarizerProvider, SummaryId,
-    ThemePreference,
+    AnalyzerProvider, AppError, DictationSessionId, MeetingId, MetricId, ProcessingStage, ReportId,
+    Score, ScribeSettings, SegmentId, SummarizerProvider, SummaryId, ThemePreference,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 17;
@@ -398,7 +397,10 @@ impl SqliteRepository {
     /// tied to a dictation session — it's stats-only.
     pub fn delete_dictation_session(&self, id: &DictationSessionId) -> Result<bool, AppError> {
         self.connection
-            .execute("DELETE FROM dictation_sessions WHERE id = ?1", params![id.as_str()])
+            .execute(
+                "DELETE FROM dictation_sessions WHERE id = ?1",
+                params![id.as_str()],
+            )
             .map(|deleted_rows| deleted_rows > 0)
             .map_err(map_db_error)
     }
@@ -1174,7 +1176,10 @@ impl SqliteRepository {
     /// since this row is the only record of their paths.
     pub fn delete_meeting(&self, meeting_id: &MeetingId) -> Result<bool, AppError> {
         self.connection
-            .execute("DELETE FROM meetings WHERE id = ?1", params![meeting_id.as_str()])
+            .execute(
+                "DELETE FROM meetings WHERE id = ?1",
+                params![meeting_id.as_str()],
+            )
             .map(|deleted_rows| deleted_rows > 0)
             .map_err(map_db_error)
     }
@@ -2141,7 +2146,10 @@ fn theme_preference_from_db(value: String, column: usize) -> rusqlite::Result<Th
     }
 }
 
-fn summarizer_provider_from_db(value: String, column: usize) -> rusqlite::Result<SummarizerProvider> {
+fn summarizer_provider_from_db(
+    value: String,
+    column: usize,
+) -> rusqlite::Result<SummarizerProvider> {
     match value.as_str() {
         "lm_studio" => Ok(SummarizerProvider::LmStudio),
         "ollama" => Ok(SummarizerProvider::Ollama),
@@ -3120,7 +3128,12 @@ mod tests {
             .update_meeting_title(&meeting.id, Some("Renamed by user"), 4_100)
             .expect("meeting can be renamed");
         assert_eq!(
-            test_repository.repository.get_meeting(&meeting.id).unwrap().unwrap().title,
+            test_repository
+                .repository
+                .get_meeting(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .title,
             Some("Renamed by user".to_string()),
         );
 
@@ -3128,7 +3141,15 @@ mod tests {
             .repository
             .update_meeting_title(&meeting.id, None, 4_200)
             .expect("meeting title can be cleared");
-        assert_eq!(test_repository.repository.get_meeting(&meeting.id).unwrap().unwrap().title, None);
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            None
+        );
 
         let missing = test_repository
             .repository
@@ -3157,7 +3178,12 @@ mod tests {
             .set_meeting_title_if_absent(&untitled.id, "Model Suggested Title", 3_000)
             .expect("title fills in when absent");
         assert_eq!(
-            test_repository.repository.get_meeting(&untitled.id).unwrap().unwrap().title,
+            test_repository
+                .repository
+                .get_meeting(&untitled.id)
+                .unwrap()
+                .unwrap()
+                .title,
             Some("Model Suggested Title".to_string()),
         );
 
@@ -3166,7 +3192,12 @@ mod tests {
             .set_meeting_title_if_absent(&untitled.id, "Later Model Title", 4_000)
             .expect("re-summarizing does not error");
         assert_eq!(
-            test_repository.repository.get_meeting(&untitled.id).unwrap().unwrap().title,
+            test_repository
+                .repository
+                .get_meeting(&untitled.id)
+                .unwrap()
+                .unwrap()
+                .title,
             Some("Model Suggested Title".to_string()),
             "a later auto-generated title must never overwrite the first one",
         );
@@ -3177,7 +3208,12 @@ mod tests {
             .set_meeting_title_if_absent(&titled.id, "Should Not Apply", 3_000)
             .expect("call succeeds even though title is already set");
         assert_eq!(
-            test_repository.repository.get_meeting(&titled.id).unwrap().unwrap().title,
+            test_repository
+                .repository
+                .get_meeting(&titled.id)
+                .unwrap()
+                .unwrap()
+                .title,
             titled.title,
             "a manually-set or pre-existing title must never be overwritten",
         );

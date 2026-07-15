@@ -158,8 +158,7 @@ fn read_child_stderr(child: &mut Child) -> Option<String> {
 pub(crate) fn system_audio_helper_path() -> Result<PathBuf, AppError> {
     let helper_name =
         option_env!("SCRIBE_SYSTEM_AUDIO_HELPER_NAME").ok_or_else(helper_unavailable)?;
-    let target =
-        option_env!("SCRIBE_SYSTEM_AUDIO_HELPER_TARGET").ok_or_else(helper_unavailable)?;
+    let target = option_env!("SCRIBE_SYSTEM_AUDIO_HELPER_TARGET").ok_or_else(helper_unavailable)?;
 
     let development_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("binaries")

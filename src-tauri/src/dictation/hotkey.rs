@@ -71,9 +71,9 @@ impl DictationHotkey {
         }
 
         // Idle: a second press close behind the first arms recording.
-        let is_double = self
-            .pending_press_ms
-            .is_some_and(|first| now_ms.saturating_sub(first) <= DOUBLE_PRESS_WINDOW.as_millis() as u64);
+        let is_double = self.pending_press_ms.is_some_and(|first| {
+            now_ms.saturating_sub(first) <= DOUBLE_PRESS_WINDOW.as_millis() as u64
+        });
         if is_double {
             self.recording_since_ms = Some(now_ms);
             self.pending_press_ms = None;
@@ -127,7 +127,7 @@ mod tests {
         let mut hotkey = DictationHotkey::new();
         hotkey.on_press(1_000);
         hotkey.on_press(1_300); // start at 1_300
-        // Auto-repeat / second tap 100 ms later must not stop it.
+                                // Auto-repeat / second tap 100 ms later must not stop it.
         assert_eq!(hotkey.on_press(1_400), HotkeyAction::None);
         assert!(hotkey.is_recording());
     }

@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::analysis::{AnalysisTranscriptSegment, KeyTopic, MeetingActionItem, MeetingSummary, MeetingSummarizer};
+use crate::analysis::{
+    AnalysisTranscriptSegment, KeyTopic, MeetingActionItem, MeetingSummarizer, MeetingSummary,
+};
 use crate::domain::{AppError, SummarizerProvider};
 
 pub const DEFAULT_SUMMARIZER_MODEL: &str = "qwen3-14b-mlx";
@@ -60,7 +62,10 @@ pub struct LmStudioSummarizer<C: ChatCompletion> {
 
 impl<C: ChatCompletion> LmStudioSummarizer<C> {
     pub fn new(client: C, model: impl Into<String>) -> Self {
-        Self { client, model: model.into() }
+        Self {
+            client,
+            model: model.into(),
+        }
     }
 }
 
@@ -80,16 +85,27 @@ impl<C: ChatCompletion> MeetingSummarizer for LmStudioSummarizer<C> {
 
         let transcript = render_transcript(transcript_segments);
         if transcript.chars().count() <= SINGLE_SHOT_CHAR_BUDGET {
-            let reply = self.client.complete(&self.model, SUMMARY_SYSTEM, &single_shot_prompt(&transcript))?;
+            let reply = self.client.complete(
+                &self.model,
+                SUMMARY_SYSTEM,
+                &single_shot_prompt(&transcript),
+            )?;
             return parse_summary(&reply);
         }
 
         let mut digests = String::new();
-        for (index, chunk) in chunk_transcript(transcript_segments, CHUNK_CHAR_TARGET).iter().enumerate() {
-            let digest = self.client.complete(&self.model, MAP_SYSTEM, &map_prompt(chunk))?;
+        for (index, chunk) in chunk_transcript(transcript_segments, CHUNK_CHAR_TARGET)
+            .iter()
+            .enumerate()
+        {
+            let digest = self
+                .client
+                .complete(&self.model, MAP_SYSTEM, &map_prompt(chunk))?;
             digests.push_str(&format!("Section {}:\n{}\n\n", index + 1, digest.trim()));
         }
-        let reply = self.client.complete(&self.model, SUMMARY_SYSTEM, &reduce_prompt(&digests))?;
+        let reply = self
+            .client
+            .complete(&self.model, SUMMARY_SYSTEM, &reduce_prompt(&digests))?;
         parse_summary(&reply)
     }
 }
@@ -211,15 +227,26 @@ fn meeting_summary_from_value(value: &Value) -> MeetingSummary {
 }
 
 fn key_topic_from_value(value: &Value) -> Option<KeyTopic> {
-    let topic = value.get("topic").and_then(Value::as_str)?.trim().to_string();
+    let topic = value
+        .get("topic")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
     if topic.is_empty() {
         return None;
     }
-    Some(KeyTopic { topic, points: string_list(value.get("points")) })
+    Some(KeyTopic {
+        topic,
+        points: string_list(value.get("points")),
+    })
 }
 
 fn action_item_from_value(value: &Value) -> Option<MeetingActionItem> {
-    let task = value.get("task").and_then(Value::as_str)?.trim().to_string();
+    let task = value
+        .get("task")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
     if task.is_empty() {
         return None;
     }
@@ -273,13 +300,21 @@ pub struct LmStudioClient {
 
 impl Default for LmStudioClient {
     fn default() -> Self {
-        Self { host: LM_STUDIO_HOST.to_string(), port: LM_STUDIO_PORT }
+        Self {
+            host: LM_STUDIO_HOST.to_string(),
+            port: LM_STUDIO_PORT,
+        }
     }
 }
 
 impl ChatCompletion for LmStudioClient {
     fn complete(&self, model: &str, system: &str, user: &str) -> Result<String, AppError> {
-        let response = post(&self.host, self.port, CHAT_PATH, &chat_request_body(model, system, user))?;
+        let response = post(
+            &self.host,
+            self.port,
+            CHAT_PATH,
+            &chat_request_body(model, system, user),
+        )?;
         parse_chat_content(&response)
     }
 }
@@ -297,7 +332,12 @@ pub struct OpenAiCompatibleClient {
 
 impl ChatCompletion for OpenAiCompatibleClient {
     fn complete(&self, model: &str, system: &str, user: &str) -> Result<String, AppError> {
-        let response = post(&self.host, self.port, CHAT_PATH, &chat_request_body(model, system, user))?;
+        let response = post(
+            &self.host,
+            self.port,
+            CHAT_PATH,
+            &chat_request_body(model, system, user),
+        )?;
         parse_chat_content(&response)
     }
 }
@@ -345,7 +385,11 @@ fn parse_chat_content(response: &[u8]) -> Result<String, AppError> {
 /// populating a model picker in Settings. LM Studio and Custom endpoints speak
 /// the OpenAI-compatible `/v1/models` list endpoint; Ollama has its own
 /// `/api/tags` shape.
-pub fn list_models(provider: SummarizerProvider, host: &str, port: u16) -> Result<Vec<String>, AppError> {
+pub fn list_models(
+    provider: SummarizerProvider,
+    host: &str,
+    port: u16,
+) -> Result<Vec<String>, AppError> {
     let response = match provider {
         SummarizerProvider::Ollama => get(host, port, "/api/tags")?,
         SummarizerProvider::LmStudio | SummarizerProvider::Custom => get(host, port, "/v1/models")?,
@@ -397,7 +441,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
 }
 
 fn get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, AppError> {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     send_request(host, port, request.as_bytes())
 }
 
@@ -406,12 +451,25 @@ fn get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, AppError> {
 fn send_request(host: &str, port: u16, framed_request: &[u8]) -> Result<Vec<u8>, AppError> {
     let address = format!("{host}:{port}")
         .parse::<std::net::SocketAddr>()
-        .map_err(|error| summarizer_error("summarizer_bad_address", "Invalid model server address.", Some(error.to_string())))?;
-    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(map_transport_error)?;
-    stream.set_read_timeout(Some(REQUEST_TIMEOUT)).map_err(map_transport_error)?;
-    stream.set_write_timeout(Some(REQUEST_TIMEOUT)).map_err(map_transport_error)?;
+        .map_err(|error| {
+            summarizer_error(
+                "summarizer_bad_address",
+                "Invalid model server address.",
+                Some(error.to_string()),
+            )
+        })?;
+    let mut stream =
+        TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(map_transport_error)?;
+    stream
+        .set_read_timeout(Some(REQUEST_TIMEOUT))
+        .map_err(map_transport_error)?;
+    stream
+        .set_write_timeout(Some(REQUEST_TIMEOUT))
+        .map_err(map_transport_error)?;
 
-    stream.write_all(framed_request).map_err(map_transport_error)?;
+    stream
+        .write_all(framed_request)
+        .map_err(map_transport_error)?;
     stream.flush().map_err(map_transport_error)?;
 
     let mut raw = Vec::new();
@@ -434,7 +492,13 @@ fn send_request(host: &str, port: u16, framed_request: &[u8]) -> Result<Vec<u8>,
     let separator = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| summarizer_error("summarizer_no_headers", "The model server's response had no header terminator.", None))?;
+        .ok_or_else(|| {
+            summarizer_error(
+                "summarizer_no_headers",
+                "The model server's response had no header terminator.",
+                None,
+            )
+        })?;
     let header_text = String::from_utf8_lossy(&raw[..separator]);
     let status_ok = header_text
         .lines()
@@ -442,7 +506,10 @@ fn send_request(host: &str, port: u16, framed_request: &[u8]) -> Result<Vec<u8>,
         .map(|line| line.contains(" 200"))
         .unwrap_or(false);
     let body_bytes = raw[separator + 4..].to_vec();
-    let body_bytes = if header_text.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    let body_bytes = if header_text
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         decode_chunked(&body_bytes)
     } else {
         body_bytes
@@ -461,10 +528,7 @@ fn send_request(host: &str, port: u16, framed_request: &[u8]) -> Result<Vec<u8>,
 fn decode_chunked(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut rest = body;
-    loop {
-        let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") else {
-            break;
-        };
+    while let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") {
         let size_line = String::from_utf8_lossy(&rest[..line_end]);
         let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
         let chunk_start = line_end + 2;
@@ -486,7 +550,9 @@ pub struct LmStudioLifecycle {
 impl LmStudioLifecycle {
     pub fn resolve(bin_override: Option<&str>) -> Result<Self, AppError> {
         if let Some(path) = bin_override.filter(|value| !value.trim().is_empty()) {
-            return Ok(Self { bin: PathBuf::from(path) });
+            return Ok(Self {
+                bin: PathBuf::from(path),
+            });
         }
         if let Some(home) = std::env::var_os("HOME") {
             let candidate = PathBuf::from(home).join(".lmstudio/bin/lms");
@@ -494,15 +560,25 @@ impl LmStudioLifecycle {
                 return Ok(Self { bin: candidate });
             }
         }
-        Ok(Self { bin: PathBuf::from("lms") })
+        Ok(Self {
+            bin: PathBuf::from("lms"),
+        })
     }
 
     pub fn ensure_running(&self) -> Result<(), AppError> {
-        self.run(&["server", "start"], "lm_studio_server_start_failed", "Could not start the LM Studio server.")
+        self.run(
+            &["server", "start"],
+            "lm_studio_server_start_failed",
+            "Could not start the LM Studio server.",
+        )
     }
 
     pub fn load(&self, model: &str) -> Result<(), AppError> {
-        self.run(&["load", model, "-y"], "lm_studio_model_load_failed", "Could not load the summarizer model in LM Studio.")
+        self.run(
+            &["load", model, "-y"],
+            "lm_studio_model_load_failed",
+            "Could not load the summarizer model in LM Studio.",
+        )
     }
 
     pub fn unload_all(&self) {
@@ -510,17 +586,24 @@ impl LmStudioLifecycle {
     }
 
     fn run(&self, args: &[&str], code: &str, message: &str) -> Result<(), AppError> {
-        let output = Command::new(&self.bin).args(args).output().map_err(|error| {
-            summarizer_error(
-                code,
-                "Could not run the LM Studio CLI. Install LM Studio and the `lms` command.",
-                Some(error.to_string()),
-            )
-        })?;
+        let output = Command::new(&self.bin)
+            .args(args)
+            .output()
+            .map_err(|error| {
+                summarizer_error(
+                    code,
+                    "Could not run the LM Studio CLI. Install LM Studio and the `lms` command.",
+                    Some(error.to_string()),
+                )
+            })?;
         if output.status.success() {
             Ok(())
         } else {
-            Err(summarizer_error(code, message, Some(String::from_utf8_lossy(&output.stderr).trim().to_string())))
+            Err(summarizer_error(
+                code,
+                message,
+                Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            ))
         }
     }
 }
@@ -534,7 +617,11 @@ fn map_transport_error(error: std::io::Error) -> AppError {
 }
 
 fn summarizer_error(code: &str, message: &str, details: Option<String>) -> AppError {
-    AppError { code: code.to_string(), message: message.to_string(), details }
+    AppError {
+        code: code.to_string(),
+        message: message.to_string(),
+        details,
+    }
 }
 
 #[cfg(test)]
@@ -596,7 +683,10 @@ mod tests {
         .expect("valid json parses");
         assert_eq!(summary.key_topics.len(), 2);
         assert_eq!(summary.key_topics[0].topic, "Budget");
-        assert_eq!(summary.key_topics[0].points, vec!["Cut cloud spend by 10%", "Delayed the Q3 hire"]);
+        assert_eq!(
+            summary.key_topics[0].points,
+            vec!["Cut cloud spend by 10%", "Delayed the Q3 hire"]
+        );
         assert!(summary.key_topics[1].points.is_empty());
     }
 
@@ -648,7 +738,10 @@ mod tests {
         let segments: Vec<AnalysisTranscriptSegment> =
             (0..4).map(|i| segment(i, "Speaker", &long_text)).collect();
         let chunks = chunk_transcript(&segments, CHUNK_CHAR_TARGET);
-        assert!(chunks.len() >= 2, "long transcript should split into multiple chunks");
+        assert!(
+            chunks.len() >= 2,
+            "long transcript should split into multiple chunks"
+        );
 
         let mut replies: Vec<&str> = vec!["- point a"; chunks.len()];
         replies.push("{\"executiveSummary\":\"Reduced.\",\"actionItems\":[],\"decisions\":[],\"openQuestions\":[]}");
@@ -663,7 +756,9 @@ mod tests {
     fn empty_transcript_is_rejected() {
         let chat = ScriptedChat::new(vec![]);
         let summarizer = LmStudioSummarizer::new(chat, "test-model");
-        let error = summarizer.summarize(&[], false).expect_err("empty transcript errors");
+        let error = summarizer
+            .summarize(&[], false)
+            .expect_err("empty transcript errors");
         assert_eq!(error.code, "summary_empty_transcript");
     }
 
@@ -682,8 +777,10 @@ mod tests {
 
     #[test]
     fn extracts_model_names_from_ollama_tags_list() {
-        let value: Value = serde_json::from_str(r#"{"models":[{"name":"llama3.2:latest"},{"name":"mistral:7b"}]}"#)
-            .expect("valid json");
+        let value: Value = serde_json::from_str(
+            r#"{"models":[{"name":"llama3.2:latest"},{"name":"mistral:7b"}]}"#,
+        )
+        .expect("valid json");
         let names = extract_model_names(SummarizerProvider::Ollama, &value);
         assert_eq!(names, vec!["llama3.2:latest", "mistral:7b"]);
     }

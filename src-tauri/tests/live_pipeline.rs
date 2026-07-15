@@ -28,15 +28,20 @@ fn live_audio_to_notes() {
         .unwrap_or_else(|_| DEFAULT_SUMMARIZER_MODEL.to_string());
 
     // 1. Real transcription via the same whisper path the app uses.
-    let mut settings = ScribeSettings::default();
-    settings.transcriber_model_path = Some(whisper_model);
+    let settings = ScribeSettings {
+        transcriber_model_path: Some(whisper_model),
+        ..ScribeSettings::default()
+    };
     let transcriber = WhisperShellTranscriber::from_settings(&settings).expect("build transcriber");
     let output = transcriber
         .transcribe(Path::new(&wav))
         .expect("whisper transcription");
     assert!(!output.segments.is_empty(), "whisper produced no segments");
 
-    println!("\n===== TRANSCRIPT ({} segments) =====", output.segments.len());
+    println!(
+        "\n===== TRANSCRIPT ({} segments) =====",
+        output.segments.len()
+    );
     for segment in &output.segments {
         println!("{}", segment.text.trim());
     }
@@ -57,7 +62,9 @@ fn live_audio_to_notes() {
     // 2. Real summarization via the LM Studio lifecycle (start -> load -> unload).
     let lifecycle = LmStudioLifecycle::resolve(None).expect("resolve lms");
     lifecycle.ensure_running().expect("start LM Studio server");
-    lifecycle.load(&summarizer_model).expect("load summarizer model");
+    lifecycle
+        .load(&summarizer_model)
+        .expect("load summarizer model");
     let summarizer = LmStudioSummarizer::new(LmStudioClient::default(), summarizer_model);
     let result = summarizer.summarize(&segments, false);
     lifecycle.unload_all();
@@ -77,5 +84,8 @@ fn live_audio_to_notes() {
         );
     }
 
-    assert!(!notes.executive_summary.trim().is_empty(), "notes had an empty TL;DR");
+    assert!(
+        !notes.executive_summary.trim().is_empty(),
+        "notes had an empty TL;DR"
+    );
 }

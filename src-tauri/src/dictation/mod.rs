@@ -32,8 +32,8 @@ fn polish_helper_unavailable() -> AppError {
 /// Resolves the bundled dictation-polish Swift sidecar, preferring the dev build
 /// under `binaries/` and falling back to the path next to the app executable.
 pub fn polish_helper_path() -> Result<PathBuf, AppError> {
-    let helper_name = option_env!("SCRIBE_DICTATION_POLISH_HELPER_NAME")
-        .ok_or_else(polish_helper_unavailable)?;
+    let helper_name =
+        option_env!("SCRIBE_DICTATION_POLISH_HELPER_NAME").ok_or_else(polish_helper_unavailable)?;
     let target = option_env!("SCRIBE_DICTATION_POLISH_HELPER_TARGET")
         .ok_or_else(polish_helper_unavailable)?;
 
@@ -134,7 +134,11 @@ fn run_polish_helper(helper_path: &Path, raw: &str) -> Result<String, AppError> 
     Err(AppError {
         code: code.to_string(),
         message: "Apple Intelligence could not polish the dictation.".to_string(),
-        details: if stderr.is_empty() { None } else { Some(stderr) },
+        details: if stderr.is_empty() {
+            None
+        } else {
+            Some(stderr)
+        },
     })
 }
 
@@ -209,7 +213,8 @@ mod tests {
     #[test]
     fn fabricated_reply_to_a_request_is_rejected() {
         let raw = "hey can you draft an email to john about the meeting";
-        let answer = "Dear John, following up on our conversation, I wanted to confirm the meeting time.";
+        let answer =
+            "Dear John, following up on our conversation, I wanted to confirm the meeting time.";
         assert!(!is_plausible_cleanup(raw, answer));
     }
 }

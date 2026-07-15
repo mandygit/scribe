@@ -69,10 +69,12 @@ pub fn probe_microphone() -> PermissionStatus {
 
 fn probe_microphone_with<B: AudioCaptureBackend>(backend: &B) -> PermissionStatus {
     let path = probe_temp_path("scribe-permission-probe-mic", "wav");
-    let outcome = backend.start_recording(path.clone(), None).and_then(|capture| {
-        std::thread::sleep(PROBE_CAPTURE_DURATION);
-        capture.handle.stop()
-    });
+    let outcome = backend
+        .start_recording(path.clone(), None)
+        .and_then(|capture| {
+            std::thread::sleep(PROBE_CAPTURE_DURATION);
+            capture.handle.stop()
+        });
     let _ = std::fs::remove_file(&path);
     status_from(outcome)
 }
@@ -156,7 +158,11 @@ mod tests {
         fn list_input_devices(&self) -> Result<Vec<AudioDevice>, AppError> {
             Ok(Vec::new())
         }
-        fn start_recording(&self, file_path: PathBuf, _device_id: Option<String>) -> Result<ActiveCapture, AppError> {
+        fn start_recording(
+            &self,
+            file_path: PathBuf,
+            _device_id: Option<String>,
+        ) -> Result<ActiveCapture, AppError> {
             Ok(ActiveCapture {
                 file_path,
                 sample_rate_hz: 16_000,
@@ -170,7 +176,11 @@ mod tests {
         fn list_input_devices(&self) -> Result<Vec<AudioDevice>, AppError> {
             Ok(Vec::new())
         }
-        fn start_recording(&self, _file_path: PathBuf, _device_id: Option<String>) -> Result<ActiveCapture, AppError> {
+        fn start_recording(
+            &self,
+            _file_path: PathBuf,
+            _device_id: Option<String>,
+        ) -> Result<ActiveCapture, AppError> {
             Err(AppError {
                 code: "audio_input_config_unavailable".to_string(),
                 message: "Microphone access denied.".to_string(),
@@ -181,12 +191,18 @@ mod tests {
 
     #[test]
     fn microphone_probe_reports_granted_when_capture_starts() {
-        assert_eq!(probe_microphone_with(&GrantedMicBackend), PermissionStatus::Granted);
+        assert_eq!(
+            probe_microphone_with(&GrantedMicBackend),
+            PermissionStatus::Granted
+        );
     }
 
     #[test]
     fn microphone_probe_reports_denied_when_capture_fails() {
-        assert_eq!(probe_microphone_with(&DeniedMicBackend), PermissionStatus::Denied);
+        assert_eq!(
+            probe_microphone_with(&DeniedMicBackend),
+            PermissionStatus::Denied
+        );
     }
 
     #[test]

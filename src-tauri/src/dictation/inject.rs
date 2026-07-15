@@ -103,7 +103,10 @@ fn send_cmd_keystroke(key: &str, failure_code: &str) -> Result<(), AppError> {
         .output()
         .map_err(|error| AppError {
             code: failure_code.to_string(),
-            message: format!("Could not start osascript to send Cmd+{}.", key.to_uppercase()),
+            message: format!(
+                "Could not start osascript to send Cmd+{}.",
+                key.to_uppercase()
+            ),
             details: Some(error.to_string()),
         })?;
 
@@ -127,7 +130,11 @@ fn send_cmd_keystroke(key: &str, failure_code: &str) -> Result<(), AppError> {
             "Could not send Cmd+{} to the focused app.",
             key.to_uppercase()
         ),
-        details: if stderr.is_empty() { None } else { Some(stderr) },
+        details: if stderr.is_empty() {
+            None
+        } else {
+            Some(stderr)
+        },
     })
 }
 
@@ -169,7 +176,11 @@ pub fn probe_accessibility() -> Result<(), AppError> {
     Err(AppError {
         code: code.to_string(),
         message: "The Accessibility permission has not been granted.".to_string(),
-        details: if stderr.is_empty() { None } else { Some(stderr) },
+        details: if stderr.is_empty() {
+            None
+        } else {
+            Some(stderr)
+        },
     })
 }
 

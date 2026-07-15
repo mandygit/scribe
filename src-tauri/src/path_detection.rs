@@ -9,7 +9,10 @@ use crate::domain::ScribeSettings;
 
 static DETECTED_LOCAL_PATHS: OnceLock<DetectedLocalPaths> = OnceLock::new();
 
-const WHISPER_BINARY_CANDIDATES: [&str; 2] = ["/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"];
+const WHISPER_BINARY_CANDIDATES: [&str; 2] = [
+    "/opt/homebrew/bin/whisper-cli",
+    "/usr/local/bin/whisper-cli",
+];
 const WHISPER_MODEL_QUERY: &str =
     "kMDItemFSName == \"ggml-*\"c && (kMDItemFSName == \"*.bin\"c || kMDItemFSName == \"*.gguf\"c)";
 const SPEAKER_EMBEDDING_QUERY: &str =
@@ -56,7 +59,7 @@ fn hydrate_settings_with_detected_paths(
 }
 
 fn missing_path(path: &Option<String>) -> bool {
-    path.as_deref().map(str::trim).is_none_or(str::is_empty)
+    path.as_deref().map(str::trim).map_or(true, str::is_empty)
 }
 
 fn detect_local_paths() -> DetectedLocalPaths {
@@ -153,13 +156,22 @@ fn spotlight_search(query: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn collect_candidates_from_common_dirs(candidates: &mut Vec<PathBuf>, kind: &ModelKind, roots: &[PathBuf]) {
+fn collect_candidates_from_common_dirs(
+    candidates: &mut Vec<PathBuf>,
+    kind: &ModelKind,
+    roots: &[PathBuf],
+) {
     for root in roots {
         collect_matching_files(root, 5, kind, candidates);
     }
 }
 
-fn collect_matching_files(root: &Path, depth: usize, kind: &ModelKind, candidates: &mut Vec<PathBuf>) {
+fn collect_matching_files(
+    root: &Path,
+    depth: usize,
+    kind: &ModelKind,
+    candidates: &mut Vec<PathBuf>,
+) {
     if depth == 0 {
         return;
     }
@@ -326,7 +338,10 @@ mod tests {
             .max_by_key(|path| score_candidate(path, &ModelKind::Whisper))
             .expect("candidate exists");
 
-        assert_eq!(best, &PathBuf::from("/Users/example/models/ggml-base-q5_1.bin"));
+        assert_eq!(
+            best,
+            &PathBuf::from("/Users/example/models/ggml-base-q5_1.bin")
+        );
     }
 
     #[test]

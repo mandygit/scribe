@@ -504,7 +504,11 @@ mod tests {
     }
 
     impl ReferenceAudioNormalizer for StubReferenceAudioNormalizer {
-        fn normalize_to_wav(&self, _source_path: &Path, output_path: &Path) -> Result<(), AppError> {
+        fn normalize_to_wav(
+            &self,
+            _source_path: &Path,
+            output_path: &Path,
+        ) -> Result<(), AppError> {
             self.calls.set(self.calls.get().saturating_add(1));
             write_mono_i16_48k(output_path, &self.samples)
         }

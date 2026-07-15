@@ -55,11 +55,7 @@ impl<B: AudioCaptureBackend> DictationRecorder<B> {
 
     /// Starts recording the microphone to `file_path`. Errors if a dictation is
     /// already in flight so a double hotkey press can't start two captures.
-    pub fn start(
-        &mut self,
-        file_path: PathBuf,
-        device_id: Option<String>,
-    ) -> Result<(), AppError> {
+    pub fn start(&mut self, file_path: PathBuf, device_id: Option<String>) -> Result<(), AppError> {
         if self.active.is_some() {
             return Err(dictation_already_recording());
         }
@@ -124,8 +120,7 @@ pub fn transcript_to_text(output: &TranscriptionOutput) -> String {
 /// dictated words. Whisper wraps these wholly in brackets or parentheses, e.g.
 /// `[BLANK_AUDIO]`, `[ Silence ]`, `[Music]`, `(wind blowing)`.
 fn is_non_speech_marker(text: &str) -> bool {
-    (text.starts_with('[') && text.ends_with(']'))
-        || (text.starts_with('(') && text.ends_with(')'))
+    (text.starts_with('[') && text.ends_with(']')) || (text.starts_with('(') && text.ends_with(')'))
 }
 
 fn dictation_already_recording() -> AppError {
@@ -228,7 +223,9 @@ mod tests {
     #[test]
     fn finishing_without_a_capture_is_rejected() {
         let mut recorder = DictationRecorder::new(StubBackend);
-        let error = recorder.finish().expect_err("finish without start is rejected");
+        let error = recorder
+            .finish()
+            .expect_err("finish without start is rejected");
         assert_eq!(error.code, "dictation_not_recording");
     }
 
