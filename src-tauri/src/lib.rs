@@ -30,8 +30,8 @@ use persistence::{
 use rules::{MetricsSummary, RuleTranscriptSegment};
 use serde::Serialize;
 use summarizer::{
-    list_models as list_summarizer_models_impl, LmStudioClient, LmStudioLifecycle, LmStudioSummarizer,
-    OpenAiCompatibleClient, DEFAULT_SUMMARIZER_MODEL,
+    list_models as list_summarizer_models_impl, LmStudioClient, LmStudioLifecycle,
+    LmStudioSummarizer, OpenAiCompatibleClient, DEFAULT_SUMMARIZER_MODEL,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use transcription::{
@@ -71,7 +71,9 @@ struct AppState {
 }
 
 fn load_effective_settings(repository: &SqliteRepository) -> Result<ScribeSettings, AppError> {
-    Ok(hydrate_settings_with_local_defaults(repository.get_settings()?))
+    Ok(hydrate_settings_with_local_defaults(
+        repository.get_settings()?,
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -384,7 +386,11 @@ fn get_meeting_history_detail(
 /// to delete the meeting currently being recorded, since its audio file is
 /// still being written.
 #[tauri::command]
-fn delete_meeting(app: AppHandle, state: State<'_, AppState>, meeting_id: String) -> Result<(), AppError> {
+fn delete_meeting(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), AppError> {
     validate_recording_file_stem(&meeting_id)?;
     let meeting_id_value = MeetingId::new(meeting_id.clone());
 
@@ -415,11 +421,19 @@ fn delete_meeting(app: AppHandle, state: State<'_, AppState>, meeting_id: String
 /// Renames a meeting. An empty (or all-whitespace) title clears it, reverting
 /// the meeting to its date-based display name in the UI.
 #[tauri::command]
-fn update_meeting_title(state: State<'_, AppState>, meeting_id: String, title: String) -> Result<(), AppError> {
+fn update_meeting_title(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    title: String,
+) -> Result<(), AppError> {
     validate_recording_file_stem(&meeting_id)?;
     let meeting_id_value = MeetingId::new(meeting_id);
     let trimmed = title.trim();
-    let title_value = if trimmed.is_empty() { None } else { Some(trimmed) };
+    let title_value = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
 
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let updated_at_ms = current_time_ms()?;
@@ -428,7 +442,10 @@ fn update_meeting_title(state: State<'_, AppState>, meeting_id: String, title: S
 
 /// Deletes a single dictation session summary row.
 #[tauri::command]
-fn delete_dictation_session(state: State<'_, AppState>, session_id: String) -> Result<(), AppError> {
+fn delete_dictation_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), AppError> {
     state
         .repository
         .lock()
@@ -500,7 +517,8 @@ fn start_recording(
         ensure_meeting_exists(&repository, &meeting_id_value, started_at_ms)?;
     }
 
-    let started = recordings.start_recording(meeting_id, file_path, system_audio_file_path, device_id)?;
+    let started =
+        recordings.start_recording(meeting_id, file_path, system_audio_file_path, device_id)?;
 
     // Broadcast to every window, not just whichever one called this command —
     // the main window and the floating recording indicator both need to know
@@ -647,7 +665,10 @@ async fn summarize_meeting(
         load_effective_settings(&repository)?
     };
 
-    let model = match model.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    let model = match model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         Some(explicit) => explicit,
         None => match settings.summarizer_model.clone() {
             Some(configured) => configured,
@@ -657,7 +678,8 @@ async fn summarize_meeting(
             None => {
                 return Err(AppError {
                     code: "summarizer_model_not_configured".to_string(),
-                    message: "Choose a local model in Settings before generating notes.".to_string(),
+                    message: "Choose a local model in Settings before generating notes."
+                        .to_string(),
                     details: None,
                 })
             }
@@ -671,14 +693,15 @@ async fn summarize_meeting(
     let generated_at_ms = current_time_ms()?;
     // Run the blocking model load + summary off the main thread so the webview
     // UI stays responsive (a synchronous command would freeze it for ~1 minute).
-    let summary_result =
-        tauri::async_runtime::spawn_blocking(move || run_summary(provider, &host, port, segments, model))
-            .await
-            .map_err(|error| AppError {
-                code: "summary_task_failed".to_string(),
-                message: "The summarization task did not finish.".to_string(),
-                details: Some(error.to_string()),
-            })?;
+    let summary_result = tauri::async_runtime::spawn_blocking(move || {
+        run_summary(provider, &host, port, segments, model)
+    })
+    .await
+    .map_err(|error| AppError {
+        code: "summary_task_failed".to_string(),
+        message: "The summarization task did not finish.".to_string(),
+        details: Some(error.to_string()),
+    })?;
     let summary = match summary_result {
         Ok(summary) => summary,
         Err(error) => {
@@ -726,9 +749,7 @@ fn begin_dictation(state: &AppState) -> Result<(), AppError> {
 /// Stops the in-flight capture and resolves the transcriber settings, returning
 /// the clip path and settings so the (blocking) transcription can run without
 /// holding any locks.
-fn stop_dictation_capture(
-    state: &AppState,
-) -> Result<(PathBuf, ScribeSettings, u64), AppError> {
+fn stop_dictation_capture(state: &AppState) -> Result<(PathBuf, ScribeSettings, u64), AppError> {
     let (wav_path, started_at_ms) = {
         let mut recorder = state.dictation.lock().map_err(map_lock_error)?;
         recorder.finish()?
@@ -786,10 +807,7 @@ fn record_dictation_session(state: &AppState, started_at_ms: u64, text: &str) {
         .map_err(map_lock_error)
         .and_then(|repository| repository.create_dictation_session(&record));
     if let Err(error) = result {
-        eprintln!(
-            "dictation: could not save session stats ({})",
-            error.code
-        );
+        eprintln!("dictation: could not save session stats ({})", error.code);
     }
 }
 
@@ -957,16 +975,147 @@ fn set_pill_visible(app: &AppHandle, visible: bool) {
     set_panel_visible(app, DICTATION_PILL_WINDOW, visible);
 }
 
+/// A coordinate far outside any real display, used to "hide" the meeting
+/// popup and recording indicator by moving them off-screen rather than
+/// ordering them out (see `set_positioned_panel_visible`'s doc comment).
+#[cfg(target_os = "macos")]
+const OFFSCREEN_POSITION: (f64, f64) = (-10_000.0, -10_000.0);
+
+/// Shows or hides a floating panel by **moving it** plus toggling its alpha
+/// and click-through state, not by ordering it in/out like
+/// [`set_panel_visible`] does for the pill. The pill toggles visibility for
+/// only ~100ms at a time (mid-paste); the meeting popup and recording
+/// indicator can sit hidden for hours waiting for a call or recording.
+/// Empirically (screenshotting the window's own screen region), a WKWebView
+/// left ordered-out that long comes back showing a stale opaque black
+/// backing buffer instead of its actual transparent content — macOS appears
+/// to reclaim/invalidate the backing store of windows ordered out for a
+/// long time. Keeping the window permanently ordered front (so its backing
+/// store is never reclaimed) and moving it off any display sidesteps that.
+///
+/// The off-screen move alone is not a reliable hide, though: `set_position`
+/// applies asynchronously and was observed (via `debug_log` plus a
+/// CGWindowList dump) to return `Ok` yet never move the window, leaving a
+/// phantom recording indicator on screen; macOS can also move a parked
+/// off-screen window back onto a display when the display configuration
+/// changes (sleep/wake, monitor plug/unplug). So hiding *also* sets the
+/// panel's alpha to 0 and makes it click-through — direct, synchronous
+/// AppKit calls that cannot be dropped — and showing restores them. Even if
+/// a move is lost, a "hidden" panel can never be seen or intercept clicks.
+#[cfg(target_os = "macos")]
+fn set_positioned_panel_visible(
+    app: &AppHandle,
+    label: &'static str,
+    anchor: WindowAnchor,
+    width: f64,
+    height: f64,
+    margin: f64,
+    visible: bool,
+) {
+    let app = app.clone();
+    debug_log(&format!(
+        "set_positioned_panel_visible label={label} visible={visible} caller_thread={:?}",
+        std::thread::current().id()
+    ));
+    let dispatch = app.clone().run_on_main_thread(move || {
+        use tauri_nspanel::ManagerExt;
+        let Some(window) = app.get_webview_window(label) else {
+            debug_log(&format!(
+                "set_positioned_panel_visible label={label}: window not found"
+            ));
+            return;
+        };
+        // Windows are converted to panels in setup() before their first
+        // hide; a missing panel here means that conversion failed, so fall
+        // back to position-only toggling rather than doing nothing.
+        let panel = app.get_webview_panel(label).ok();
+        if panel.is_none() {
+            debug_log(&format!(
+                "set_positioned_panel_visible label={label}: panel not found, position-only fallback"
+            ));
+        }
+        if visible {
+            position_window(&window, anchor, width, height, margin);
+            if let Some(panel) = &panel {
+                panel.set_ignore_mouse_events(false);
+                panel.set_alpha_value(1.0);
+            }
+            debug_log(&format!(
+                "set_positioned_panel_visible label={label}: shown, readback={:?}",
+                window.outer_position()
+            ));
+        } else {
+            if let Some(panel) = &panel {
+                panel.set_alpha_value(0.0);
+                panel.set_ignore_mouse_events(true);
+            }
+            let (x, y) = OFFSCREEN_POSITION;
+            let result = window.set_position(tauri::LogicalPosition::new(x, y));
+            debug_log(&format!(
+                "set_positioned_panel_visible label={label}: hide result={result:?} readback={:?}",
+                window.outer_position()
+            ));
+        }
+    });
+    debug_log(&format!(
+        "set_positioned_panel_visible label={label} visible={visible} dispatch_ok={}",
+        dispatch.is_ok()
+    ));
+}
+
+/// Diagnostic logging for floating-panel visibility: appends to
+/// ~/Library/Logs/Scribe/app-debug.log (eprintln is invisible for a
+/// Finder-launched .app). This trail is what proved a hide's `set_position`
+/// can return `Ok` yet never apply (see `set_positioned_panel_visible`);
+/// kept because show/hide failures are environment-dependent (multi-monitor,
+/// sleep/wake) and unreproducible without a record of what was dispatched.
+#[cfg(target_os = "macos")]
+fn debug_log(message: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::Path::new(&home).join("Library/Logs/Scribe");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("app-debug.log"))
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{timestamp} {message}");
+    }
+}
+
 /// Shows or hides the "Record this meeting?" popup.
 #[cfg(target_os = "macos")]
 fn set_meeting_popup_visible(app: &AppHandle, visible: bool) {
-    set_panel_visible(app, MEETING_POPUP_WINDOW, visible);
+    set_positioned_panel_visible(
+        app,
+        MEETING_POPUP_WINDOW,
+        WindowAnchor::TopCenter,
+        MEETING_POPUP_WIDTH,
+        MEETING_POPUP_HEIGHT,
+        MEETING_POPUP_TOP_MARGIN,
+        visible,
+    );
 }
 
 /// Shows or hides the recording-in-progress indicator.
 #[cfg(target_os = "macos")]
 fn set_recording_indicator_visible(app: &AppHandle, visible: bool) {
-    set_panel_visible(app, RECORDING_INDICATOR_WINDOW, visible);
+    set_positioned_panel_visible(
+        app,
+        RECORDING_INDICATOR_WINDOW,
+        WindowAnchor::RightCenter,
+        RECORDING_INDICATOR_WIDTH,
+        RECORDING_INDICATOR_HEIGHT,
+        RECORDING_INDICATOR_RIGHT_MARGIN,
+        visible,
+    );
 }
 
 /// Shows or clears a "listening" indicator in the menu bar by setting the tray
@@ -1022,8 +1171,11 @@ const RECORDING_INDICATOR_HEIGHT: f64 = 132.0;
 const RECORDING_INDICATOR_RIGHT_MARGIN: f64 = 10.0;
 
 /// Which edge of the primary monitor's work area a floating window is pinned to.
+/// The shared `Center` postfix is deliberate (each window sits at the center
+/// of its edge, not a corner), so the variant-name lint doesn't apply.
 #[cfg(desktop)]
 #[derive(Clone, Copy)]
+#[allow(clippy::enum_variant_names)]
 enum WindowAnchor {
     BottomCenter,
     TopCenter,
@@ -1059,7 +1211,13 @@ fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
     .visible(true)
     .build()?;
 
-    position_window(&pill, WindowAnchor::BottomCenter, PILL_BOTTOM_MARGIN);
+    position_window(
+        &pill,
+        WindowAnchor::BottomCenter,
+        PILL_WIDTH,
+        PILL_HEIGHT,
+        PILL_BOTTOM_MARGIN,
+    );
     Ok(())
 }
 
@@ -1069,6 +1227,14 @@ fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
 /// live Teams call is detected. Same non-activating-panel treatment as the
 /// dictation pill, for the same reason: a click must not steal focus from the
 /// meeting app the user is currently in.
+///
+/// Built `.visible(true)` (like the pill), not `.visible(false)`: a WKWebView
+/// built hidden never gets an initial render pass, so ordering it front later
+/// showed a stale opaque black backing buffer instead of the actual
+/// transparent page (confirmed by screenshotting the window's screen region
+/// during a real detected call). It's hidden immediately after being
+/// converted to a panel in `setup()` instead, via the same `order_out`
+/// mechanism used for all later show/hide toggling.
 #[cfg(desktop)]
 fn create_meeting_popup(app: &AppHandle) -> tauri::Result<()> {
     use tauri::{WebviewUrl, WebviewWindowBuilder};
@@ -1089,10 +1255,16 @@ fn create_meeting_popup(app: &AppHandle) -> tauri::Result<()> {
     .focusable(false)
     .focused(false)
     .accept_first_mouse(true)
-    .visible(false)
+    .visible(true)
     .build()?;
 
-    position_window(&popup, WindowAnchor::TopCenter, MEETING_POPUP_TOP_MARGIN);
+    position_window(
+        &popup,
+        WindowAnchor::TopCenter,
+        MEETING_POPUP_WIDTH,
+        MEETING_POPUP_HEIGHT,
+        MEETING_POPUP_TOP_MARGIN,
+    );
     Ok(())
 }
 
@@ -1102,6 +1274,10 @@ fn create_meeting_popup(app: &AppHandle) -> tauri::Result<()> {
 /// `emit_recording_stopped`), and shown for *any* active recording, not just
 /// ones started from the meeting-detection popup. Same non-activating-panel
 /// treatment as the pill and the meeting popup.
+///
+/// Built `.visible(true)`, then hidden right after in `setup()` — see
+/// `create_meeting_popup`'s doc comment for why (a hidden-at-creation
+/// WKWebView never gets an initial render pass).
 #[cfg(desktop)]
 fn create_recording_indicator(app: &AppHandle) -> tauri::Result<()> {
     use tauri::{WebviewUrl, WebviewWindowBuilder};
@@ -1122,53 +1298,72 @@ fn create_recording_indicator(app: &AppHandle) -> tauri::Result<()> {
     .focusable(false)
     .focused(false)
     .accept_first_mouse(true)
-    .visible(false)
+    .visible(true)
     .build()?;
 
-    position_window(&indicator, WindowAnchor::RightCenter, RECORDING_INDICATOR_RIGHT_MARGIN);
+    position_window(
+        &indicator,
+        WindowAnchor::RightCenter,
+        RECORDING_INDICATOR_WIDTH,
+        RECORDING_INDICATOR_HEIGHT,
+        RECORDING_INDICATOR_RIGHT_MARGIN,
+    );
     Ok(())
 }
 
 /// Pins `window` to the given edge of the primary monitor's work area — the
 /// visible region that already excludes the Dock and menu bar — offset by
 /// `margin` so it floats clear of that edge rather than being clipped behind
-/// it. Positions in physical pixels so it lands correctly on Retina displays.
+/// it. `window_width`/`window_height` are the window's known logical size
+/// (the same values passed to `.inner_size()`), not queried via
+/// `outer_size()`, which can return a stale/default size immediately after
+/// `.build()`.
+///
+/// Works entirely in logical units (points) and positions via
+/// `LogicalPosition`, rather than converting to physical pixels by hand:
+/// mixing a hand-computed physical-pixel offset with `PhysicalPosition` on a
+/// multi-monitor, mixed-DPI setup landed a window at coordinates that
+/// matched neither display's logical bounds (confirmed against a real
+/// two-monitor Retina + non-Retina setup) — `LogicalPosition` lets
+/// tao/Tauri handle the physical/logical and any macOS coordinate-space
+/// conversion internally, which is exactly what it's designed to abstract.
 /// Best-effort: leaves the window at its default position if monitor info is
 /// unavailable.
 #[cfg(desktop)]
-fn position_window(window: &tauri::WebviewWindow, anchor: WindowAnchor, margin: f64) {
+fn position_window(
+    window: &tauri::WebviewWindow,
+    anchor: WindowAnchor,
+    window_width: f64,
+    window_height: f64,
+    margin: f64,
+) {
     let Ok(Some(monitor)) = window.primary_monitor() else {
         return;
     };
     let scale = monitor.scale_factor();
     let work_area = monitor.work_area();
-    let Ok(window_size) = window.outer_size() else {
-        return;
-    };
-    let margin_px = (margin * scale) as i32;
+    let work_x = work_area.position.x as f64 / scale;
+    let work_y = work_area.position.y as f64 / scale;
+    let work_width = work_area.size.width as f64 / scale;
+    let work_height = work_area.size.height as f64 / scale;
+
     let (x, y) = match anchor {
         WindowAnchor::BottomCenter | WindowAnchor::TopCenter => {
-            let x = work_area.position.x
-                + (work_area.size.width as i32 - window_size.width as i32) / 2;
+            let x = work_x + (work_width - window_width) / 2.0;
             let y = if matches!(anchor, WindowAnchor::BottomCenter) {
-                work_area.position.y + work_area.size.height as i32
-                    - window_size.height as i32
-                    - margin_px
+                work_y + work_height - window_height - margin
             } else {
-                work_area.position.y + margin_px
+                work_y + margin
             };
             (x, y)
         }
         WindowAnchor::RightCenter => {
-            let x = work_area.position.x + work_area.size.width as i32
-                - window_size.width as i32
-                - margin_px;
-            let y = work_area.position.y
-                + (work_area.size.height as i32 - window_size.height as i32) / 2;
+            let x = work_x + work_width - window_width - margin;
+            let y = work_y + (work_height - window_height) / 2.0;
             (x, y)
         }
     };
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    let _ = window.set_position(tauri::LogicalPosition::new(x, y));
 }
 
 /// Converts a floating window (the dictation pill or the meeting popup) into a
@@ -1278,8 +1473,12 @@ fn start_meeting_detection_if_enabled(app: &AppHandle, settings: &ScribeSettings
         return;
     };
     let app_for_thread = app.clone();
-    if let Err(error) = detector.start(move |line| on_meeting_detector_line(&app_for_thread, &line)) {
-        eprintln!("meeting_detector_start_failed: {} ({})", error.message, error.code);
+    if let Err(error) = detector.start(move |line| on_meeting_detector_line(&app_for_thread, &line))
+    {
+        eprintln!(
+            "meeting_detector_start_failed: {} ({})",
+            error.message, error.code
+        );
     }
 }
 
@@ -1459,46 +1658,47 @@ fn stop_and_process_dictation(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let outcome = stop_dictation_capture(&state).and_then(|(wav_path, settings, started_at_ms)| {
-            let mut text = transcribe_dictation_wav(&wav_path, &settings)?;
-            if settings.dictation_polish_enabled && !text.trim().is_empty() {
-                // Polish with Apple Intelligence, but fall back to the raw
-                // transcript if it is unavailable or returns nothing.
-                match dictation::polish_text(&text) {
-                    Ok(polished) if !polished.trim().is_empty() => text = polished,
-                    Ok(_) => {}
-                    Err(error) => eprintln!(
-                        "dictation: polish failed ({}), inserting raw text",
-                        error.code
-                    ),
+        let outcome =
+            stop_dictation_capture(&state).and_then(|(wav_path, settings, started_at_ms)| {
+                let mut text = transcribe_dictation_wav(&wav_path, &settings)?;
+                if settings.dictation_polish_enabled && !text.trim().is_empty() {
+                    // Polish with Apple Intelligence, but fall back to the raw
+                    // transcript if it is unavailable or returns nothing.
+                    match dictation::polish_text(&text) {
+                        Ok(polished) if !polished.trim().is_empty() => text = polished,
+                        Ok(_) => {}
+                        Err(error) => eprintln!(
+                            "dictation: polish failed ({}), inserting raw text",
+                            error.code
+                        ),
+                    }
                 }
-            }
-            record_dictation_session(&state, started_at_ms, &text);
-            // Before pasting, hand key focus back to the user's app: clicking the
-            // pill can make it the key window (dropping the user's field as first
-            // responder), so a synthesised Cmd+V would land nowhere. Hiding the
-            // always-on-top pill returns key to the previously-active window;
-            // after the paste, bring the pill back without re-keying it. Skipped
-            // for empty transcripts (inject is a no-op then).
-            #[cfg(target_os = "macos")]
-            let restore_pill = !text.trim().is_empty();
-            #[cfg(target_os = "macos")]
-            if restore_pill {
-                set_pill_visible(&app, false);
-                // Brief: just long enough for key focus to return to the user's
-                // window before the synthesised paste fires.
-                std::thread::sleep(std::time::Duration::from_millis(70));
-            }
-            let inject_result = dictation::inject_text(&text);
-            #[cfg(target_os = "macos")]
-            if restore_pill {
-                // inject_text already waited for the paste keystroke, so the pill
-                // can float back immediately.
-                set_pill_visible(&app, true);
-            }
-            inject_result?;
-            Ok(text)
-        });
+                record_dictation_session(&state, started_at_ms, &text);
+                // Before pasting, hand key focus back to the user's app: clicking the
+                // pill can make it the key window (dropping the user's field as first
+                // responder), so a synthesised Cmd+V would land nowhere. Hiding the
+                // always-on-top pill returns key to the previously-active window;
+                // after the paste, bring the pill back without re-keying it. Skipped
+                // for empty transcripts (inject is a no-op then).
+                #[cfg(target_os = "macos")]
+                let restore_pill = !text.trim().is_empty();
+                #[cfg(target_os = "macos")]
+                if restore_pill {
+                    set_pill_visible(&app, false);
+                    // Brief: just long enough for key focus to return to the user's
+                    // window before the synthesised paste fires.
+                    std::thread::sleep(std::time::Duration::from_millis(70));
+                }
+                let inject_result = dictation::inject_text(&text);
+                #[cfg(target_os = "macos")]
+                if restore_pill {
+                    // inject_text already waited for the paste keystroke, so the pill
+                    // can float back immediately.
+                    set_pill_visible(&app, true);
+                }
+                inject_result?;
+                Ok(text)
+            });
         match outcome {
             Ok(text) if text.trim().is_empty() => {
                 eprintln!("dictation: no speech detected, nothing inserted");
@@ -1615,7 +1815,10 @@ fn update_dictation_settings(
         settings.dictation_hotkey = dictation_hotkey;
         settings.dictation_polish_enabled = dictation_polish_enabled;
         repository.upsert_settings(&settings, current_time_ms()?)?;
-        (previous_hotkey, hydrate_settings_with_local_defaults(settings))
+        (
+            previous_hotkey,
+            hydrate_settings_with_local_defaults(settings),
+        )
     };
 
     #[cfg(desktop)]
@@ -1642,7 +1845,10 @@ fn run_summary(
             lifecycle.ensure_running()?;
             lifecycle.load(&model)?;
             let summarizer = LmStudioSummarizer::new(
-                LmStudioClient { host: host.to_string(), port },
+                LmStudioClient {
+                    host: host.to_string(),
+                    port,
+                },
                 model,
             );
             let result = summarizer.summarize(&segments, false);
@@ -1651,7 +1857,10 @@ fn run_summary(
         }
         SummarizerProvider::Ollama | SummarizerProvider::Custom => {
             let summarizer = LmStudioSummarizer::new(
-                OpenAiCompatibleClient { host: host.to_string(), port },
+                OpenAiCompatibleClient {
+                    host: host.to_string(),
+                    port,
+                },
                 model,
             );
             summarizer.summarize(&segments, false)
@@ -1923,13 +2132,30 @@ fn apple_script_string_literal(value: &str) -> String {
 }
 
 #[tauri::command]
-fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<RecordingMetadata, AppError> {
+fn stop_recording(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RecordingMetadata, AppError> {
     let stopped_at_ms = current_time_ms()?;
-    let metadata = state
+    let stop_result = state
         .recordings
         .lock()
         .map_err(map_lock_error)?
-        .stop_recording(stopped_at_ms)?;
+        .stop_recording(stopped_at_ms);
+    let metadata = match stop_result {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            // Whatever went wrong, no recording is running after a stop
+            // attempt — so the indicator must not stay on screen. Without
+            // this, an indicator that is visible while no recording is
+            // active (e.g. after a missed hide) has a Stop button that can
+            // never dismiss it: the command errors out with
+            // "recording_not_active" before ever reaching the hide below.
+            #[cfg(target_os = "macos")]
+            set_recording_indicator_visible(&app, false);
+            return Err(error);
+        }
+    };
     let meeting_id = MeetingId::new(metadata.meeting_id.clone());
 
     {
@@ -2006,18 +2232,21 @@ pub fn run() {
             std::fs::create_dir_all(&app_data_dir)?;
             let database_path = app_data_dir.join(SCRIBE_DATABASE_FILE_NAME);
             let repository = SqliteRepository::open(&database_path)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.message))?;
+                .map_err(|error| std::io::Error::other(error.message))?;
             let saved_settings = repository
                 .get_settings()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.message))?;
+                .map_err(|error| std::io::Error::other(error.message))?;
             let hydrated_settings = hydrate_settings_with_local_defaults(saved_settings.clone());
             if hydrated_settings != saved_settings {
                 repository
-                    .upsert_settings(&hydrated_settings, current_time_ms().map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::Other, error.message)
-                    })?)
+                    .upsert_settings(
+                        &hydrated_settings,
+                        current_time_ms().map_err(|error| {
+                            std::io::Error::other(error.message)
+                        })?,
+                    )
                     .map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::Other, error.message)
+                        std::io::Error::other(error.message)
                     })?;
             }
             app.manage(AppState {
@@ -2100,7 +2329,13 @@ pub fn run() {
                     eprintln!("meeting_popup_create_failed: {error}");
                 }
                 #[cfg(target_os = "macos")]
-                make_window_non_activating(app.handle(), MEETING_POPUP_WINDOW);
+                {
+                    make_window_non_activating(app.handle(), MEETING_POPUP_WINDOW);
+                    // Built visible (see create_meeting_popup's doc comment) and
+                    // stays ordered front forever -- "hidden" moves it off-screen
+                    // instead (see set_positioned_panel_visible's doc comment).
+                    set_meeting_popup_visible(app.handle(), false);
+                }
             }
 
             #[cfg(desktop)]
@@ -2112,16 +2347,21 @@ pub fn run() {
                     eprintln!("recording_indicator_create_failed: {error}");
                 }
                 #[cfg(target_os = "macos")]
-                make_window_non_activating(app.handle(), RECORDING_INDICATOR_WINDOW);
+                {
+                    make_window_non_activating(app.handle(), RECORDING_INDICATOR_WINDOW);
+                    set_recording_indicator_visible(app.handle(), false);
+                }
             }
 
             #[cfg(desktop)]
             {
                 // Register the saved dictation hotkey (double-press to start, single
                 // press to stop). Configurable from Settings.
-                if let Err(error) =
-                    register_dictation_hotkey(app.handle(), None, &hydrated_settings.dictation_hotkey)
-                {
+                if let Err(error) = register_dictation_hotkey(
+                    app.handle(),
+                    None,
+                    &hydrated_settings.dictation_hotkey,
+                ) {
                     eprintln!("{}: {}", error.code, error.message);
                 }
                 // Register the polish-selection hotkey (single press): polishes
@@ -2646,7 +2886,7 @@ fn delete_retained_audio_files(
     };
 
     for metadata in expired_metadata {
-        for file_path in retention_file_paths(&metadata) {
+        for file_path in retention_file_paths(metadata) {
             match delete_retained_audio_file(&file_path, app_data_dir)? {
                 RetainedAudioDeleteOutcome::Deleted => {
                     summary.deleted_audio_file_count += 1;
