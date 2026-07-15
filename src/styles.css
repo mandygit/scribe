@@ -311,6 +311,17 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+}
+/* The title text itself is a button (click or Enter starts renaming) but
+   must look exactly like plain heading text. */
+.title-text-btn {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
   cursor: text;
 }
 .title-edit-btn {
@@ -325,7 +336,8 @@ button {
   opacity: 0;
   transition: opacity 0.1s ease;
 }
-.meeting-title-display:hover .title-edit-btn {
+.meeting-title-display:hover .title-edit-btn,
+.meeting-title-display:focus-within .title-edit-btn {
   opacity: 1;
 }
 .meeting-title-input {

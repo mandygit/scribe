@@ -910,6 +910,13 @@ function MeetingDetailView({
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(meetingTitle(meeting));
+  const titleInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (isEditingTitle) {
+      titleInputRef.current?.focus();
+    }
+  }, [isEditingTitle]);
 
   useEffect(() => {
     if (!isEditingTitle) {
@@ -941,10 +948,10 @@ function MeetingDetailView({
         <div>
           {isEditingTitle ? (
             <input
+              ref={titleInputRef}
               type="text"
               className="meeting-title-input"
               value={titleDraft}
-              autoFocus
               onChange={(event) => setTitleDraft(event.target.value)}
               onBlur={commitTitle}
               onKeyDown={(event) => {
@@ -957,16 +964,15 @@ function MeetingDetailView({
               }}
             />
           ) : (
-            <h1 className="meeting-title-display" onClick={() => setIsEditingTitle(true)}>
-              {meetingTitle(meeting)}
+            <h1 className="meeting-title-display">
+              <button type="button" className="title-text-btn" onClick={() => setIsEditingTitle(true)}>
+                {meetingTitle(meeting)}
+              </button>
               <button
                 type="button"
                 className="title-edit-btn"
                 aria-label="Rename meeting"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  setIsEditingTitle(true);
-                }}
+                onClick={() => setIsEditingTitle(true)}
               >
                 <Icon name="edit" size={13} />
               </button>
@@ -1413,9 +1419,7 @@ function SettingsView({
           </div>
           <select
             value={settings.themePreference}
-            onChange={(event) =>
-              void saveTheme(event.target.value as ScribeSettings['themePreference'])
-            }
+            onChange={(event) => void saveTheme(event.target.value as ScribeSettings['themePreference'])}
           >
             {THEME_PREFERENCES.map((option) => (
               <option key={option.value} value={option.value}>
