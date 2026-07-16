@@ -64,6 +64,7 @@ const FALLBACK_SETTINGS: ScribeSettings = {
   cloudVideoReviewEnabled: false,
   transcriberBinPath: null,
   transcriberModelPath: null,
+  transcriberVocabulary: null,
   speakerEmbeddingModelPath: null,
   speakerSegmentationModelPath: null,
   dictationHotkey: 'ctrl+option+d',
@@ -1249,6 +1250,7 @@ function SettingsView({
 }) {
   const [transcriberBin, setTranscriberBin] = useState(settings.transcriberBinPath ?? '');
   const [transcriberModel, setTranscriberModel] = useState(settings.transcriberModelPath ?? '');
+  const [transcriberVocabulary, setTranscriberVocabulary] = useState(settings.transcriberVocabulary ?? '');
   const [summarizerHostInput, setSummarizerHostInput] = useState(settings.summarizerHost);
   const [summarizerPortInput, setSummarizerPortInput] = useState(String(settings.summarizerPort));
   const [summarizerModelInput, setSummarizerModelInput] = useState(settings.summarizerModel ?? '');
@@ -1384,12 +1386,13 @@ function SettingsView({
       const updated = await updateTranscriberSettings(
         transcriberBin.trim() || null,
         transcriberModel.trim() || null,
+        transcriberVocabulary.trim() || null,
         settings.speakerEmbeddingModelPath,
         settings.speakerSegmentationModelPath,
       );
       onSettings(updated);
     } catch (cause) {
-      onError(messageFromUnknownError(cause, 'Could not update transcriber paths.'));
+      onError(messageFromUnknownError(cause, 'Could not update transcription settings.'));
     }
   }, [
     onError,
@@ -1398,6 +1401,7 @@ function SettingsView({
     settings.speakerSegmentationModelPath,
     transcriberBin,
     transcriberModel,
+    transcriberVocabulary,
   ]);
 
   return (
@@ -1436,7 +1440,10 @@ function SettingsView({
         <div className="field">
           <div>
             <div className="field-label">Microphone</div>
-            <p className="field-desc">Used as your voice channel.</p>
+            <p className="field-desc">
+              Used as your voice channel. System default prefers the built-in mic over low-quality Bluetooth headset
+              mics; pick a device to override.
+            </p>
           </div>
           <select
             value={settings.microphoneDeviceId ?? ''}
@@ -1669,9 +1676,25 @@ function SettingsView({
             onChange={(event) => setTranscriberModel(event.target.value)}
           />
         </div>
+        <div className="field">
+          <div>
+            <div className="field-label">Custom vocabulary</div>
+            <p className="field-desc">
+              Product names and jargon whisper should spell correctly, separated by commas (e.g. SymbioRAG, Jira).
+              Applies to meetings and dictation.
+            </p>
+          </div>
+          <textarea
+            value={transcriberVocabulary}
+            placeholder="SymbioRAG, Jira, Confluence"
+            rows={3}
+            maxLength={600}
+            onChange={(event) => setTranscriberVocabulary(event.target.value)}
+          />
+        </div>
         <div style={{ marginTop: 12 }}>
           <button type="button" className="primary-btn" onClick={() => void saveTranscriber()}>
-            Save transcription paths
+            Save transcription settings
           </button>
         </div>
       </section>

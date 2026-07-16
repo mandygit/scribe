@@ -30,6 +30,7 @@ export interface ScribeSettings {
   cloudVideoReviewEnabled: boolean;
   transcriberBinPath: string | null;
   transcriberModelPath: string | null;
+  transcriberVocabulary: string | null;
   speakerEmbeddingModelPath: string | null;
   speakerSegmentationModelPath: string | null;
   dictationHotkey: string;

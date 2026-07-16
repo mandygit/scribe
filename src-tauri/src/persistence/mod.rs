@@ -1209,7 +1209,8 @@ impl SqliteRepository {
                     summarizer_model,
                     theme_preference,
                     polish_selection_hotkey,
-                    prompt_on_teams_meeting
+                    prompt_on_teams_meeting,
+                    transcriber_vocabulary
                 FROM settings
                 WHERE id = ?1",
                 params![SETTINGS_ID],
@@ -1251,8 +1252,9 @@ impl SqliteRepository {
                     theme_preference,
                     polish_selection_hotkey,
                     prompt_on_teams_meeting,
+                    transcriber_vocabulary,
                     updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
                 ON CONFLICT(id) DO UPDATE SET
                     microphone_device_id = excluded.microphone_device_id,
                     enable_system_audio = excluded.enable_system_audio,
@@ -1275,6 +1277,7 @@ impl SqliteRepository {
                     theme_preference = excluded.theme_preference,
                     polish_selection_hotkey = excluded.polish_selection_hotkey,
                     prompt_on_teams_meeting = excluded.prompt_on_teams_meeting,
+                    transcriber_vocabulary = excluded.transcriber_vocabulary,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     SETTINGS_ID,
@@ -1299,6 +1302,7 @@ impl SqliteRepository {
                     theme_preference_to_db(settings.theme_preference),
                     settings.polish_selection_hotkey.as_str(),
                     bool_to_db(settings.prompt_on_teams_meeting),
+                    settings.transcriber_vocabulary.as_deref(),
                     to_db_i64(updated_at_ms)?,
                 ],
             )
@@ -1468,6 +1472,7 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
 
     ensure_settings_column(connection, "transcriber_bin_path", "TEXT")?;
     ensure_settings_column(connection, "transcriber_model_path", "TEXT")?;
+    ensure_settings_column(connection, "transcriber_vocabulary", "TEXT")?;
     ensure_settings_column(connection, "speaker_embedding_model_path", "TEXT")?;
     ensure_settings_column(connection, "speaker_segmentation_model_path", "TEXT")?;
     ensure_settings_column(
@@ -1988,6 +1993,7 @@ fn read_settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScribeSettings> {
         theme_preference: theme_preference_from_db(row.get::<_, String>(18)?, 18)?,
         polish_selection_hotkey: row.get(19)?,
         prompt_on_teams_meeting: db_to_bool(row.get(20)?, 20)?,
+        transcriber_vocabulary: row.get(21)?,
     })
 }
 
@@ -2776,6 +2782,7 @@ mod tests {
             cloud_video_review_enabled: true,
             transcriber_bin_path: Some("/opt/homebrew/bin/whisper-cli".to_string()),
             transcriber_model_path: Some("/models/base.bin".to_string()),
+            transcriber_vocabulary: Some("SymbioRAG, Jira".to_string()),
             speaker_embedding_model_path: Some("/models/speaker.onnx".to_string()),
             speaker_segmentation_model_path: Some("/models/segmentation.onnx".to_string()),
             dictation_hotkey: "ctrl+option+d".to_string(),
@@ -2799,6 +2806,7 @@ mod tests {
             cloud_video_review_enabled: false,
             transcriber_bin_path: Some("/usr/local/bin/whisper-cli".to_string()),
             transcriber_model_path: Some("/models/small-q5_1.bin".to_string()),
+            transcriber_vocabulary: None,
             speaker_embedding_model_path: Some("/models/speaker-v2.onnx".to_string()),
             speaker_segmentation_model_path: Some("/models/segmentation-v2.onnx".to_string()),
             dictation_hotkey: "cmd+shift+space".to_string(),

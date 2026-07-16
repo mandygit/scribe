@@ -250,6 +250,11 @@ impl<T: TranscriptEventSink, N: NudgeEventSink> TranscriptEventSink
 {
     fn emit_segment(&mut self, event: TranscriptStreamEvent) -> Result<(), AppError> {
         self.transcript_sink.emit_segment(event.clone())?;
+        // Nudges coach the user's own speaking; remote participants' segments
+        // from the system-audio track must not trigger them.
+        if !crate::transcription::is_user_segment(event.segment.speaker_label.as_deref()) {
+            return Ok(());
+        }
         for nudge in self.pipeline.process_segment(&event) {
             if let Err(error) = self.nudge_sink.emit_nudge(nudge) {
                 eprintln!(

@@ -172,12 +172,14 @@ export const updatePrivacySettings = async (
 export const updateTranscriberSettings = async (
   transcriberBinPath: string | null,
   transcriberModelPath: string | null,
+  transcriberVocabulary: string | null,
   speakerEmbeddingModelPath: string | null,
   speakerSegmentationModelPath: string | null,
 ): Promise<ScribeSettings> =>
   invokeNative<ScribeSettings>('update_transcriber_settings', {
     transcriberBinPath,
     transcriberModelPath,
+    transcriberVocabulary,
     speakerEmbeddingModelPath,
     speakerSegmentationModelPath,
   });

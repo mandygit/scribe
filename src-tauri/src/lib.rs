@@ -554,9 +554,12 @@ async fn transcribe_meeting(
     // tie up the invoke thread for the whole duration, the way it used to
     // when "stop meeting" awaited this synchronously.
     let transcription_output = tauri::async_runtime::spawn_blocking(move || {
-        let audio_path =
-            select_transcription_audio_path(&settings, &metadata, &SpeexEchoCancellationBackend);
-        transcribe_audio_with_retry(&transcriber, std::path::Path::new(&audio_path))
+        transcribe_meeting_tracks(
+            &settings,
+            &metadata,
+            &transcriber,
+            &SpeexEchoCancellationBackend,
+        )
     })
     .await
     .map_err(|error| AppError {
@@ -1928,18 +1931,38 @@ fn open_permission_settings(pane: String) -> Result<(), AppError> {
     permissions::open_system_settings_pane(&pane)
 }
 
+/// Longest accepted vocabulary text. Whisper truncates carried prompts to
+/// half its text context anyway, so anything longer would silently lose terms.
+const MAX_TRANSCRIBER_VOCABULARY_CHARS: usize = 600;
+
 #[tauri::command]
 fn update_transcriber_settings(
     state: State<'_, AppState>,
     transcriber_bin_path: Option<String>,
     transcriber_model_path: Option<String>,
+    transcriber_vocabulary: Option<String>,
     speaker_embedding_model_path: Option<String>,
     speaker_segmentation_model_path: Option<String>,
 ) -> Result<ScribeSettings, AppError> {
+    let transcriber_vocabulary = transcriber_vocabulary
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(vocabulary) = &transcriber_vocabulary {
+        if vocabulary.chars().count() > MAX_TRANSCRIBER_VOCABULARY_CHARS {
+            return Err(AppError {
+                code: "invalid_transcriber_vocabulary".to_string(),
+                message: format!(
+                    "Vocabulary is too long; keep it under {MAX_TRANSCRIBER_VOCABULARY_CHARS} characters."
+                ),
+                details: Some(format!("length={}", vocabulary.chars().count())),
+            });
+        }
+    }
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let mut settings = repository.get_settings()?;
     settings.transcriber_bin_path = normalize_optional_path(transcriber_bin_path);
     settings.transcriber_model_path = normalize_optional_path(transcriber_model_path);
+    settings.transcriber_vocabulary = transcriber_vocabulary;
     settings.speaker_embedding_model_path = normalize_optional_path(speaker_embedding_model_path);
     settings.speaker_segmentation_model_path =
         normalize_optional_path(speaker_segmentation_model_path);
@@ -2520,6 +2543,44 @@ fn load_meeting_audio_metadata(
         })
 }
 
+/// Transcribes the microphone track (echo-cancelled when possible) and, when
+/// a system-audio track was recorded, the remote participants' track as well,
+/// merging both into one speaker-labeled timeline. The system track is the
+/// only place remote voices exist when the user wears headphones, so skipping
+/// it would silently drop everyone else from the transcript. A system-track
+/// failure degrades to the microphone-only transcript instead of failing the
+/// whole meeting, mirroring how recording falls back when system capture
+/// cannot start.
+fn transcribe_meeting_tracks(
+    settings: &ScribeSettings,
+    metadata: &AudioMetadata,
+    transcriber: &impl transcription::Transcriber,
+    echo_cancellation: &impl EchoCancellationBackend,
+) -> Result<TranscriptionOutput, AppError> {
+    let microphone_audio_path =
+        select_transcription_audio_path(settings, metadata, echo_cancellation);
+    let microphone_output =
+        transcribe_audio_with_retry(transcriber, std::path::Path::new(&microphone_audio_path))?;
+
+    let Some(system_audio_file_path) = metadata.system_audio_file_path.as_deref() else {
+        return Ok(microphone_output);
+    };
+    match transcribe_audio_with_retry(transcriber, std::path::Path::new(system_audio_file_path)) {
+        Ok(system_output) => {
+            transcription::merge_dual_track_outputs(microphone_output, system_output)
+        }
+        Err(error) => {
+            eprintln!(
+                "System audio transcription failed for meeting {}: code={}, message={}; keeping the microphone-only transcript",
+                metadata.meeting_id.as_str(),
+                error.code,
+                error.message
+            );
+            Ok(microphone_output)
+        }
+    }
+}
+
 fn select_transcription_audio_path(
     settings: &ScribeSettings,
     metadata: &AudioMetadata,
@@ -2633,9 +2694,12 @@ fn calculate_metrics_for_meeting(
         })?;
     ensure_deterministic_metrics_are_absent(repository, meeting_id)?;
 
+    // Metrics coach the user's own speaking (talk time, pace, filler words),
+    // so segments attributed to remote participants must not count.
     let segments = repository
         .list_transcript_segments(meeting_id)?
         .into_iter()
+        .filter(|segment| transcription::is_user_segment(segment.speaker_label.as_deref()))
         .map(|segment| RuleTranscriptSegment {
             text: segment.text,
             started_at_ms: segment.started_at_ms,
@@ -3333,6 +3397,137 @@ mod tests {
             select_transcription_audio_path(&settings, &metadata, &echo_cancellation);
 
         assert_eq!(selected_path, metadata.file_path);
+    }
+
+    struct TrackAwareTranscriber {
+        system_result: Result<TranscriptionOutput, AppError>,
+    }
+
+    impl transcription::Transcriber for TrackAwareTranscriber {
+        fn transcribe(&self, audio_path: &Path) -> Result<TranscriptionOutput, AppError> {
+            if audio_path.to_string_lossy().contains(".system.") {
+                return self.system_result.clone();
+            }
+            Ok(TranscriptionOutput {
+                segments: vec![TranscriptSegment {
+                    sequence_number: 1,
+                    speaker_label: None,
+                    text: "Mic point.".to_string(),
+                    started_at_ms: 0,
+                    ended_at_ms: 1_000,
+                }],
+            })
+        }
+    }
+
+    fn settings_without_echo_cancellation() -> ScribeSettings {
+        ScribeSettings {
+            enable_echo_cancellation: false,
+            ..ScribeSettings::default()
+        }
+    }
+
+    fn unused_echo_cancellation() -> StubEchoCancellation {
+        StubEchoCancellation {
+            calls: AtomicU8::new(0),
+            result: Ok(PathBuf::from("/tmp/scribe/unused.aec.wav")),
+        }
+    }
+
+    #[test]
+    fn transcribe_meeting_tracks_merges_system_track_with_speaker_labels() {
+        let metadata = audio_metadata_with_system_reference("meeting-dual-track");
+        let transcriber = TrackAwareTranscriber {
+            system_result: Ok(TranscriptionOutput {
+                segments: vec![TranscriptSegment {
+                    sequence_number: 1,
+                    speaker_label: None,
+                    text: "Remote point.".to_string(),
+                    started_at_ms: 500,
+                    ended_at_ms: 900,
+                }],
+            }),
+        };
+
+        let output = transcribe_meeting_tracks(
+            &settings_without_echo_cancellation(),
+            &metadata,
+            &transcriber,
+            &unused_echo_cancellation(),
+        )
+        .expect("dual-track transcription succeeds");
+
+        assert_eq!(
+            output
+                .segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.sequence_number,
+                        segment.speaker_label.as_deref(),
+                        segment.text.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some(transcription::USER_SPEAKER_LABEL), "Mic point."),
+                (
+                    2,
+                    Some(transcription::OTHERS_SPEAKER_LABEL),
+                    "Remote point."
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn transcribe_meeting_tracks_keeps_mic_transcript_when_system_track_fails() {
+        let metadata = audio_metadata_with_system_reference("meeting-dual-track-fallback");
+        let transcriber = TrackAwareTranscriber {
+            system_result: Err(AppError {
+                code: "transcription_audio_conversion_failed".to_string(),
+                message: "ffmpeg could not convert the audio file for transcription.".to_string(),
+                details: None,
+            }),
+        };
+
+        let output = transcribe_meeting_tracks(
+            &settings_without_echo_cancellation(),
+            &metadata,
+            &transcriber,
+            &unused_echo_cancellation(),
+        )
+        .expect("microphone transcript survives a system-track failure");
+
+        assert_eq!(output.segments.len(), 1);
+        assert_eq!(output.segments[0].text, "Mic point.");
+        assert_eq!(output.segments[0].speaker_label, None);
+    }
+
+    #[test]
+    fn transcribe_meeting_tracks_stays_mic_only_without_system_audio() {
+        let metadata = AudioMetadata {
+            system_audio_file_path: None,
+            ..audio_metadata_with_system_reference("meeting-mic-only")
+        };
+        let transcriber = TrackAwareTranscriber {
+            system_result: Err(AppError {
+                code: "system_track_must_not_be_transcribed".to_string(),
+                message: "The system track must not be requested without a recording.".to_string(),
+                details: None,
+            }),
+        };
+
+        let output = transcribe_meeting_tracks(
+            &settings_without_echo_cancellation(),
+            &metadata,
+            &transcriber,
+            &unused_echo_cancellation(),
+        )
+        .expect("microphone-only transcription succeeds");
+
+        assert_eq!(output.segments.len(), 1);
+        assert_eq!(output.segments[0].speaker_label, None);
     }
 
     #[test]

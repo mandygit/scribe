@@ -15,8 +15,24 @@ const HOMEBREW_WHISPER_PATHS: &[&str] = &[
     "/usr/local/bin/whisper-cli",
 ];
 const MAX_WHISPER_JSON_BYTES: u64 = 16 * 1024 * 1024;
+const WHISPER_INPUT_SAMPLE_RATE_HZ: u32 = 16_000;
 pub const TRANSCRIPT_SEGMENT_EVENT: &str = "scribe://transcript-segment";
 pub const TRANSCRIPT_STREAM_COMPLETE_EVENT: &str = "scribe://transcript-stream-complete";
+
+/// Speaker label for microphone-track segments in dual-track transcripts.
+pub const USER_SPEAKER_LABEL: &str = "You";
+/// Speaker label for system-audio-track segments (remote participants).
+pub const OTHERS_SPEAKER_LABEL: &str = "Others";
+
+/// Whether a segment belongs to the user for coaching purposes (metrics,
+/// nudges). Unlabeled segments come from microphone-only transcripts and
+/// count as the user's.
+pub fn is_user_segment(speaker_label: Option<&str>) -> bool {
+    match speaker_label {
+        None => true,
+        Some(label) => label == USER_SPEAKER_LABEL,
+    }
+}
 
 /// Strategy interface for batch transcription providers.
 pub trait Transcriber {
@@ -148,6 +164,7 @@ impl<T: Transcriber> StreamingTranscriber for BatchReplayStreamingTranscriber<T>
 pub struct WhisperShellTranscriber {
     binary_path: PathBuf,
     model_path: PathBuf,
+    vocabulary_prompt: Option<String>,
 }
 
 impl WhisperShellTranscriber {
@@ -156,6 +173,8 @@ impl WhisperShellTranscriber {
             Some(path) => validate_binary_path(Path::new(path))?,
             None => resolve_default_binary_path()?,
         };
+        let vocabulary_prompt =
+            normalized_vocabulary_prompt(settings.transcriber_vocabulary.as_deref());
         let model_path = settings
             .transcriber_model_path
             .as_deref()
@@ -174,6 +193,7 @@ impl WhisperShellTranscriber {
         Ok(Self {
             binary_path,
             model_path,
+            vocabulary_prompt,
         })
     }
 
@@ -184,6 +204,7 @@ impl WhisperShellTranscriber {
         Ok(Self {
             binary_path: validate_binary_path(&binary_path.into())?,
             model_path: validate_model_path(&model_path.into())?,
+            vocabulary_prompt: None,
         })
     }
 }
@@ -198,12 +219,36 @@ impl Transcriber for WhisperShellTranscriber {
                 Some(error.to_string()),
             )
         })?;
+        let whisper_input = prepare_whisper_input(&audio_path, output_dir.path())?;
         let output_stem = output_dir.path().join("transcript");
-        let output = Command::new(&self.binary_path)
+        let mut command = Command::new(&self.binary_path);
+        command
             .arg("-m")
             .arg(&self.model_path)
             .arg("-f")
-            .arg(audio_path)
+            .arg(&whisper_input);
+        // Rolling text context must never survive between decode windows:
+        // with carryover, a stretch of non-speech audio (music playing before
+        // a meeting starts) locks the decoder into repeating "[Music]" for
+        // the remainder of the file. Without a vocabulary that is "-mc 0".
+        // With one, "-mc" is sized to the glossary prompt itself: whisper.cpp
+        // fills the context budget with the carried initial prompt first and
+        // only gives rolling context the leftover, so a budget the size of
+        // the prompt keeps the bias while starving carryover to zero.
+        match &self.vocabulary_prompt {
+            Some(prompt) => {
+                command
+                    .arg("-mc")
+                    .arg(vocabulary_max_context(prompt).to_string())
+                    .arg("--prompt")
+                    .arg(prompt)
+                    .arg("--carry-initial-prompt");
+            }
+            None => {
+                command.arg("-mc").arg("0");
+            }
+        }
+        let output = command
             .arg("-ojf")
             .arg("-of")
             .arg(&output_stem)
@@ -227,6 +272,124 @@ impl Transcriber for WhisperShellTranscriber {
         let json_path = output_stem.with_extension("json");
         read_whisper_json_file(&json_path)
     }
+}
+
+/// Turns the user's raw vocabulary text (comma- or newline-separated terms)
+/// into the whisper initial prompt, e.g. "Glossary: SymbioRAG, Jira.".
+/// Returns `None` when there are no usable terms.
+pub fn normalized_vocabulary_prompt(raw: Option<&str>) -> Option<String> {
+    let terms: Vec<&str> = raw?
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(format!("Glossary: {}.", terms.join(", ")))
+}
+
+/// Text-context budget sized to the vocabulary prompt: a conservative token
+/// estimate (BPE averages under four characters per token for product names)
+/// so the carried prompt consumes the whole "-mc" budget and rolling context
+/// gets nothing. Underestimating only trims the glossary's leading terms;
+/// overestimating would leak rolling context back in.
+fn vocabulary_max_context(prompt: &str) -> usize {
+    prompt.chars().count() / 4 + 1
+}
+
+/// whisper-cli only decodes WAV input, so compressed sources (the system
+/// audio m4a, imported mp3/ogg files) are converted to 16 kHz mono WAV first.
+fn prepare_whisper_input(audio_path: &Path, temp_dir: &Path) -> Result<PathBuf, AppError> {
+    if path_has_extension(audio_path, "wav") {
+        return Ok(audio_path.to_path_buf());
+    }
+
+    let converted_path = temp_dir.join("whisper-input.wav");
+    let ffmpeg_path = crate::media_import::resolve_ffmpeg_path(None)?;
+    let output = Command::new(ffmpeg_path)
+        .arg("-y")
+        .arg("-i")
+        .arg(audio_path)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg(WHISPER_INPUT_SAMPLE_RATE_HZ.to_string())
+        .arg("-sample_fmt")
+        .arg("s16")
+        .arg("-f")
+        .arg("wav")
+        .arg(&converted_path)
+        .output()
+        .map_err(|error| {
+            transcription_error(
+                "transcription_audio_conversion_failed",
+                "Could not start ffmpeg to convert audio for transcription.",
+                Some(error.to_string()),
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(transcription_error(
+            "transcription_audio_conversion_failed",
+            "ffmpeg could not convert the audio file for transcription.",
+            Some(format!(
+                "path={}, stderr={}",
+                audio_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        ));
+    }
+
+    Ok(converted_path)
+}
+
+fn path_has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+}
+
+/// Merges the microphone and system-audio transcripts into one timeline.
+/// Microphone segments are attributed to the user; system-audio segments to
+/// the remote participants, since the system track is the output mix that the
+/// user's own voice never enters.
+pub fn merge_dual_track_outputs(
+    microphone: TranscriptionOutput,
+    system: TranscriptionOutput,
+) -> Result<TranscriptionOutput, AppError> {
+    let mut segments: Vec<TranscriptSegment> = microphone
+        .segments
+        .into_iter()
+        .map(|segment| TranscriptSegment {
+            speaker_label: Some(USER_SPEAKER_LABEL.to_string()),
+            ..segment
+        })
+        .chain(
+            system
+                .segments
+                .into_iter()
+                .map(|segment| TranscriptSegment {
+                    speaker_label: Some(OTHERS_SPEAKER_LABEL.to_string()),
+                    ..segment
+                }),
+        )
+        .collect();
+    segments.sort_by_key(|segment| (segment.started_at_ms, segment.ended_at_ms));
+
+    for (index, segment) in segments.iter_mut().enumerate() {
+        segment.sequence_number = u32::try_from(index + 1).map_err(|error| {
+            transcription_error(
+                "too_many_transcript_segments",
+                "Transcription produced too many transcript segments.",
+                Some(error.to_string()),
+            )
+        })?;
+    }
+
+    Ok(TranscriptionOutput { segments })
 }
 
 pub fn replay_transcription_output(
@@ -698,6 +861,132 @@ mod tests {
         let unsupported_error = validate_audio_path(&unsupported_path)
             .expect_err("unsupported extensions are rejected");
         assert_eq!(unsupported_error.code, "unsupported_audio_format");
+    }
+
+    #[test]
+    fn merge_dual_track_outputs_interleaves_by_time_and_labels_speakers() {
+        let microphone = TranscriptionOutput {
+            segments: vec![
+                TranscriptSegment {
+                    sequence_number: 1,
+                    speaker_label: None,
+                    text: "My first point.".to_string(),
+                    started_at_ms: 0,
+                    ended_at_ms: 1_000,
+                },
+                TranscriptSegment {
+                    sequence_number: 2,
+                    speaker_label: None,
+                    text: "My reply.".to_string(),
+                    started_at_ms: 5_000,
+                    ended_at_ms: 6_000,
+                },
+            ],
+        };
+        let system = TranscriptionOutput {
+            segments: vec![TranscriptSegment {
+                sequence_number: 1,
+                speaker_label: None,
+                text: "Their answer.".to_string(),
+                started_at_ms: 2_000,
+                ended_at_ms: 4_500,
+            }],
+        };
+
+        let merged =
+            merge_dual_track_outputs(microphone, system).expect("dual track outputs merge");
+
+        assert_eq!(
+            merged
+                .segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.sequence_number,
+                        segment.speaker_label.as_deref(),
+                        segment.text.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some(USER_SPEAKER_LABEL), "My first point."),
+                (2, Some(OTHERS_SPEAKER_LABEL), "Their answer."),
+                (3, Some(USER_SPEAKER_LABEL), "My reply."),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_dual_track_outputs_keeps_microphone_first_on_timestamp_ties() {
+        let segment = TranscriptSegment {
+            sequence_number: 1,
+            speaker_label: None,
+            text: "Same start.".to_string(),
+            started_at_ms: 1_000,
+            ended_at_ms: 2_000,
+        };
+        let microphone = TranscriptionOutput {
+            segments: vec![segment.clone()],
+        };
+        let system = TranscriptionOutput {
+            segments: vec![segment],
+        };
+
+        let merged =
+            merge_dual_track_outputs(microphone, system).expect("dual track outputs merge");
+
+        assert_eq!(
+            merged
+                .segments
+                .iter()
+                .map(|segment| segment.speaker_label.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(USER_SPEAKER_LABEL), Some(OTHERS_SPEAKER_LABEL)]
+        );
+    }
+
+    #[test]
+    fn vocabulary_prompt_normalizes_commas_newlines_and_blanks() {
+        assert_eq!(
+            normalized_vocabulary_prompt(Some("SymbioRAG, Jira\n Snyk ,,\n")),
+            Some("Glossary: SymbioRAG, Jira, Snyk.".to_string())
+        );
+        assert_eq!(normalized_vocabulary_prompt(Some("  , \n ")), None);
+        assert_eq!(normalized_vocabulary_prompt(None), None);
+    }
+
+    #[test]
+    fn vocabulary_max_context_stays_at_or_below_prompt_token_count() {
+        // Every whisper BPE token covers at least one character, and product
+        // names average well under four characters per token, so chars/4 + 1
+        // must stay a safe underestimate that leaves no rolling-context room.
+        let prompt = normalized_vocabulary_prompt(Some("SymbioRAG, Jira, Snyk, Langflow"))
+            .expect("prompt is built");
+        let budget = vocabulary_max_context(&prompt);
+        assert!(budget >= 1);
+        assert!(budget <= prompt.split_whitespace().count() * 3);
+    }
+
+    #[test]
+    fn user_segments_are_unlabeled_or_labeled_as_user() {
+        assert!(is_user_segment(None));
+        assert!(is_user_segment(Some(USER_SPEAKER_LABEL)));
+        assert!(!is_user_segment(Some(OTHERS_SPEAKER_LABEL)));
+    }
+
+    #[test]
+    fn prepare_whisper_input_passes_wav_files_through_untouched() {
+        let temp_dir = std::env::current_dir()
+            .expect("current dir exists")
+            .join("target/test-data/transcription/whisper-input");
+        std::fs::create_dir_all(&temp_dir).expect("test directory can be created");
+        let wav_path = temp_dir.join("already.wav");
+        std::fs::write(&wav_path, b"RIFF fake wav").expect("wav placeholder");
+
+        let prepared =
+            prepare_whisper_input(&wav_path, &temp_dir).expect("wav input needs no conversion");
+
+        assert_eq!(prepared, wav_path);
     }
 
     #[test]

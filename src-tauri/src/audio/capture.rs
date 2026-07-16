@@ -327,13 +327,19 @@ fn select_input_device(
     device_id: Option<&str>,
 ) -> Result<cpal::Device, AppError> {
     match device_id {
-        None => host.default_input_device().ok_or_else(|| {
-            audio_error(
-                "audio_input_device_not_found",
-                "No default microphone input device is available.",
-                None,
-            )
-        }),
+        None => {
+            #[cfg(target_os = "macos")]
+            if let Some(device) = bluetooth_avoiding_input_device(host) {
+                return Ok(device);
+            }
+            host.default_input_device().ok_or_else(|| {
+                audio_error(
+                    "audio_input_device_not_found",
+                    "No default microphone input device is available.",
+                    None,
+                )
+            })
+        }
         Some(id) => cpal::DeviceId::from_str(id)
             .map_err(map_cpal_device_id_error)
             .and_then(|device_id| {
@@ -345,6 +351,208 @@ fn select_input_device(
                     )
                 })
             }),
+    }
+}
+
+/// Picks the built-in microphone when the OS default input is a Bluetooth
+/// hands-free microphone and no device was chosen explicitly. Bluetooth
+/// hands-free input is 16 kHz telephone quality and drags the headset out of
+/// its high-quality playback profile; the built-in microphone hears the same
+/// voice from the room at full quality. An explicit device selection in
+/// settings bypasses this entirely.
+#[cfg(target_os = "macos")]
+fn bluetooth_avoiding_input_device(host: &cpal::Host) -> Option<cpal::Device> {
+    let uid = macos_transport::builtin_input_uid_when_default_is_bluetooth()?;
+    let device = host.device_by_id(&cpal::DeviceId(cpal::HostId::CoreAudio, uid))?;
+    if let Ok(description) = device.description() {
+        eprintln!(
+            "Default input is a Bluetooth hands-free microphone; recording from \"{}\" instead.",
+            description.name()
+        );
+    }
+    Some(device)
+}
+
+/// Minimal CoreAudio bindings to read device transport types, which cpal does
+/// not expose. Everything degrades to `None` (keep the default device) when a
+/// call fails.
+#[cfg(target_os = "macos")]
+mod macos_transport {
+    use std::ffi::{c_char, c_void};
+
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    const SYSTEM_OBJECT: u32 = 1;
+    const SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+    const SCOPE_INPUT: u32 = u32::from_be_bytes(*b"inpt");
+    const ELEMENT_MAIN: u32 = 0;
+    const SELECTOR_DEFAULT_INPUT_DEVICE: u32 = u32::from_be_bytes(*b"dIn ");
+    const SELECTOR_DEVICES: u32 = u32::from_be_bytes(*b"dev#");
+    const SELECTOR_TRANSPORT_TYPE: u32 = u32::from_be_bytes(*b"tran");
+    const SELECTOR_STREAMS: u32 = u32::from_be_bytes(*b"stm#");
+    const SELECTOR_DEVICE_UID: u32 = u32::from_be_bytes(*b"uid ");
+    const TRANSPORT_BUILT_IN: u32 = u32::from_be_bytes(*b"bltn");
+    const TRANSPORT_BLUETOOTH: u32 = u32::from_be_bytes(*b"blue");
+    const TRANSPORT_BLUETOOTH_LE: u32 = u32::from_be_bytes(*b"blea");
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const UID_BUFFER_LEN: usize = 512;
+
+    // No #[link] attributes: CoreAudio and CoreFoundation are already linked
+    // by cpal and the Tauri frameworks, so the symbols resolve without adding
+    // them to the link line again.
+    unsafe extern "C" {
+        fn AudioObjectGetPropertyData(
+            object_id: u32,
+            address: *const AudioObjectPropertyAddress,
+            qualifier_data_size: u32,
+            qualifier_data: *const c_void,
+            data_size: *mut u32,
+            data: *mut c_void,
+        ) -> i32;
+        fn AudioObjectGetPropertyDataSize(
+            object_id: u32,
+            address: *const AudioObjectPropertyAddress,
+            qualifier_data_size: u32,
+            qualifier_data: *const c_void,
+            data_size: *mut u32,
+        ) -> i32;
+    }
+
+    unsafe extern "C" {
+        fn CFStringGetCString(
+            string: *const c_void,
+            buffer: *mut c_char,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFRelease(object: *const c_void);
+    }
+
+    /// UID of the built-in input device, but only when the current default
+    /// input is a Bluetooth microphone. `None` means: keep the default.
+    pub fn builtin_input_uid_when_default_is_bluetooth() -> Option<String> {
+        let default_device = read_u32(SYSTEM_OBJECT, SELECTOR_DEFAULT_INPUT_DEVICE)?;
+        if default_device == 0 {
+            return None;
+        }
+        let transport = read_u32(default_device, SELECTOR_TRANSPORT_TYPE)?;
+        if transport != TRANSPORT_BLUETOOTH && transport != TRANSPORT_BLUETOOTH_LE {
+            return None;
+        }
+
+        all_device_ids()
+            .into_iter()
+            .filter(|device| has_input_streams(*device))
+            .find(|device| read_u32(*device, SELECTOR_TRANSPORT_TYPE) == Some(TRANSPORT_BUILT_IN))
+            .and_then(device_uid)
+    }
+
+    fn global_address(selector: u32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress {
+            selector,
+            scope: SCOPE_GLOBAL,
+            element: ELEMENT_MAIN,
+        }
+    }
+
+    fn read_u32(object_id: u32, selector: u32) -> Option<u32> {
+        let address = global_address(selector);
+        let mut value = 0_u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                object_id,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                (&mut value as *mut u32).cast::<c_void>(),
+            )
+        };
+        (status == 0 && size == std::mem::size_of::<u32>() as u32).then_some(value)
+    }
+
+    fn all_device_ids() -> Vec<u32> {
+        let address = global_address(SELECTOR_DEVICES);
+        let mut size = 0_u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(SYSTEM_OBJECT, &address, 0, std::ptr::null(), &mut size)
+        };
+        if status != 0 || size == 0 {
+            return Vec::new();
+        }
+
+        let mut devices = vec![0_u32; size as usize / std::mem::size_of::<u32>()];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                devices.as_mut_ptr().cast::<c_void>(),
+            )
+        };
+        if status != 0 {
+            return Vec::new();
+        }
+        devices.truncate(size as usize / std::mem::size_of::<u32>());
+        devices
+    }
+
+    fn has_input_streams(device_id: u32) -> bool {
+        let address = AudioObjectPropertyAddress {
+            selector: SELECTOR_STREAMS,
+            scope: SCOPE_INPUT,
+            element: ELEMENT_MAIN,
+        };
+        let mut size = 0_u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(device_id, &address, 0, std::ptr::null(), &mut size)
+        };
+        status == 0 && size > 0
+    }
+
+    fn device_uid(device_id: u32) -> Option<String> {
+        let address = global_address(SELECTOR_DEVICE_UID);
+        let mut cf_string: *const c_void = std::ptr::null();
+        let mut size = std::mem::size_of::<*const c_void>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                (&mut cf_string as *mut *const c_void).cast::<c_void>(),
+            )
+        };
+        if status != 0 || cf_string.is_null() {
+            return None;
+        }
+
+        let mut buffer = vec![0_u8; UID_BUFFER_LEN];
+        let copied = unsafe {
+            CFStringGetCString(
+                cf_string,
+                buffer.as_mut_ptr().cast::<c_char>(),
+                buffer.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+            )
+        };
+        unsafe { CFRelease(cf_string) };
+        if copied == 0 {
+            return None;
+        }
+
+        let terminator = buffer.iter().position(|byte| *byte == 0)?;
+        buffer.truncate(terminator);
+        String::from_utf8(buffer).ok()
     }
 }
 
@@ -424,6 +632,30 @@ mod tests {
 
         assert_eq!(receiver.try_recv().expect("first sample is retained"), 10);
         assert_eq!(dropped_sample_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bluetooth_avoidance_returns_resolvable_builtin_device_or_none() {
+        use cpal::traits::{DeviceTrait, HostTrait};
+
+        // None is the correct answer whenever the default input is not a
+        // Bluetooth microphone; when it is, the returned UID must resolve to
+        // a real capture device so recording cannot fail on the swap.
+        let Some(uid) = macos_transport::builtin_input_uid_when_default_is_bluetooth() else {
+            return;
+        };
+
+        let host = cpal::default_host();
+        let device = host
+            .device_by_id(&cpal::DeviceId(cpal::HostId::CoreAudio, uid))
+            .expect("built-in microphone UID resolves to a cpal device");
+        let description = device.description().expect("device has a description");
+        println!(
+            "bluetooth default input detected; would record from: {}",
+            description.name()
+        );
+        assert!(device.default_input_config().is_ok());
     }
 
     #[test]

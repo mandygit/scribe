@@ -55,10 +55,24 @@ impl EchoCancellationBackend for SpeexEchoCancellationBackend {
         microphone_wav_path: &Path,
         reference_wav_path: &Path,
     ) -> Result<PathBuf, AppError> {
-        let prepared_reference =
-            prepare_reference_audio_for_aec(reference_wav_path, &FfmpegReferenceAudioNormalizer)?;
         let output_path = echo_cancelled_path(microphone_wav_path)?;
-        process_wav_pair(prepared_reference.path(), microphone_wav_path, &output_path)?;
+        let prepared_reference = prepare_audio_for_aec(
+            reference_wav_path,
+            &FfmpegReferenceAudioNormalizer,
+            AEC_REFERENCE_SUFFIX,
+        )?;
+        // Bluetooth hands-free microphones record at 16 kHz, so the mic track
+        // may need the same resampling as the compressed reference.
+        let prepared_microphone = prepare_audio_for_aec(
+            microphone_wav_path,
+            &FfmpegReferenceAudioNormalizer,
+            AEC_MICROPHONE_SUFFIX,
+        )?;
+        process_wav_pair(
+            prepared_reference.path(),
+            prepared_microphone.path(),
+            &output_path,
+        )?;
         Ok(output_path)
     }
 }
@@ -147,31 +161,47 @@ impl Drop for PreparedReferenceAudio {
     }
 }
 
-fn prepare_reference_audio_for_aec(
-    reference_path: &Path,
+const AEC_REFERENCE_SUFFIX: &str = "aec-reference";
+const AEC_MICROPHONE_SUFFIX: &str = "aec-input";
+
+fn prepare_audio_for_aec(
+    source_path: &Path,
     normalizer: &impl ReferenceAudioNormalizer,
+    normalized_suffix: &str,
 ) -> Result<PreparedReferenceAudio, AppError> {
-    if path_has_wav_extension(reference_path) {
-        return Ok(PreparedReferenceAudio::existing(reference_path));
+    if path_has_wav_extension(source_path) && wav_matches_aec_spec(source_path) {
+        return Ok(PreparedReferenceAudio::existing(source_path));
     }
 
-    let normalized_path = normalized_reference_wav_path(reference_path)?;
-    normalizer.normalize_to_wav(reference_path, &normalized_path)?;
+    let normalized_path = normalized_aec_wav_path(source_path, normalized_suffix)?;
+    normalizer.normalize_to_wav(source_path, &normalized_path)?;
     Ok(PreparedReferenceAudio::temporary(normalized_path))
 }
 
-fn normalized_reference_wav_path(reference_path: &Path) -> Result<PathBuf, AppError> {
-    let stem = reference_path
+fn wav_matches_aec_spec(path: &Path) -> bool {
+    WavReader::open(path)
+        .map(|reader| {
+            let spec = reader.spec();
+            spec.channels == EXPECTED_CHANNELS
+                && spec.sample_rate == EXPECTED_SAMPLE_RATE
+                && spec.bits_per_sample == EXPECTED_BITS_PER_SAMPLE
+                && spec.sample_format == SampleFormat::Int
+        })
+        .unwrap_or(false)
+}
+
+fn normalized_aec_wav_path(source_path: &Path, suffix: &str) -> Result<PathBuf, AppError> {
+    let stem = source_path
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or_else(|| AppError {
             code: "aec_invalid_reference_path".to_string(),
-            message: "Could not derive the normalized system audio path for echo cancellation."
+            message: "Could not derive the normalized audio path for echo cancellation."
                 .to_string(),
-            details: Some(format!("path={}", reference_path.display())),
+            details: Some(format!("path={}", source_path.display())),
         })?;
 
-    Ok(reference_path.with_file_name(format!("{stem}.aec-reference.wav")))
+    Ok(source_path.with_file_name(format!("{stem}.{suffix}.wav")))
 }
 
 fn path_has_wav_extension(path: &Path) -> bool {
@@ -543,14 +573,63 @@ mod tests {
         };
 
         {
-            let prepared = prepare_reference_audio_for_aec(&reference_path, &normalizer)
-                .expect("reference audio is normalized");
+            let prepared =
+                prepare_audio_for_aec(&reference_path, &normalizer, AEC_REFERENCE_SUFFIX)
+                    .expect("reference audio is normalized");
             assert_eq!(prepared.path(), expected_path);
             assert!(expected_path.exists());
         }
 
         assert_eq!(normalizer.calls.get(), 1);
         assert!(!expected_path.exists());
+    }
+
+    #[test]
+    fn normalizes_non_48k_microphone_wav_for_aec() {
+        // Bluetooth hands-free microphones record at 16 kHz; that WAV must be
+        // resampled rather than rejected with aec_unsupported_wav_format.
+        let directory = tempdir().expect("temp directory");
+        let microphone_path = directory.path().join("microphone.wav");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer =
+            WavWriter::create(&microphone_path, spec).expect("16 kHz wav can be created");
+        for _ in 0..spec.sample_rate {
+            writer.write_sample(0_i16).expect("sample can be written");
+        }
+        writer.finalize().expect("16 kHz wav can be finalized");
+        let expected_path = directory.path().join("microphone.aec-input.wav");
+        let normalizer = StubReferenceAudioNormalizer {
+            calls: Cell::new(0),
+            samples: vec![0_i16; DEFAULT_FRAME_SIZE],
+        };
+
+        let prepared = prepare_audio_for_aec(&microphone_path, &normalizer, AEC_MICROPHONE_SUFFIX)
+            .expect("16 kHz microphone audio is normalized");
+
+        assert_eq!(prepared.path(), expected_path);
+        assert_eq!(normalizer.calls.get(), 1);
+    }
+
+    #[test]
+    fn keeps_conforming_48k_wav_without_normalizing() {
+        let directory = tempdir().expect("temp directory");
+        let wav_path = directory.path().join("conforming.wav");
+        write_mono_i16_48k(&wav_path, &[0_i16; 480]).expect("48 kHz wav can be written");
+        let normalizer = StubReferenceAudioNormalizer {
+            calls: Cell::new(0),
+            samples: Vec::new(),
+        };
+
+        let prepared = prepare_audio_for_aec(&wav_path, &normalizer, AEC_MICROPHONE_SUFFIX)
+            .expect("conforming audio passes through");
+
+        assert_eq!(prepared.path(), wav_path);
+        assert_eq!(normalizer.calls.get(), 0);
     }
 
     #[test]
