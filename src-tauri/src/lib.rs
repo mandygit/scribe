@@ -445,6 +445,32 @@ fn update_meeting_title(
     repository.update_meeting_title(&meeting_id_value, title_value, updated_at_ms)
 }
 
+/// Labels a meeting with a provisional title (e.g. "Teams Meeting" from the
+/// live-call popup). Unlike `update_meeting_title`, the summarizer's generated
+/// title may still replace it later, and it never overwrites a title the user
+/// chose themselves.
+#[tauri::command]
+fn set_meeting_placeholder_title(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    title: String,
+) -> Result<(), AppError> {
+    validate_recording_file_stem(&meeting_id)?;
+    let meeting_id_value = MeetingId::new(meeting_id);
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(AppError {
+            code: "invalid_placeholder_title".to_string(),
+            message: "A placeholder title cannot be empty.".to_string(),
+            details: None,
+        });
+    }
+
+    let repository = state.repository.lock().map_err(map_lock_error)?;
+    let updated_at_ms = current_time_ms()?;
+    repository.set_meeting_placeholder_title(&meeting_id_value, trimmed, updated_at_ms)
+}
+
 /// Saves the notes the user typed for a meeting (the "Notes" tab). Empty
 /// content clears them.
 #[tauri::command]
@@ -746,7 +772,7 @@ async fn summarize_meeting(
         let repository = state.repository.lock().map_err(map_lock_error)?;
         repository.upsert_meeting_summary(&meeting_id_value, &body_json, generated_at_ms)?;
         if let Some(title) = summary.meeting_title.as_deref() {
-            repository.set_meeting_title_if_absent(&meeting_id_value, title, generated_at_ms)?;
+            repository.set_generated_meeting_title(&meeting_id_value, title, generated_at_ms)?;
         }
         clear_pipeline_failure_after_success(&repository, &meeting_id_value);
     }
@@ -2433,6 +2459,7 @@ pub fn run() {
             get_meeting_history_detail,
             delete_meeting,
             update_meeting_title,
+            set_meeting_placeholder_title,
             update_meeting_user_notes,
             list_meeting_trends,
             list_audio_devices,

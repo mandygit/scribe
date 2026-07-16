@@ -453,7 +453,8 @@ impl SqliteRepository {
 
     /// Overwrites a meeting's title (manual rename). Passing `None` or an
     /// empty title clears it, reverting the meeting to its date-based
-    /// display name in the UI.
+    /// display name in the UI. A user-chosen title is never a placeholder,
+    /// so this also clears the placeholder flag.
     pub fn update_meeting_title(
         &self,
         id: &MeetingId,
@@ -463,7 +464,8 @@ impl SqliteRepository {
         let changed = self
             .connection
             .execute(
-                "UPDATE meetings SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                "UPDATE meetings SET title = ?2, title_is_placeholder = 0, updated_at_ms = ?3
+                WHERE id = ?1",
                 params![id.as_str(), title, to_db_i64(updated_at_ms)?],
             )
             .map_err(map_report_create_error)?;
@@ -478,10 +480,11 @@ impl SqliteRepository {
         Ok(())
     }
 
-    /// Fills in a meeting's title from a model-generated suggestion, but only
-    /// when it doesn't already have one — so this never overwrites a manual
-    /// rename or a title set by an earlier summarization.
-    pub fn set_meeting_title_if_absent(
+    /// Labels a meeting with a provisional title (e.g. "Teams Meeting" from
+    /// the live-call popup). The placeholder flag stays set so a later
+    /// model-generated title can replace it. Never touches a title the user
+    /// chose themselves.
+    pub fn set_meeting_placeholder_title(
         &self,
         id: &MeetingId,
         title: &str,
@@ -489,8 +492,30 @@ impl SqliteRepository {
     ) -> Result<(), AppError> {
         self.connection
             .execute(
-                "UPDATE meetings SET title = ?2, updated_at_ms = ?3
-                WHERE id = ?1 AND (title IS NULL OR trim(title) = '')",
+                "UPDATE meetings SET title = ?2, title_is_placeholder = 1, updated_at_ms = ?3
+                WHERE id = ?1
+                    AND (title IS NULL OR trim(title) = '' OR title_is_placeholder = 1)",
+                params![id.as_str(), title, to_db_i64(updated_at_ms)?],
+            )
+            .map_err(map_report_create_error)?;
+        Ok(())
+    }
+
+    /// Fills in a meeting's title from a model-generated suggestion, but only
+    /// when the meeting is untitled or carries a provisional placeholder - so
+    /// this never overwrites a manual rename or a title set by an earlier
+    /// summarization.
+    pub fn set_generated_meeting_title(
+        &self,
+        id: &MeetingId,
+        title: &str,
+        updated_at_ms: u64,
+    ) -> Result<(), AppError> {
+        self.connection
+            .execute(
+                "UPDATE meetings SET title = ?2, title_is_placeholder = 0, updated_at_ms = ?3
+                WHERE id = ?1
+                    AND (title IS NULL OR trim(title) = '' OR title_is_placeholder = 1)",
                 params![id.as_str(), title, to_db_i64(updated_at_ms)?],
             )
             .map_err(map_report_create_error)?;
@@ -1401,6 +1426,7 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
             CREATE TABLE IF NOT EXISTS meetings (
                 id TEXT PRIMARY KEY,
                 title TEXT,
+                title_is_placeholder INTEGER NOT NULL DEFAULT 0 CHECK (title_is_placeholder IN (0, 1)),
                 started_at_ms INTEGER NOT NULL,
                 stopped_at_ms INTEGER,
                 created_at_ms INTEGER NOT NULL,
@@ -1630,6 +1656,24 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         "prompt_on_teams_meeting",
         "INTEGER NOT NULL DEFAULT 1 CHECK (prompt_on_teams_meeting IN (0, 1))",
     )?;
+    let placeholder_column_added = ensure_column(
+        connection,
+        "meetings",
+        "title_is_placeholder",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (title_is_placeholder IN (0, 1))",
+    )?;
+    if placeholder_column_added {
+        // Before this column existed, the Teams popup labeled meetings with a
+        // literal 'Teams Meeting' title, which then blocked the summarizer's
+        // generated title. Mark those rows as placeholders once so a future
+        // summarization can still name them.
+        connection
+            .execute(
+                "UPDATE meetings SET title_is_placeholder = 1 WHERE title = 'Teams Meeting'",
+                [],
+            )
+            .map_err(map_db_error)?;
+    }
     connection
         .execute(
             "INSERT OR IGNORE INTO schema_versions(version) VALUES (2)",
@@ -1753,15 +1797,17 @@ fn ensure_settings_column(
     column_name: &str,
     column_type: &str,
 ) -> Result<(), AppError> {
-    ensure_column(connection, "settings", column_name, column_type)
+    ensure_column(connection, "settings", column_name, column_type).map(|_| ())
 }
 
+/// Returns `true` when the column was just added, so callers can run one-time
+/// backfills only on the startup that performs the upgrade.
 fn ensure_column(
     connection: &Connection,
     table_name: &str,
     column_name: &str,
     column_type: &str,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     validate_migration_identifier("table_name", table_name)?;
     validate_migration_identifier("column_name", column_name)?;
     validate_migration_column_type(column_type)?;
@@ -1780,12 +1826,12 @@ fn ensure_column(
         .map_err(map_db_error)?;
 
     if column_exists {
-        return Ok(());
+        return Ok(false);
     }
 
     let sql = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}");
     connection.execute(&sql, []).map_err(map_db_error)?;
-    Ok(())
+    Ok(true)
 }
 
 fn validate_migration_identifier(label: &str, value: &str) -> Result<(), AppError> {
@@ -1814,6 +1860,7 @@ fn validate_migration_column_type(column_type: &str) -> Result<(), AppError> {
         | "INTEGER NOT NULL DEFAULT 0 CHECK (cloud_video_review_enabled IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 0 CHECK (dictation_polish_enabled IN (0, 1))"
         | "INTEGER NOT NULL DEFAULT 1 CHECK (prompt_on_teams_meeting IN (0, 1))"
+        | "INTEGER NOT NULL DEFAULT 0 CHECK (title_is_placeholder IN (0, 1))"
         | "TEXT NOT NULL DEFAULT 'lm_studio'"
         | "TEXT NOT NULL DEFAULT '127.0.0.1'"
         | "TEXT NOT NULL DEFAULT 'system'"
@@ -3326,7 +3373,7 @@ mod tests {
     }
 
     #[test]
-    fn set_meeting_title_if_absent_fills_blank_titles_but_never_overwrites() {
+    fn set_generated_meeting_title_fills_blank_titles_but_never_overwrites() {
         let test_repository = repository();
         let untitled = test_repository
             .repository
@@ -3342,7 +3389,7 @@ mod tests {
 
         test_repository
             .repository
-            .set_meeting_title_if_absent(&untitled.id, "Model Suggested Title", 3_000)
+            .set_generated_meeting_title(&untitled.id, "Model Suggested Title", 3_000)
             .expect("title fills in when absent");
         assert_eq!(
             test_repository
@@ -3356,7 +3403,7 @@ mod tests {
 
         test_repository
             .repository
-            .set_meeting_title_if_absent(&untitled.id, "Later Model Title", 4_000)
+            .set_generated_meeting_title(&untitled.id, "Later Model Title", 4_000)
             .expect("re-summarizing does not error");
         assert_eq!(
             test_repository
@@ -3372,7 +3419,7 @@ mod tests {
         let titled = create_test_meeting(&test_repository.repository, "meeting-already-titled");
         test_repository
             .repository
-            .set_meeting_title_if_absent(&titled.id, "Should Not Apply", 3_000)
+            .set_generated_meeting_title(&titled.id, "Should Not Apply", 3_000)
             .expect("call succeeds even though title is already set");
         assert_eq!(
             test_repository
@@ -3383,6 +3430,160 @@ mod tests {
                 .title,
             titled.title,
             "a manually-set or pre-existing title must never be overwritten",
+        );
+    }
+
+    #[test]
+    fn generated_title_replaces_placeholder_but_placeholder_never_replaces_user_title() {
+        let test_repository = repository();
+        let meeting = test_repository
+            .repository
+            .create_meeting(&CreateMeeting {
+                id: MeetingId::new("meeting-teams-popup"),
+                title: None,
+                started_at_ms: 1_000,
+                stopped_at_ms: Some(2_000),
+                created_at_ms: 1_000,
+                updated_at_ms: 2_000,
+            })
+            .expect("meeting can be created");
+
+        test_repository
+            .repository
+            .set_meeting_placeholder_title(&meeting.id, "Teams Meeting", 2_500)
+            .expect("placeholder labels an untitled meeting");
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            Some("Teams Meeting".to_string()),
+        );
+
+        test_repository
+            .repository
+            .set_generated_meeting_title(&meeting.id, "Q3 Budget Review", 3_000)
+            .expect("generated title applies over a placeholder");
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            Some("Q3 Budget Review".to_string()),
+            "a placeholder title must be replaced by the generated one",
+        );
+
+        test_repository
+            .repository
+            .set_meeting_placeholder_title(&meeting.id, "Teams Meeting", 3_500)
+            .expect("placeholder call succeeds even when it does not apply");
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            Some("Q3 Budget Review".to_string()),
+            "a placeholder must never replace a generated or user title",
+        );
+    }
+
+    #[test]
+    fn migration_backfills_placeholder_flag_for_legacy_teams_meeting_titles() {
+        let database = NamedTempFile::new().expect("temp database can be created");
+        {
+            let connection = Connection::open(database.path()).expect("raw connection opens");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE meetings (
+                        id TEXT PRIMARY KEY,
+                        title TEXT,
+                        started_at_ms INTEGER NOT NULL,
+                        stopped_at_ms INTEGER,
+                        created_at_ms INTEGER NOT NULL,
+                        updated_at_ms INTEGER NOT NULL
+                    );
+                    INSERT INTO meetings VALUES
+                        ('legacy-teams', 'Teams Meeting', 1000, 2000, 1000, 2000),
+                        ('legacy-named', 'Weekly design review', 1000, 2000, 1000, 2000);
+                    ",
+                )
+                .expect("legacy schema can be seeded");
+        }
+
+        let repository =
+            SqliteRepository::open(database.path()).expect("migration upgrades the legacy schema");
+
+        repository
+            .set_generated_meeting_title(&MeetingId::new("legacy-teams"), "Q3 Budget Review", 3_000)
+            .expect("generated title call succeeds");
+        assert_eq!(
+            repository
+                .get_meeting(&MeetingId::new("legacy-teams"))
+                .unwrap()
+                .unwrap()
+                .title,
+            Some("Q3 Budget Review".to_string()),
+            "legacy 'Teams Meeting' titles must be backfilled as placeholders",
+        );
+
+        repository
+            .set_generated_meeting_title(&MeetingId::new("legacy-named"), "Should Not Apply", 3_000)
+            .expect("generated title call succeeds");
+        assert_eq!(
+            repository
+                .get_meeting(&MeetingId::new("legacy-named"))
+                .unwrap()
+                .unwrap()
+                .title,
+            Some("Weekly design review".to_string()),
+            "other legacy titles must not be marked as placeholders",
+        );
+    }
+
+    #[test]
+    fn user_rename_clears_placeholder_so_generated_title_no_longer_applies() {
+        let test_repository = repository();
+        let meeting = test_repository
+            .repository
+            .create_meeting(&CreateMeeting {
+                id: MeetingId::new("meeting-renamed-after-popup"),
+                title: None,
+                started_at_ms: 1_000,
+                stopped_at_ms: Some(2_000),
+                created_at_ms: 1_000,
+                updated_at_ms: 2_000,
+            })
+            .expect("meeting can be created");
+
+        test_repository
+            .repository
+            .set_meeting_placeholder_title(&meeting.id, "Teams Meeting", 2_500)
+            .expect("placeholder labels an untitled meeting");
+        test_repository
+            .repository
+            .update_meeting_title(&meeting.id, Some("My Important Sync"), 2_600)
+            .expect("user can rename over a placeholder");
+
+        test_repository
+            .repository
+            .set_generated_meeting_title(&meeting.id, "Model Title", 3_000)
+            .expect("generated title call succeeds even when it does not apply");
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            Some("My Important Sync".to_string()),
+            "a user rename must win over a later generated title",
         );
     }
 

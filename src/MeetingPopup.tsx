@@ -5,8 +5,8 @@ import {
   isTauriRuntime,
   listenToMeetingCallEnded,
   listenToMeetingDetected,
+  setMeetingPlaceholderTitle,
   startRecording,
-  updateMeetingTitle,
 } from './tauri-commands';
 
 /**
@@ -65,8 +65,9 @@ export default function MeetingPopup() {
       try {
         await startRecording(meetingId);
         // Best-effort labeling; a failure here shouldn't undo the recording
-        // that already started.
-        await updateMeetingTitle(meetingId, 'Teams Meeting').catch(() => {});
+        // that already started. A placeholder title, so the summarizer's
+        // generated title can still replace it.
+        await setMeetingPlaceholderTitle(meetingId, 'Teams Meeting').catch(() => {});
       } catch {
         // The main Scribe window's history/recording state is the source of
         // truth if this fails -- the popup itself has nothing further to

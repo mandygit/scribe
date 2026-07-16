@@ -46,8 +46,8 @@ pub struct MeetingSummary {
     pub open_questions: Vec<String>,
     pub speaking_improvements: Vec<SpeakingImprovement>,
     /// Short model-suggested meeting title. Only used to fill in a meeting's
-    /// title when it doesn't already have one — see
-    /// `SqliteRepository::set_meeting_title_if_absent`.
+    /// title when it is untitled or carries a provisional placeholder - see
+    /// `SqliteRepository::set_generated_meeting_title`.
     #[serde(default)]
     pub meeting_title: Option<String>,
 }
