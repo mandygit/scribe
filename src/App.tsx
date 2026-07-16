@@ -45,11 +45,13 @@ import {
   updateDictationSettings,
   updateMeetingDetectionSettings,
   updateMeetingTitle,
+  updateMeetingUserNotes,
   updatePrivacySettings,
   updateSummarizerSettings,
   updateThemePreference,
   updateTranscriberSettings,
 } from './tauri-commands';
+import UserNotesEditor from './UserNotesEditor';
 
 const PERMISSIONS_ONBOARDING_SEEN_KEY = 'scribe-permissions-onboarding-seen';
 
@@ -249,6 +251,15 @@ export default function App() {
     },
     [refreshHistory, requestConfirm, selectedId],
   );
+
+  const handleSaveUserNotes = useCallback(async (meetingId: string, content: string) => {
+    await updateMeetingUserNotes(meetingId, content);
+    setDetail((current) =>
+      current && current.meeting.meetingId === meetingId
+        ? { ...current, userNotes: content.trim() ? content : null }
+        : current,
+    );
+  }, []);
 
   const handleRenameMeeting = useCallback(async (meetingId: string, title: string) => {
     const normalized = title.trim() || null;
@@ -574,6 +585,7 @@ export default function App() {
               onSummarize={() => void handleSummarize(detail.meeting.meetingId)}
               onDelete={() => void handleDeleteMeeting(detail.meeting.meetingId)}
               onRename={(title) => void handleRenameMeeting(detail.meeting.meetingId, title)}
+              onSaveNotes={(content) => handleSaveUserNotes(detail.meeting.meetingId, content)}
             />
           ) : (
             <EmptyState recording={isRecording} />
@@ -612,6 +624,9 @@ const ICON_PATHS: Record<string, string> = {
   copy: 'M10 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2zM4 16V4a2 2 0 0 1 2-2h10',
   check: 'M5 12l5 5L19 7',
   edit: 'M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z',
+  checklist: 'M3.5 5.5 5 7l2.5-2.5M3.5 11.5 5 13l2.5-2.5M3.5 17.5 5 19l2.5-2.5M11 6h9.5M11 12h9.5M11 18h9.5',
+  transcript:
+    'M4 6.5h7.5M4 11h7.5M4 15.5h5M17.5 4.5a1.9 1.9 0 0 1 1.9 1.9v2.7a1.9 1.9 0 0 1-3.8 0V6.4a1.9 1.9 0 0 1 1.9-1.9zM14 8.6a3.5 3.5 0 0 0 7 0M17.5 12.1v2.4M4 19.5h16',
 };
 
 function Icon({ name, size = 16 }: { name: keyof typeof ICON_PATHS | string; size?: number }) {
@@ -886,6 +901,14 @@ function TrendsView({ points }: { points: MeetingTrendPoint[] }) {
   );
 }
 
+type MeetingDetailTab = 'summary' | 'notes' | 'transcript';
+
+const MEETING_DETAIL_TABS: { id: MeetingDetailTab; label: string; icon: string }[] = [
+  { id: 'summary', label: 'Summary', icon: 'checklist' },
+  { id: 'notes', label: 'Notes', icon: 'edit' },
+  { id: 'transcript', label: 'Transcript', icon: 'transcript' },
+];
+
 function MeetingDetailView({
   detail,
   processing,
@@ -895,6 +918,7 @@ function MeetingDetailView({
   onSummarize,
   onDelete,
   onRename,
+  onSaveNotes,
 }: {
   detail: MeetingHistoryDetail;
   processing: boolean;
@@ -904,14 +928,23 @@ function MeetingDetailView({
   onSummarize: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
+  onSaveNotes: (content: string) => Promise<void>;
 }) {
   const { meeting, transcriptSegments, summary } = detail;
   const segmentCount = transcriptSegments.length;
   const hasTranscript = segmentCount > 0;
+  const [tab, setTab] = useState<MeetingDetailTab>('summary');
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(meetingTitle(meeting));
   const titleInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Opening a different meeting lands on Summary again, like opening a page.
+  const [tabMeetingId, setTabMeetingId] = useState(meeting.meetingId);
+  if (tabMeetingId !== meeting.meetingId) {
+    setTabMeetingId(meeting.meetingId);
+    setTab('summary');
+  }
 
   useEffect(() => {
     if (isEditingTitle) {
@@ -986,13 +1019,13 @@ function MeetingDetailView({
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          {summary && hasTranscript && (
+          {tab === 'summary' && summary && hasTranscript && (
             <button type="button" className="ghost-btn" onClick={() => void handleCopy()}>
               <Icon name={copyState === 'copied' ? 'check' : 'copy'} />
               {copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy failed' : 'Copy'}
             </button>
           )}
-          {summary && hasTranscript && (
+          {tab === 'summary' && summary && hasTranscript && (
             <button type="button" className="ghost-btn" disabled={summarizing} onClick={onSummarize}>
               {summarizing ? <Spinner /> : <Icon name="refresh" />} Regenerate
             </button>
@@ -1003,68 +1036,106 @@ function MeetingDetailView({
         </div>
       </div>
 
-      {summarizing ? (
-        <div className="pending">
-          <Spinner />
-          <span className="label" style={{ flex: 1 }}>
-            Summarizing with {modelName} on device…
-            <br />
-            <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
-              Loading the model can take up to a minute the first time.
-            </span>
-          </span>
-        </div>
-      ) : summary ? (
-        <NotesView summary={summary} modelName={modelName} />
-      ) : processing ? (
-        <div className="pending">
-          <Spinner />
-          <span className="label">Transcribing the recording…</span>
-        </div>
-      ) : hasTranscript ? (
-        <div className="pending">
-          <Icon name="sparkles" />
-          <span className="label" style={{ flex: 1 }}>
-            Generate on-device notes from this transcript with {modelName}.
-          </span>
-          <button type="button" className="primary-btn" disabled={!canSummarize} onClick={onSummarize}>
-            <Icon name="sparkles" />
-            Generate notes
+      <div className="detail-tabs" role="tablist" aria-label="Meeting sections">
+        {MEETING_DETAIL_TABS.map((entry) => (
+          <button
+            key={entry.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === entry.id}
+            className={`detail-tab${tab === entry.id ? ' is-active' : ''}`}
+            onClick={() => setTab(entry.id)}
+          >
+            <Icon name={entry.icon} size={15} /> {entry.label}
           </button>
-        </div>
-      ) : (
-        <div className="pending">
-          <Icon name="sparkles" />
-          <span className="label">Transcribe this meeting first to generate notes.</span>
+        ))}
+      </div>
+
+      {tab === 'summary' && (
+        <div role="tabpanel" aria-label="Summary">
+          {summarizing ? (
+            <div className="pending">
+              <Spinner />
+              <span className="label" style={{ flex: 1 }}>
+                Summarizing with {modelName} on device…
+                <br />
+                <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                  Loading the model can take up to a minute the first time.
+                </span>
+              </span>
+            </div>
+          ) : summary ? (
+            <SummaryView summary={summary} modelName={modelName} />
+          ) : processing ? (
+            <div className="pending">
+              <Spinner />
+              <span className="label">Transcribing the recording…</span>
+            </div>
+          ) : hasTranscript ? (
+            <div className="pending">
+              <Icon name="sparkles" />
+              <span className="label" style={{ flex: 1 }}>
+                Generate on-device notes from this transcript with {modelName}.
+              </span>
+              <button type="button" className="primary-btn" disabled={!canSummarize} onClick={onSummarize}>
+                <Icon name="sparkles" />
+                Generate notes
+              </button>
+            </div>
+          ) : (
+            <div className="pending">
+              <Icon name="sparkles" />
+              <span className="label">Transcribe this meeting first to generate notes.</span>
+            </div>
+          )}
         </div>
       )}
 
-      <h2 className="section-title">Transcript</h2>
-      {segmentCount === 0 ? (
-        <p className="mi-meta">No transcript yet.</p>
-      ) : (
-        <div className="transcript">
-          {transcriptSegments.map((segment) => (
-            <div className="segment" key={segment.sequenceNumber}>
-              <p className="speaker">
-                {segment.speakerLabel ?? 'Speaker'}
-                <span className="ts">{formatClock(Math.round(segment.startedAtMs / 1000))}</span>
-              </p>
-              <p className="text">{segment.text}</p>
-            </div>
-          ))}
+      {tab === 'notes' && (
+        <div role="tabpanel" aria-label="Notes">
+          <UserNotesEditor key={meeting.meetingId} initialContent={detail.userNotes} onSave={onSaveNotes} />
         </div>
       )}
-      {detail.transcriptTruncated && (
-        <p className="mi-meta" style={{ marginTop: 12 }}>
-          Transcript truncated.
-        </p>
+
+      {tab === 'transcript' && (
+        <div role="tabpanel" aria-label="Transcript">
+          {segmentCount === 0 ? (
+            <div className="empty" style={{ height: 'auto', padding: '32px 0' }}>
+              <span className="ill">
+                <Icon name="transcript" size={26} />
+              </span>
+              <h2>No transcript yet</h2>
+              <p>
+                {processing
+                  ? 'Transcribing the recording — the transcript will appear here shortly.'
+                  : 'This meeting has no transcript.'}
+              </p>
+            </div>
+          ) : (
+            <div className="transcript">
+              {transcriptSegments.map((segment) => (
+                <div className="segment" key={segment.sequenceNumber}>
+                  <p className="speaker">
+                    {segment.speakerLabel ?? 'Speaker'}
+                    <span className="ts">{formatClock(Math.round(segment.startedAtMs / 1000))}</span>
+                  </p>
+                  <p className="text">{segment.text}</p>
+                </div>
+              ))}
+            </div>
+          )}
+          {detail.transcriptTruncated && (
+            <p className="mi-meta" style={{ marginTop: 12 }}>
+              Transcript truncated.
+            </p>
+          )}
+        </div>
       )}
     </div>
   );
 }
 
-function NotesView({ summary, modelName }: { summary: MeetingSummary; modelName: string }) {
+function SummaryView({ summary, modelName }: { summary: MeetingSummary; modelName: string }) {
   return (
     <div>
       <div className="notes">

@@ -144,6 +144,7 @@ pub struct MeetingHistoryDetail {
     transcript_truncated: bool,
     summary: Option<MeetingSummary>,
     summary_generated_at_ms: Option<u64>,
+    user_notes: Option<String>,
     audio_file_path: Option<String>,
     system_audio_file_path: Option<String>,
     pipeline_failure: Option<PipelineFailureRecord>,
@@ -323,6 +324,9 @@ fn get_meeting_history_detail(
         })
         .transpose()?;
     let summary_generated_at_ms = stored_summary.as_ref().map(|record| record.generated_at_ms);
+    let user_notes = repository
+        .get_meeting_notes(&meeting_id_value)?
+        .map(|record| record.content);
     let history_item = MeetingHistoryItem {
         meeting_id: meeting.id,
         title: meeting.title,
@@ -375,6 +379,7 @@ fn get_meeting_history_detail(
         transcript_truncated,
         summary,
         summary_generated_at_ms,
+        user_notes,
         audio_file_path,
         system_audio_file_path,
         pipeline_failure,
@@ -438,6 +443,21 @@ fn update_meeting_title(
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let updated_at_ms = current_time_ms()?;
     repository.update_meeting_title(&meeting_id_value, title_value, updated_at_ms)
+}
+
+/// Saves the notes the user typed for a meeting (the "Notes" tab). Empty
+/// content clears them.
+#[tauri::command]
+fn update_meeting_user_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    content: String,
+) -> Result<(), AppError> {
+    validate_recording_file_stem(&meeting_id)?;
+    let meeting_id_value = MeetingId::new(meeting_id);
+    let repository = state.repository.lock().map_err(map_lock_error)?;
+    let updated_at_ms = current_time_ms()?;
+    repository.upsert_meeting_notes(&meeting_id_value, &content, updated_at_ms)
 }
 
 /// Deletes a single dictation session summary row.
@@ -2413,6 +2433,7 @@ pub fn run() {
             get_meeting_history_detail,
             delete_meeting,
             update_meeting_title,
+            update_meeting_user_notes,
             list_meeting_trends,
             list_audio_devices,
             start_recording,

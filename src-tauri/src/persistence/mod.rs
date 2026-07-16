@@ -174,6 +174,14 @@ pub struct MeetingSummaryRecord {
     pub generated_at_ms: u64,
 }
 
+/// Notes the user typed themselves for a meeting (markdown-ish text),
+/// as opposed to the model-generated summary in `meeting_summaries`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingNotesRecord {
+    pub content: String,
+    pub updated_at_ms: u64,
+}
+
 /// Persisted audio metadata for a meeting recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioMetadata {
@@ -1051,6 +1059,66 @@ impl SqliteRepository {
             .map_err(map_db_error)
     }
 
+    /// Inserts or replaces the user's own notes for a meeting. Empty (or
+    /// all-whitespace) content deletes the row instead, so "no notes" stays
+    /// a single unambiguous state.
+    pub fn upsert_meeting_notes(
+        &self,
+        meeting_id: &MeetingId,
+        content: &str,
+        updated_at_ms: u64,
+    ) -> Result<(), AppError> {
+        if self.get_meeting(meeting_id)?.is_none() {
+            return Err(persistence_error(
+                "meeting_not_found",
+                "Notes could not be saved because the meeting does not exist.",
+                Some(format!("meeting_id={}", meeting_id.as_str())),
+            ));
+        }
+
+        if content.trim().is_empty() {
+            self.connection
+                .execute(
+                    "DELETE FROM meeting_notes WHERE meeting_id = ?1",
+                    params![meeting_id.as_str()],
+                )
+                .map_err(map_db_error)?;
+            return Ok(());
+        }
+
+        self.connection
+            .execute(
+                "INSERT INTO meeting_notes (meeting_id, content, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(meeting_id) DO UPDATE SET
+                    content = excluded.content,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![meeting_id.as_str(), content, to_db_i64(updated_at_ms)?],
+            )
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    /// Returns the user's own notes for a meeting, if any.
+    pub fn get_meeting_notes(
+        &self,
+        meeting_id: &MeetingId,
+    ) -> Result<Option<MeetingNotesRecord>, AppError> {
+        self.connection
+            .query_row(
+                "SELECT content, updated_at_ms FROM meeting_notes WHERE meeting_id = ?1",
+                params![meeting_id.as_str()],
+                |row| {
+                    Ok(MeetingNotesRecord {
+                        content: row.get(0)?,
+                        updated_at_ms: from_db_u64(row.get(1)?)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_db_error)
+    }
+
     /// Inserts or updates audio metadata for a meeting recording.
     pub fn upsert_audio_metadata(
         &self,
@@ -1412,6 +1480,13 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 meeting_id TEXT PRIMARY KEY,
                 body_json TEXT NOT NULL,
                 generated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS meeting_notes (
+                meeting_id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
                 FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
             );
 
@@ -3164,6 +3239,90 @@ mod tests {
             .update_meeting_title(&MeetingId::new("missing-meeting"), Some("x"), 4_200)
             .expect_err("missing meeting cannot be renamed");
         assert_eq!(missing.code, "meeting_not_found");
+    }
+
+    #[test]
+    fn meeting_notes_upsert_get_and_clear() {
+        let test_repository = repository();
+        let meeting = create_test_meeting(&test_repository.repository, "meeting-notes");
+
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting_notes(&meeting.id)
+                .expect("notes lookup succeeds"),
+            None
+        );
+
+        test_repository
+            .repository
+            .upsert_meeting_notes(&meeting.id, "- [ ] follow up with Sam", 5_000)
+            .expect("notes can be saved");
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting_notes(&meeting.id)
+                .expect("notes lookup succeeds"),
+            Some(MeetingNotesRecord {
+                content: "- [ ] follow up with Sam".to_string(),
+                updated_at_ms: 5_000,
+            })
+        );
+
+        test_repository
+            .repository
+            .upsert_meeting_notes(&meeting.id, "- [x] follow up with Sam", 5_100)
+            .expect("notes can be overwritten");
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting_notes(&meeting.id)
+                .expect("notes lookup succeeds")
+                .expect("notes exist")
+                .content,
+            "- [x] follow up with Sam",
+        );
+
+        test_repository
+            .repository
+            .upsert_meeting_notes(&meeting.id, "   \n", 5_200)
+            .expect("blank notes clear the row");
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting_notes(&meeting.id)
+                .expect("notes lookup succeeds"),
+            None
+        );
+
+        let missing = test_repository
+            .repository
+            .upsert_meeting_notes(&MeetingId::new("missing-meeting"), "x", 5_300)
+            .expect_err("missing meeting cannot have notes");
+        assert_eq!(missing.code, "meeting_not_found");
+    }
+
+    #[test]
+    fn meeting_notes_are_deleted_with_their_meeting() {
+        let test_repository = repository();
+        let meeting = create_test_meeting(&test_repository.repository, "meeting-notes-cascade");
+
+        test_repository
+            .repository
+            .upsert_meeting_notes(&meeting.id, "- remember this", 5_000)
+            .expect("notes can be saved");
+        test_repository
+            .repository
+            .delete_meeting(&meeting.id)
+            .expect("meeting can be deleted");
+
+        assert_eq!(
+            test_repository
+                .repository
+                .get_meeting_notes(&meeting.id)
+                .expect("notes lookup succeeds"),
+            None
+        );
     }
 
     #[test]

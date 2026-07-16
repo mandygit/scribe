@@ -385,6 +385,144 @@ button {
   color: var(--text-primary);
 }
 
+/* ---------- Meeting detail tabs ---------- */
+.detail-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 0 20px;
+}
+.detail-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 13px;
+  border: none;
+  border-radius: 20px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.detail-tab:hover {
+  color: var(--text-secondary);
+  background: var(--surface-1);
+}
+.detail-tab.is-active {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 0.5px solid var(--border);
+  box-shadow: 0 1px 2px rgba(28, 27, 23, 0.05);
+}
+
+/* ---------- Personal notes editor ---------- */
+.notes-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  border-bottom: 0.5px solid var(--border);
+}
+.notes-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+}
+.notes-tool:hover {
+  background: var(--surface-1);
+  color: var(--text-secondary);
+}
+.notes-tool.is-active {
+  background: var(--bg-accent);
+  color: var(--text-accent);
+}
+.notes-save-state {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.notes-save-state.is-error {
+  color: var(--text-danger);
+}
+.notes-blocks {
+  display: flex;
+  flex-direction: column;
+}
+.note-block {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 2px 0;
+}
+.note-marker {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: right;
+  font-size: 14px;
+  line-height: 24px;
+  color: var(--text-muted);
+  user-select: none;
+}
+.note-block.is-text .note-marker {
+  display: none;
+}
+.note-check {
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  margin: 4.5px 0 0 3px;
+  padding: 0;
+  border: 1.2px solid var(--border-strong);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+.note-check:hover {
+  border-color: var(--accent);
+}
+.note-check:checked {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 12l5 5L19 7'/%3E%3C/svg%3E");
+  background-size: 10px;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+.note-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  resize: none;
+  overflow: hidden;
+  padding: 0;
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 24px;
+  color: var(--text-primary);
+}
+.note-input:focus {
+  outline: none;
+}
+.note-input::placeholder {
+  color: var(--text-muted);
+}
+.note-block.is-checked .note-input {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
 /* ---------- Notes (Claude serif voice) ---------- */
 .notes {
   font-family: var(--font-serif);

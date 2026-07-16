@@ -239,6 +239,7 @@ export interface MeetingHistoryDetail {
   transcriptTruncated: boolean;
   summary: MeetingSummary | null;
   summaryGeneratedAtMs: number | null;
+  userNotes: string | null;
   audioFilePath: string | null;
   systemAudioFilePath: string | null;
   pipelineFailure: PipelineFailureRecord | null;
