@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::audio::capture::{current_time_ms, ActiveCapture, AudioCaptureBackend};
+use crate::audio::capture::{current_time_ms, ActiveCapture, AudioCaptureBackend, LevelObserver};
 use crate::domain::AppError;
 use crate::transcription::{Transcriber, TranscriptionOutput};
 
@@ -51,6 +51,13 @@ impl<B: AudioCaptureBackend> DictationRecorder<B> {
 
     pub fn is_recording(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Weak view onto the in-flight capture's live input level, for the pill's
+    /// waveform. `None` when no dictation is recording; the observer itself
+    /// starts reading `None` once the capture stops.
+    pub fn level_observer(&self) -> Option<LevelObserver> {
+        self.active.as_ref().map(|capture| capture.level.observer())
     }
 
     /// Starts recording the microphone to `file_path`. Errors if a dictation is
@@ -176,6 +183,7 @@ mod tests {
                 file_path,
                 sample_rate_hz: 16_000,
                 started_at_ms: 0,
+                level: Default::default(),
                 handle: Box::new(StubSession),
             })
         }

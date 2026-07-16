@@ -167,6 +167,7 @@ mod tests {
                 file_path,
                 sample_rate_hz: 16_000,
                 started_at_ms: 0,
+                level: Default::default(),
                 handle: Box::new(StubSession),
             })
         }

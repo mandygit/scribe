@@ -221,6 +221,7 @@ mod tests {
                 file_path,
                 sample_rate_hz: 1_000,
                 started_at_ms: 10,
+                level: Default::default(),
                 handle: Box::new(FakeSession),
             })
         }

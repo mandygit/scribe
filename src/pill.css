@@ -1,15 +1,19 @@
-/* Dictation pill window. The window itself is transparent; only the .dpill bar
-   paints, so it reads as a small free-floating capsule — like Wispr Flow. Classes
-   are namespaced (dpill*) so they never collide with the app's own .pill. */
+/* Dictation pill window. The window itself is transparent; only the capsule
+   paints, so it reads as a small free-floating shape — like Wispr Flow. The
+   capsule morphs per layout (data-layout on the .dpill button): a thin idle
+   sliver, a mic capsule under the cursor, a waveform while listening, a
+   progress sweep while transcribing, and a short text notice. The window is
+   resized in lockstep by the `set_pill_layout` command; keep the sizes here
+   inside the window sizes in src-tauri/src/lib.rs. Classes are namespaced
+   (dpill*) so they never collide with the app's own .pill. */
 
 :root {
-  --dpill-bg: rgba(28, 27, 23, 0.78);
+  --dpill-bg: rgba(28, 27, 23, 0.85);
   --dpill-text: #f4f3ee;
   --dpill-muted: rgba(244, 243, 238, 0.62);
-  --dpill-idle: rgba(244, 243, 238, 0.5);
   --dpill-listening: #e0533f;
   --dpill-transcribing: #4a86e8;
-  --dpill-polish: #c96442;
+  --dpill-polish: #e8916f;
 }
 
 /* Page-level rules are scoped to .pill-view (added to <html> only in pill mode).
@@ -32,87 +36,176 @@
 
 .pill-view #root {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   justify-content: center;
 }
 
-/* Auto-width capsule: stays only as wide as its content so the footprint is
-   minimal when idle and grows naturally for the listening/transcribing states. */
+/* The button fills the whole (small) window so the entire window is the
+   click/hover target — a 6px sliver alone would be a miserable one. The
+   capsule is bottom-anchored so it blooms upward from a fixed baseline while
+   the window is resized around it. */
 .dpill {
-  display: inline-flex;
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 7px;
-  height: 30px;
-  padding: 0 11px 0 6px;
-  border-radius: 15px;
+  justify-content: flex-end;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0 0 4px;
+  border: none;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.dpill:focus {
+  outline: none;
+}
+
+/* The morphing capsule. Sized per layout below; the transition length must
+   match COLLAPSE_MS in DictationPill.tsx (window shrinks wait for it). */
+.dpill__body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
   background: var(--dpill-bg);
   -webkit-backdrop-filter: blur(18px) saturate(140%);
   backdrop-filter: blur(18px) saturate(140%);
   border: 0.5px solid rgba(255, 255, 255, 0.09);
   box-shadow: 0 3px 14px rgba(0, 0, 0, 0.32);
   color: var(--dpill-text);
+  transition:
+    width 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+    height 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+    border-radius 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+    background 0.15s ease;
 }
 
-.dpill__mic {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
+/* Idle: a thin sliver. The lighter fill and border keep the 6px line legible
+   over both light and dark app backgrounds. */
+.dpill[data-layout="idle"] .dpill__body {
+  width: 44px;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(28, 27, 23, 0.62);
+  border-color: rgba(255, 255, 255, 0.28);
 }
 
-.dpill__mic:hover {
-  background: rgba(255, 255, 255, 0.1);
+.dpill[data-layout="hover"] .dpill__body {
+  width: 56px;
+  height: 24px;
+  border-radius: 12px;
+  background: rgba(44, 43, 38, 0.9);
 }
 
-.dpill__mic-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--dpill-idle);
-  transition: background 0.15s ease;
+.dpill[data-layout="listening"] .dpill__body,
+.dpill[data-layout="transcribing"] .dpill__body {
+  width: 120px;
+  height: 28px;
+  border-radius: 14px;
 }
 
-.dpill[data-state="listening"] .dpill__mic-dot {
-  background: var(--dpill-listening);
-  animation: dpill-pulse 1.2s ease-in-out infinite;
+.dpill[data-layout="notice"] .dpill__body {
+  width: auto;
+  max-width: 280px;
+  height: 28px;
+  border-radius: 14px;
+  padding: 0 12px;
 }
 
-.dpill[data-state="transcribing"] .dpill__mic-dot {
-  background: var(--dpill-transcribing);
-}
-
-.dpill__label {
+/* Hover hint above the capsule (rendered only in the hover layout). */
+.dpill__tooltip {
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: rgba(17, 17, 22, 0.92);
+  border: 0.5px solid rgba(255, 255, 255, 0.09);
+  color: var(--dpill-muted);
   font-size: 12px;
   font-weight: 500;
-  letter-spacing: 0.01em;
-  color: var(--dpill-muted);
   white-space: nowrap;
 }
 
-.dpill[data-state="listening"] .dpill__label,
-.dpill[data-state="transcribing"] .dpill__label {
-  color: var(--dpill-text);
+.dpill__mic {
+  display: none;
+  width: 13px;
+  height: 13px;
+  color: var(--dpill-muted);
 }
 
-/* Brief polish-selection feedback ("select text first", "saved to clipboard")
-   shown in place of the normal state label. */
-.dpill__label--notice {
+.dpill[data-layout="hover"] .dpill__mic {
+  display: block;
+}
+
+/* Listening: a scrolling waveform driven by live mic levels (bar heights are
+   set imperatively in DictationPill.tsx). */
+.dpill__bars {
+  display: none;
+  align-items: center;
+  gap: 2.5px;
+}
+
+.dpill[data-layout="listening"] .dpill__bars {
+  display: flex;
+}
+
+.dpill__bar {
+  width: 2.5px;
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--dpill-listening);
+  transition: height 70ms linear;
+}
+
+/* Transcribing: an indeterminate sweep along a thin track. */
+.dpill__sweep {
+  display: none;
+  position: relative;
+  width: 70px;
+  height: 3px;
+  border-radius: 1.5px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.dpill[data-layout="transcribing"] .dpill__sweep {
+  display: block;
+}
+
+.dpill__sweep-thumb {
+  position: absolute;
+  top: 0;
+  left: -30%;
+  width: 30%;
+  height: 100%;
+  border-radius: 1.5px;
+  background: var(--dpill-transcribing);
+  animation: dpill-sweep 1.1s ease-in-out infinite;
+}
+
+@keyframes dpill-sweep {
+  from {
+    left: -30%;
+  }
+  to {
+    left: 100%;
+  }
+}
+
+/* Brief polish-selection feedback ("select text first", "saved to clipboard"). */
+.dpill__notice-text {
+  display: none;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--dpill-polish);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-@keyframes dpill-pulse {
-  0%,
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.45;
-    transform: scale(0.7);
-  }
+.dpill[data-layout="notice"] .dpill__notice-text {
+  display: block;
 }

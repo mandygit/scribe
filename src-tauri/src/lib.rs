@@ -874,6 +874,128 @@ fn emit_dictation_state(app: &AppHandle, state: &'static str) {
     let _ = app.emit(DICTATION_STATE_EVENT, DictationStateEvent { state });
 }
 
+/// Event the pill listens to while dictation records: the live microphone
+/// input level (RMS, 0..=1) driving its waveform.
+const DICTATION_LEVEL_EVENT: &str = "scribe://dictation-level";
+
+/// How often the live input level is sampled and emitted to the pill.
+const DICTATION_LEVEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationLevelEvent {
+    level: f32,
+}
+
+/// Streams the microphone input level to the pill for the duration of the
+/// in-flight dictation. The thread holds only a weak view onto the capture's
+/// level meter, so it exits on its own as soon as the capture is stopped and
+/// dropped — no stop signal to coordinate, and a stale thread can never read
+/// a later dictation's levels.
+fn spawn_dictation_level_emitter(app: &AppHandle) {
+    let observer = match app.state::<AppState>().dictation.lock() {
+        Ok(recorder) => recorder.level_observer(),
+        Err(_) => None,
+    };
+    let Some(observer) = observer else {
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        while let Some(level) = observer.read() {
+            let _ = app.emit(DICTATION_LEVEL_EVENT, DictationLevelEvent { level });
+            std::thread::sleep(DICTATION_LEVEL_INTERVAL);
+        }
+    });
+}
+
+/// Event the pill listens to for cursor hover, driving its idle-sliver →
+/// capsule bloom. Detected by polling the global cursor position against the
+/// pill's known frame (see `spawn_pill_hover_watcher`), NOT by DOM mouse
+/// events: WebKit installs its mouse tracking scoped to the key window, and
+/// the pill's non-activating panel is essentially never key, so mouseenter
+/// never fires inside it.
+#[cfg(target_os = "macos")]
+const DICTATION_PILL_HOVER_EVENT: &str = "scribe://dictation-pill-hover";
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationPillHoverEvent {
+    hovering: bool,
+}
+
+/// How often the hover watcher samples the cursor. 10 Hz keeps worst-case
+/// hover latency at ~100ms, which reads as instant for a reveal affordance,
+/// at a per-tick cost of one CoreGraphics call and a rect compare.
+#[cfg(target_os = "macos")]
+const PILL_HOVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Watches the global cursor and tells the pill when it enters or leaves the
+/// pill window's frame. Runs for the app's whole lifetime.
+#[cfg(target_os = "macos")]
+fn spawn_pill_hover_watcher(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut was_hovering = false;
+        loop {
+            std::thread::sleep(PILL_HOVER_POLL_INTERVAL);
+            let Some((cursor_x, cursor_y)) = macos_cursor::location() else {
+                continue;
+            };
+            let hovering = PILL_RECT.lock().ok().and_then(|rect| *rect).is_some_and(
+                |(x, y, width, height)| {
+                    cursor_x >= x && cursor_x < x + width && cursor_y >= y && cursor_y < y + height
+                },
+            );
+            if hovering != was_hovering {
+                was_hovering = hovering;
+                let _ = app.emit(
+                    DICTATION_PILL_HOVER_EVENT,
+                    DictationPillHoverEvent { hovering },
+                );
+            }
+        }
+    });
+}
+
+/// Minimal CoreGraphics bindings for the global cursor position, which needs
+/// no permissions (unlike synthesising events). Same no-#[link] approach as
+/// `audio::capture::macos_transport`: CoreGraphics and CoreFoundation are
+/// already linked by wry/tauri, so the symbols resolve without re-declaring
+/// them on the link line.
+#[cfg(target_os = "macos")]
+mod macos_cursor {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const c_void) -> *const c_void;
+        fn CGEventGetLocation(event: *const c_void) -> CGPoint;
+        fn CFRelease(object: *const c_void);
+    }
+
+    /// Cursor position in global top-left-origin screen points — the same
+    /// space `position_window` computes window frames in. `None` if the
+    /// event could not be created (never observed in practice).
+    pub fn location() -> Option<(f64, f64)> {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            if event.is_null() {
+                return None;
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event);
+            Some((point.x, point.y))
+        }
+    }
+}
+
 /// Event the pill listens to for brief polish-selection feedback: "nothing
 /// selected" nudges and the "couldn't paste, saved to clipboard" fallback.
 const POLISH_SELECTION_NOTICE_EVENT: &str = "scribe://polish-selection-notice";
@@ -1135,13 +1257,39 @@ fn set_recording_indicator(app: &AppHandle, recording: bool) {
 #[cfg(desktop)]
 const DICTATION_PILL_WINDOW: &str = "pill";
 
-/// Logical size of the dictation pill and the gap kept above the Dock.
+/// Logical window sizes of the dictation pill per visual layout, plus the gap
+/// kept above the Dock. The window is resized to hug each state's painted
+/// content (see `set_pill_layout`): the window is transparent, so any area
+/// beyond the visuals is an invisible click-trap sitting over whatever the
+/// user has at the bottom of the screen. Idle stays a small sliver; hover
+/// needs headroom for the tooltip; listening/transcribing fit the waveform
+/// capsule; notices fit a short line of text.
 #[cfg(desktop)]
-const PILL_WIDTH: f64 = 240.0;
+const PILL_IDLE_SIZE: (f64, f64) = (64.0, 18.0);
 #[cfg(desktop)]
-const PILL_HEIGHT: f64 = 40.0;
+const PILL_HOVER_SIZE: (f64, f64) = (210.0, 64.0);
+#[cfg(desktop)]
+const PILL_ACTIVE_SIZE: (f64, f64) = (160.0, 40.0);
+#[cfg(desktop)]
+const PILL_NOTICE_SIZE: (f64, f64) = (300.0, 40.0);
 #[cfg(desktop)]
 const PILL_BOTTOM_MARGIN: f64 = 8.0;
+
+/// The pill window's current frame in global top-left-origin screen points,
+/// kept in sync by `create_dictation_pill` and `set_pill_layout`. The hover
+/// watcher polls the cursor against this instead of relying on WebKit mouse
+/// tracking, which is unreliable inside a non-activating panel that is never
+/// the key window (mouseenter simply never fires there).
+#[cfg(desktop)]
+static PILL_RECT: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+
+/// Records the pill frame most recently applied by `position_window`.
+#[cfg(desktop)]
+fn remember_pill_rect(position: Option<(f64, f64)>, width: f64, height: f64) {
+    if let (Some((x, y)), Ok(mut rect)) = (position, PILL_RECT.lock()) {
+        *rect = Some((x, y, width, height));
+    }
+}
 
 /// Label of the meeting-detected prompt window (the small bar pinned to the
 /// top-center of the screen, like the dictation pill but anchored opposite).
@@ -1198,7 +1346,7 @@ fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
         WebviewUrl::App("index.html?view=pill".into()),
     )
     .title("Scribe Dictation")
-    .inner_size(PILL_WIDTH, PILL_HEIGHT)
+    .inner_size(PILL_IDLE_SIZE.0, PILL_IDLE_SIZE.1)
     .decorations(false)
     .transparent(true)
     .always_on_top(true)
@@ -1211,13 +1359,58 @@ fn create_dictation_pill(app: &AppHandle) -> tauri::Result<()> {
     .visible(true)
     .build()?;
 
-    position_window(
+    let position = position_window(
         &pill,
         WindowAnchor::BottomCenter,
-        PILL_WIDTH,
-        PILL_HEIGHT,
+        PILL_IDLE_SIZE.0,
+        PILL_IDLE_SIZE.1,
         PILL_BOTTOM_MARGIN,
     );
+    remember_pill_rect(position, PILL_IDLE_SIZE.0, PILL_IDLE_SIZE.1);
+    Ok(())
+}
+
+/// Window size for one of the pill's visual layouts. `listening` and
+/// `transcribing` share a size so that transition never moves the window.
+#[cfg(desktop)]
+fn pill_layout_size(layout: &str) -> Result<(f64, f64), AppError> {
+    match layout {
+        "idle" => Ok(PILL_IDLE_SIZE),
+        "hover" => Ok(PILL_HOVER_SIZE),
+        "listening" | "transcribing" => Ok(PILL_ACTIVE_SIZE),
+        "notice" => Ok(PILL_NOTICE_SIZE),
+        other => Err(AppError {
+            code: "pill_layout_unknown".to_string(),
+            message: format!("Unknown dictation pill layout: {other}"),
+            details: None,
+        }),
+    }
+}
+
+/// Resizes the pill window to hug the given visual layout and re-anchors it to
+/// the bottom-center of the screen. Invoked by the pill webview whenever its
+/// visual state changes (idle sliver, hover capsule, listening waveform,
+/// transcribing sweep, notice text) so the transparent window never covers —
+/// and never swallows clicks meant for — more of the screen than it paints.
+#[tauri::command]
+fn set_pill_layout(app: AppHandle, layout: String) -> Result<(), AppError> {
+    #[cfg(desktop)]
+    {
+        let (width, height) = pill_layout_size(&layout)?;
+        if let Some(window) = app.get_webview_window(DICTATION_PILL_WINDOW) {
+            let _ = window.set_size(tauri::LogicalSize::new(width, height));
+            let position = position_window(
+                &window,
+                WindowAnchor::BottomCenter,
+                width,
+                height,
+                PILL_BOTTOM_MARGIN,
+            );
+            remember_pill_rect(position, width, height);
+        }
+    }
+    #[cfg(not(desktop))]
+    let _ = (app, layout);
     Ok(())
 }
 
@@ -1336,9 +1529,9 @@ fn position_window(
     window_width: f64,
     window_height: f64,
     margin: f64,
-) {
+) -> Option<(f64, f64)> {
     let Ok(Some(monitor)) = window.primary_monitor() else {
-        return;
+        return None;
     };
     let scale = monitor.scale_factor();
     let work_area = monitor.work_area();
@@ -1364,6 +1557,7 @@ fn position_window(
         }
     };
     let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+    Some((x, y))
 }
 
 /// Converts a floating window (the dictation pill or the meeting popup) into a
@@ -1636,6 +1830,7 @@ fn start_dictation_session(app: &AppHandle) {
             eprintln!("dictation: listening…");
             set_recording_indicator(app, true);
             emit_dictation_state(app, "listening");
+            spawn_dictation_level_emitter(app);
             play_cue(DICTATION_START_SOUND);
         }
         Err(error) => {
@@ -2231,6 +2426,7 @@ pub fn run() {
             delete_dictation_session,
             get_dictation_stats_summary,
             toggle_dictation,
+            set_pill_layout,
             inject_dictation_text,
             polish_dictation,
             update_dictation_settings,
@@ -2333,7 +2529,10 @@ pub fn run() {
                 // activates Scribe (which would raise the main window over the pill
                 // and steal focus). focusable(false) alone does not prevent that.
                 #[cfg(target_os = "macos")]
-                make_window_non_activating(app.handle(), DICTATION_PILL_WINDOW);
+                {
+                    make_window_non_activating(app.handle(), DICTATION_PILL_WINDOW);
+                    spawn_pill_hover_watcher(app.handle());
+                }
             }
 
             #[cfg(desktop)]

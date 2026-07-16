@@ -2,9 +2,9 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         mpsc::{sync_channel, SyncSender, TrySendError},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
 };
 
@@ -40,7 +40,37 @@ pub struct ActiveCapture {
     pub file_path: PathBuf,
     pub sample_rate_hz: u32,
     pub started_at_ms: u64,
+    pub level: LevelMeter,
     pub handle: Box<dyn CaptureSessionHandle>,
+}
+
+/// Live input level of an in-flight capture: the RMS of the most recent audio
+/// callback buffer, normalised to 0..=1. Stored as f32 bits in an atomic so the
+/// realtime audio callback can publish it without locking.
+#[derive(Clone, Default)]
+pub struct LevelMeter(Arc<AtomicU32>);
+
+impl LevelMeter {
+    fn store(&self, level: f32) {
+        self.0.store(level.to_bits(), Ordering::Relaxed);
+    }
+
+    /// A weak view for readers that must not keep the capture alive: `read`
+    /// returns `None` once the capture and its stream are gone, which is how
+    /// the dictation level emitter thread knows to exit.
+    pub fn observer(&self) -> LevelObserver {
+        LevelObserver(Arc::downgrade(&self.0))
+    }
+}
+
+pub struct LevelObserver(Weak<AtomicU32>);
+
+impl LevelObserver {
+    pub fn read(&self) -> Option<f32> {
+        self.0
+            .upgrade()
+            .map(|bits| f32::from_bits(bits.load(Ordering::Relaxed)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +137,7 @@ impl AudioCaptureBackend for CpalCaptureBackend {
         }
         let channels = usize::from(config.channels);
         let (sample_sender, sample_receiver) = sync_channel(AUDIO_SAMPLE_CHANNEL_CAPACITY);
+        let level = LevelMeter::default();
         let dropped_sample_count = Arc::new(AtomicU64::new(0));
         let stream_error = Arc::new(Mutex::new(None));
         let err_callback = {
@@ -124,6 +155,7 @@ impl AudioCaptureBackend for CpalCaptureBackend {
                 &config,
                 channels,
                 sample_sender,
+                level.clone(),
                 Arc::clone(&dropped_sample_count),
                 err_callback,
             ),
@@ -132,6 +164,7 @@ impl AudioCaptureBackend for CpalCaptureBackend {
                 &config,
                 channels,
                 sample_sender,
+                level.clone(),
                 Arc::clone(&dropped_sample_count),
                 err_callback,
             ),
@@ -140,6 +173,7 @@ impl AudioCaptureBackend for CpalCaptureBackend {
                 &config,
                 channels,
                 sample_sender,
+                level.clone(),
                 Arc::clone(&dropped_sample_count),
                 err_callback,
             ),
@@ -161,6 +195,7 @@ impl AudioCaptureBackend for CpalCaptureBackend {
             file_path,
             sample_rate_hz,
             started_at_ms: current_time_ms()?,
+            level,
             handle: Box::new(CpalCaptureSession {
                 stream,
                 writer,
@@ -210,6 +245,7 @@ fn build_i16_stream(
     config: &cpal::StreamConfig,
     channels: usize,
     sender: SyncSender<i16>,
+    level: LevelMeter,
     dropped_sample_count: Arc<AtomicU64>,
     err_callback: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AppError> {
@@ -217,6 +253,10 @@ fn build_i16_stream(
         .build_input_stream(
             config,
             move |data: &[i16], _| {
+                level.store(rms_of_normalized(
+                    data.iter()
+                        .map(|sample| f64::from(*sample) / f64::from(i16::MAX)),
+                ));
                 enqueue_i16_samples(data, channels, &sender, &dropped_sample_count)
             },
             err_callback,
@@ -230,6 +270,7 @@ fn build_u16_stream(
     config: &cpal::StreamConfig,
     channels: usize,
     sender: SyncSender<i16>,
+    level: LevelMeter,
     dropped_sample_count: Arc<AtomicU64>,
     err_callback: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AppError> {
@@ -237,6 +278,9 @@ fn build_u16_stream(
         .build_input_stream(
             config,
             move |data: &[u16], _| {
+                level.store(rms_of_normalized(data.iter().map(|sample| {
+                    (f64::from(*sample) - 32_768.0) / f64::from(i16::MAX)
+                })));
                 enqueue_u16_samples(data, channels, &sender, &dropped_sample_count)
             },
             err_callback,
@@ -250,6 +294,7 @@ fn build_f32_stream(
     config: &cpal::StreamConfig,
     channels: usize,
     sender: SyncSender<i16>,
+    level: LevelMeter,
     dropped_sample_count: Arc<AtomicU64>,
     err_callback: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AppError> {
@@ -257,12 +302,30 @@ fn build_f32_stream(
         .build_input_stream(
             config,
             move |data: &[f32], _| {
+                level.store(rms_of_normalized(
+                    data.iter().map(|sample| f64::from(*sample)),
+                ));
                 enqueue_f32_samples(data, channels, &sender, &dropped_sample_count)
             },
             err_callback,
             None,
         )
         .map_err(map_cpal_build_error)
+}
+
+/// RMS of a buffer of samples already normalised to -1..=1, clamped to 0..=1.
+/// An empty buffer reads as silence.
+fn rms_of_normalized(samples: impl Iterator<Item = f64>) -> f32 {
+    let mut sum_of_squares = 0.0_f64;
+    let mut count = 0_u64;
+    for sample in samples {
+        sum_of_squares += sample * sample;
+        count += 1;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    ((sum_of_squares / count as f64).sqrt().clamp(0.0, 1.0)) as f32
 }
 
 fn enqueue_i16_samples(

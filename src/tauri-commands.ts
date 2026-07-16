@@ -26,6 +26,8 @@ export const TRANSCRIPT_SEGMENT_EVENT = 'scribe://transcript-segment';
 export const TRANSCRIPT_STREAM_COMPLETE_EVENT = 'scribe://transcript-stream-complete';
 export const LIVE_NUDGE_EVENT = 'scribe://live-nudge';
 export const DICTATION_STATE_EVENT = 'scribe://dictation-state';
+export const DICTATION_LEVEL_EVENT = 'scribe://dictation-level';
+export const DICTATION_PILL_HOVER_EVENT = 'scribe://dictation-pill-hover';
 export const POLISH_SELECTION_NOTICE_EVENT = 'scribe://polish-selection-notice';
 export const MEETING_DETECTED_EVENT = 'scribe://meeting-detected';
 export const MEETING_CALL_ENDED_EVENT = 'scribe://meeting-call-ended';
@@ -33,6 +35,13 @@ export const RECORDING_STARTED_EVENT = 'scribe://recording-started';
 export const RECORDING_STOPPED_EVENT = 'scribe://recording-stopped';
 
 export type DictationState = 'idle' | 'listening' | 'transcribing';
+
+/**
+ * Visual layouts of the dictation pill. Superset of {@link DictationState}:
+ * `hover` is the idle sliver expanded under the cursor, `notice` is the
+ * transient polish-selection feedback text.
+ */
+export type PillLayout = DictationState | 'hover' | 'notice';
 
 export type {
   AppStatus,
@@ -221,9 +230,36 @@ export const sendCompletionNotification = async (title: string, body: string): P
 
 export const toggleDictation = async (): Promise<void> => invokeNative<void>('toggle_dictation');
 
+/**
+ * Resizes the pill window to hug the given visual layout (see the Rust
+ * `set_pill_layout` command): the window is transparent, so any area beyond
+ * the painted content is an invisible click-trap over the user's screen.
+ */
+export const setPillLayout = async (layout: PillLayout): Promise<void> =>
+  invokeNative<void>('set_pill_layout', { layout });
+
 export const listenToDictationState = async (onState: (state: DictationState) => void): Promise<UnlistenFn> => {
   assertTauriRuntime();
   return listen<{ state: DictationState }>(DICTATION_STATE_EVENT, (event) => onState(event.payload.state));
+};
+
+/**
+ * Fires ~30x/s while a dictation records, with the live microphone input
+ * level (RMS, 0..1) that drives the pill's waveform.
+ */
+export const listenToDictationLevel = async (onLevel: (level: number) => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen<{ level: number }>(DICTATION_LEVEL_EVENT, (event) => onLevel(event.payload.level));
+};
+
+/**
+ * Fires when the cursor enters or leaves the pill window. Hover is detected
+ * on the Rust side (cursor polled against the pill frame) because DOM mouse
+ * tracking never fires inside the pill's non-activating, never-key panel.
+ */
+export const listenToDictationPillHover = async (onHover: (hovering: boolean) => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen<{ hovering: boolean }>(DICTATION_PILL_HOVER_EVENT, (event) => onHover(event.payload.hovering));
 };
 
 export const listenToPolishSelectionNotice = async (onNotice: (message: string) => void): Promise<UnlistenFn> => {
