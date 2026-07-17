@@ -192,3 +192,9 @@ Read `docs/technical-architecture.md` for the full architecture: why each
 dependency was chosen, how the pieces fit together (with diagrams), the
 Tauri command/event surface, and an honest accounting of what's dead code vs.
 shipped.
+
+## License
+
+[MIT](LICENSE). Bundled third-party components keep their own licenses
+(whisper.cpp and ggml are MIT, libomp is Apache 2.0 with LLVM exception,
+SpeexDSP is BSD); copies ship inside the app bundle next to the binaries.
