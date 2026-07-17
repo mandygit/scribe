@@ -23,21 +23,11 @@ leaving your machine.
 | Local transcription | Runs a configured `whisper-cli` binary + model over the recording, in the background so "stop meeting" doesn't block the UI. |
 | Local summarization | Sends the transcript to a local OpenAI-compatible chat server (LM Studio, Ollama, or any custom endpoint) and produces structured notes. Long transcripts are automatically map-reduced into chunks. |
 | Copy to Slack/Teams | One click copies the generated notes (bold section labels, bullet lists, no tables) as rich text that pastes cleanly into chat apps. |
-| Live nudges | Deterministic, rule-based (not LLM) feedback during transcript playback: filler words, hedging, pace, long monologues. |
+| Meeting workspace | Each meeting opens in Summary / Notes / Transcript tabs, with an editable notes pane alongside the generated summary. |
 | History & trends | Every meeting's transcript, metrics, and notes are stored locally in SQLite; a trends view charts pace/filler words/score over time. |
 | Dictation | Global hotkey (double-press to toggle), floating non-activating pill UI, optional on-device polish via Apple Intelligence (macOS 15+), paste-based injection into the focused app. |
 | Retention controls | Configure how long raw audio is kept; transcripts and notes are kept regardless. |
 | Permission onboarding | First-run flow for Microphone / Screen Recording / Accessibility, with a clear explanation of what's degraded without each. |
-
-### Not implemented yet
-
-A couple of things referenced in older docs or leftover code
-**have no UI and no reachable commands today** — don't be alarmed if you spot
-them while poking around:
-
-- **Cloud video review** (sampled-frame review via OpenAI) — mentioned in older docs, not present in code.
-
-See `docs/technical-architecture.md` § "Known dead code and unshipped features" for the full, current status of each.
 
 ## Requirements
 
@@ -173,7 +163,7 @@ this yet.
 | `src-tauri/src/transcription/` | `whisper-cli` subprocess wrapper, streaming replay. |
 | `src-tauri/src/summarizer/` | LM Studio/Ollama/custom chat client, map-reduce summarization. |
 | `src-tauri/src/dictation/` | Hotkey detection, capture, clipboard injection, Apple Intelligence polish. |
-| `src-tauri/src/rules/`, `src-tauri/src/nudges/` | Deterministic transcript metrics and live coaching nudges. |
+| `src-tauri/src/rules/`, `src-tauri/src/nudges/` | Deterministic transcript metrics (pace, filler words) that feed the trends view. |
 | `src-tauri/src/persistence/` | `SqliteRepository` — all SQL lives here. |
 | `src-tauri/native/` | Swift sidecar sources (system audio capture, dictation polish). |
 | `docs/technical-architecture.md` | The detailed engineering doc — read this next. |
