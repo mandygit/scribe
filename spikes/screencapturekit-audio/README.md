@@ -18,7 +18,7 @@ The `.m4a` output is only a temporary validation artifact for this macOS spike. 
 ## Run
 
 ```bash
-cd /Users/nama4008/Projects/meeting-coach/spikes/screencapturekit-audio
+cd spikes/screencapturekit-audio  # from the repo root
 chmod +x build_and_run.sh
 ./build_and_run.sh
 ```

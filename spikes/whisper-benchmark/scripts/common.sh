@@ -33,7 +33,7 @@ absolute_path() {
 
 ensure_output_inside_spike() {
   local path
-  local python_bin="${VENV_BENCHMARK_PYTHON:-/Users/nama4008/Projects/meeting-coach/.venv-benchmark/bin/python}"
+  local python_bin="${VENV_BENCHMARK_PYTHON:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/.venv-benchmark/bin/python}"
   local python_command=()
   if [[ -x "$python_bin" ]]; then
     python_command=("$python_bin")

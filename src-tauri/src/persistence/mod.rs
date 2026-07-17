@@ -2904,7 +2904,7 @@ mod tests {
             cloud_video_review_enabled: true,
             transcriber_bin_path: Some("/opt/homebrew/bin/whisper-cli".to_string()),
             transcriber_model_path: Some("/models/base.bin".to_string()),
-            transcriber_vocabulary: Some("SymbioRAG, Jira".to_string()),
+            transcriber_vocabulary: Some("AcmeRAG, Jira".to_string()),
             speaker_embedding_model_path: Some("/models/speaker.onnx".to_string()),
             speaker_segmentation_model_path: Some("/models/segmentation.onnx".to_string()),
             dictation_hotkey: "ctrl+option+d".to_string(),

@@ -19,7 +19,7 @@ reference=""
 models_csv="$(join_by_comma "${DEFAULT_MODELS[@]}")"
 run_output_dir="$OUTPUTS_DIR/run-$(date +%Y%m%d-%H%M%S)"
 threads="$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-python_bin="${VENV_BENCHMARK_PYTHON:-/Users/nama4008/Projects/meeting-coach/.venv-benchmark/bin/python}"
+python_bin="${VENV_BENCHMARK_PYTHON:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/.venv-benchmark/bin/python}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -113,7 +113,9 @@ bun run package:mac:dmg
 ```
 
 This produces `src-tauri/target/release/bundle/dmg/Scribe_<version>_aarch64.dmg`
-(or `x64` on Intel).
+(or `x64` on Intel). Hand recipients `docs/installing.md` along with it -
+it's the standalone install guide (prerequisites, Gatekeeper unblock,
+permissions, local-model setup) and assumes no development context.
 
 ### 2. Install it and clear the quarantine flag
 
