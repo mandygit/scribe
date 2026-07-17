@@ -39,12 +39,12 @@ See `docs/technical-architecture.md` § "Known dead code and unshipped features"
 - [Bun](https://bun.sh) for the frontend.
 - Rust + Cargo (`rustc --version` to check) for the Tauri backend.
 - Xcode Command Line Tools (`xcode-select --install`) — needed to compile the two Swift sidecar helpers at build time.
-- [`whisper.cpp`](https://github.com/ggml-org/whisper.cpp)'s `whisper-cli` binary, plus a downloaded `ggml-*.bin` model.
+- [`whisper.cpp`](https://github.com/ggml-org/whisper.cpp) via Homebrew (`brew install whisper-cpp`, which pulls in `ggml` and `libomp`) — only needed on the **build machine**: `bun run package:prepare` copies and relinks these into the app bundle, so installed builds need no Homebrew. A `ggml-*.bin` model is fetched automatically by the same step (or auto-detected from disk in dev).
 - A local LLM server for summarization — any one of:
   - [LM Studio](https://lmstudio.ai) (default; the app can start/stop/load models for it via the `lms` CLI), or
   - [Ollama](https://ollama.com), or
   - any other server that speaks the OpenAI-compatible `/v1/chat/completions` API.
-- Optional: SpeexDSP (`brew install speexdsp` or similar) for echo cancellation — recording and transcription work fine without it, just without the cleaned-mic pass.
+- SpeexDSP (`brew install speexdsp`) for echo cancellation — like whisper-cpp, build-machine-only; it gets bundled. Recording and transcription work fine without it, just without the cleaned-mic pass.
 
 ## Quick start (development)
 
@@ -55,9 +55,9 @@ bun install
 # 2. Confirm your Rust toolchain
 rustc --version && cargo --version
 
-# 3. Install whisper.cpp and a model (Homebrew example)
-brew install whisper-cpp
-# then download a model, e.g. ggml-base.bin, from the whisper.cpp releases
+# 3. Install whisper.cpp + speexdsp and stage the bundled tooling and model
+brew install whisper-cpp speexdsp
+bun run package:prepare
 
 # 4. Install and start a local LLM server, e.g. LM Studio, and load a model
 #    (Qwen3-14B-MLX-4bit is a good fit for 32GB+ Apple Silicon Macs — see
@@ -82,10 +82,17 @@ at your `whisper-cli` binary/model path and your LLM server's host/port/model
 | `bun run test:frontend` | Bun-based frontend tests (`tests/frontend/`). |
 | `cd src-tauri && cargo check` | Fast Rust compile check. |
 | `cd src-tauri && cargo test` | Rust unit/integration tests (150+; a few native ones are `#[ignore]`d since they need real hardware/whisper-cli/LM Studio). |
-| `bun run package:mac` | Build a local unsigned `.app` bundle. |
-| `bun run package:mac:dmg` | Build a `.dmg` for handing to another Mac. |
+| `bun run package:prepare` | Assemble the bundled tooling (relinked `whisper-cli`, whisper model, libspeexdsp) into `src-tauri/resources/`. Runs automatically before the two package commands. |
+| `bun run package:mac` | Build a local unsigned `.app` bundle with all tooling included. |
+| `bun run package:mac:dmg` | Build a self-contained `.dmg` for handing to another Mac. |
 
 ## Building and installing a distributable build
+
+The DMG is **self-contained**: it bundles the Swift sidecar helpers, a
+relocatable `whisper-cli` (with its ggml Metal/CPU/BLAS backends), the
+`ggml-small-q5_1` whisper model, and libspeexdsp for echo cancellation.
+The only things a recipient installs themselves are a local LLM server
+(LM Studio/Ollama) for summaries — transcription works out of the box.
 
 There's no Apple Developer ID yet, so builds are **ad-hoc signed** (Tauri's
 default) rather than notarized. That's fine for handing the app to yourself
@@ -169,7 +176,7 @@ this yet.
 
 - macOS only.
 - System audio capture requires the Screen Recording permission; without it, recording silently falls back to mic-only.
-- Echo cancellation only runs when SpeexDSP is installed and a compatible reference track exists; otherwise it safely falls back to the raw mic recording.
+- Echo cancellation only runs when SpeexDSP is available (bundled in packaged builds; `brew install speexdsp` in dev) and a compatible reference track exists; otherwise it safely falls back to the raw mic recording.
 - Summarization quality and speed depend entirely on your local model choice and hardware — see `docs/technical-architecture.md` § Summarization for sizing guidance.
 - Not notarized — see the rebuild/re-grant dance above.
 

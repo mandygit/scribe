@@ -1,7 +1,6 @@
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::domain::AppError;
 
@@ -85,37 +84,12 @@ struct FfmpegReferenceAudioNormalizer;
 
 impl ReferenceAudioNormalizer for FfmpegReferenceAudioNormalizer {
     fn normalize_to_wav(&self, source_path: &Path, output_path: &Path) -> Result<(), AppError> {
-        let ffmpeg_path = crate::media_import::resolve_ffmpeg_path(None)?;
-        let output = Command::new(ffmpeg_path)
-            .arg("-y")
-            .arg("-i")
-            .arg(source_path)
-            .arg("-vn")
-            .arg("-ac")
-            .arg("1")
-            .arg("-ar")
-            .arg(EXPECTED_SAMPLE_RATE.to_string())
-            .arg("-sample_fmt")
-            .arg("s16")
-            .arg("-f")
-            .arg("wav")
-            .arg(output_path)
-            .output()
-            .map_err(|error| AppError {
-                code: "aec_reference_normalization_start_failed".to_string(),
-                message: "Could not start ffmpeg for echo cancellation.".to_string(),
-                details: Some(error.to_string()),
-            })?;
-
-        if !output.status.success() {
-            return Err(AppError {
-                code: "aec_reference_normalization_failed".to_string(),
-                message: "ffmpeg could not convert system audio for echo cancellation.".to_string(),
-                details: Some(format!("path={}", source_path.display())),
-            });
-        }
-
-        Ok(())
+        crate::media_import::convert_to_mono_s16_wav(
+            source_path,
+            output_path,
+            EXPECTED_SAMPLE_RATE,
+            "aec_reference_normalization_failed",
+        )
     }
 }
 
@@ -422,11 +396,27 @@ struct SpeexLibrary {
     echo_ctl: SpeexEchoCtl,
 }
 
+/// The bundled copy shipped in the app's resources (see
+/// scripts/bundle-speexdsp.sh) is preferred, then the usual Homebrew and
+/// linker locations.
+fn speex_library_candidates() -> Vec<String> {
+    let mut candidates = Vec::with_capacity(SPEEX_LIBRARY_CANDIDATES.len() + 1);
+    if let Some(resources) = crate::path_detection::bundled_resources_dir() {
+        let bundled = resources.join("lib").join("libspeexdsp.dylib");
+        if bundled.is_file() {
+            candidates.push(bundled.to_string_lossy().into_owned());
+        }
+    }
+    candidates.extend(SPEEX_LIBRARY_CANDIDATES.iter().map(|c| (*c).to_string()));
+    candidates
+}
+
 impl SpeexLibrary {
     fn load() -> Result<Self, AppError> {
-        let mut attempted = Vec::with_capacity(SPEEX_LIBRARY_CANDIDATES.len());
-        for candidate in SPEEX_LIBRARY_CANDIDATES {
-            attempted.push(candidate.to_string());
+        let candidates = speex_library_candidates();
+        let mut attempted = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            attempted.push(candidate.clone());
             let path = CString::new(candidate).map_err(|error| AppError {
                 code: "aec_library_path_invalid".to_string(),
                 message: "SpeexDSP library path is invalid.".to_string(),

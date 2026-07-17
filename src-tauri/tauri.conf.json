@@ -46,6 +46,11 @@
       "binaries/scribe-dictation-polish",
       "binaries/scribe-meeting-detector"
     ],
+    "resources": {
+      "resources/whisper": "whisper",
+      "resources/models": "models",
+      "resources/lib": "lib"
+    },
     "macOS": {
       "minimumSystemVersion": "13.0",
       "infoPlist": "Info.plist",

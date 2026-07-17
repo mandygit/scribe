@@ -306,41 +306,12 @@ fn prepare_whisper_input(audio_path: &Path, temp_dir: &Path) -> Result<PathBuf, 
     }
 
     let converted_path = temp_dir.join("whisper-input.wav");
-    let ffmpeg_path = crate::media_import::resolve_ffmpeg_path(None)?;
-    let output = Command::new(ffmpeg_path)
-        .arg("-y")
-        .arg("-i")
-        .arg(audio_path)
-        .arg("-vn")
-        .arg("-ac")
-        .arg("1")
-        .arg("-ar")
-        .arg(WHISPER_INPUT_SAMPLE_RATE_HZ.to_string())
-        .arg("-sample_fmt")
-        .arg("s16")
-        .arg("-f")
-        .arg("wav")
-        .arg(&converted_path)
-        .output()
-        .map_err(|error| {
-            transcription_error(
-                "transcription_audio_conversion_failed",
-                "Could not start ffmpeg to convert audio for transcription.",
-                Some(error.to_string()),
-            )
-        })?;
-
-    if !output.status.success() {
-        return Err(transcription_error(
-            "transcription_audio_conversion_failed",
-            "ffmpeg could not convert the audio file for transcription.",
-            Some(format!(
-                "path={}, stderr={}",
-                audio_path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )),
-        ));
-    }
+    crate::media_import::convert_to_mono_s16_wav(
+        audio_path,
+        &converted_path,
+        WHISPER_INPUT_SAMPLE_RATE_HZ,
+        "transcription_audio_conversion_failed",
+    )?;
 
     Ok(converted_path)
 }

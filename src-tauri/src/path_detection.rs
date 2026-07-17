@@ -73,7 +73,46 @@ fn detect_local_paths() -> DetectedLocalPaths {
         .clone()
 }
 
+/// Root of the resources that ship inside the app bundle: the source-tree
+/// `src-tauri/resources` in development, `Scribe.app/Contents/Resources` when
+/// running the packaged app. Assembled by `scripts/bundle-whisper-cli.sh` and
+/// `scripts/fetch-whisper-model.sh`, so it may be absent in a fresh checkout.
+pub(crate) fn bundled_resources_dir() -> Option<PathBuf> {
+    let development_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+    if development_dir.is_dir() {
+        return Some(development_dir);
+    }
+
+    let executable_path = env::current_exe().ok()?;
+    let resources_dir = executable_path.parent()?.parent()?.join("Resources");
+    resources_dir.is_dir().then_some(resources_dir)
+}
+
+fn bundled_whisper_binary_path() -> Option<String> {
+    let path = bundled_resources_dir()?.join("whisper").join("whisper-cli");
+    is_file(&path).then(|| path.to_string_lossy().into_owned())
+}
+
+fn bundled_whisper_model_path() -> Option<String> {
+    let models_dir = bundled_resources_dir()?.join("models");
+    let mut candidates: Vec<PathBuf> = fs::read_dir(models_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_candidate_for_kind(path, &ModelKind::Whisper))
+        .collect();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 fn detect_whisper_binary_path() -> Option<String> {
+    if let Some(bundled) = bundled_whisper_binary_path() {
+        return Some(bundled);
+    }
+
     for candidate in WHISPER_BINARY_CANDIDATES {
         let path = Path::new(candidate);
         if is_file(path) {
@@ -92,6 +131,12 @@ fn find_binary_on_path(binary_name: &str) -> Option<PathBuf> {
 }
 
 fn detect_model_path(kind: ModelKind) -> Option<String> {
+    if matches!(kind, ModelKind::Whisper) {
+        if let Some(bundled) = bundled_whisper_model_path() {
+            return Some(bundled);
+        }
+    }
+
     let roots = search_roots();
     let mut candidates = spotlight_search(
         match kind {

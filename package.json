@@ -8,8 +8,9 @@
     "build": "tsc --noEmit --project tsconfig.json && tsc --noEmit --project tsconfig.node.json && vite build",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "package:mac": "tauri build --bundles app",
-    "package:mac:dmg": "tauri build --bundles dmg",
+    "package:prepare": "./scripts/bundle-whisper-cli.sh && ./scripts/fetch-whisper-model.sh && ./scripts/bundle-speexdsp.sh",
+    "package:mac": "bun run package:prepare && tauri build --bundles app",
+    "package:mac:dmg": "bun run package:prepare && tauri build --bundles dmg",
     "test:frontend": "bun test tests/frontend",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri"
