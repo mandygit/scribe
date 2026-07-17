@@ -2,6 +2,8 @@
 
 **Private, on-device meeting notes and dictation for macOS.**
 
+![Scribe in action: meeting summary, transcript, trends, and system-wide dictation](docs/demo.gif)
+
 Scribe is a Tauri desktop app that records meetings locally, transcribes them with
 `whisper.cpp`, and writes concise notes (executive summary, decisions, open
 questions, action items) with a local LLM — nothing leaves your Mac. It also
