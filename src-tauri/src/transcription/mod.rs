@@ -275,7 +275,7 @@ impl Transcriber for WhisperShellTranscriber {
 }
 
 /// Turns the user's raw vocabulary text (comma- or newline-separated terms)
-/// into the whisper initial prompt, e.g. "Glossary: AcmeRAG, Jira.".
+/// into the whisper initial prompt, e.g. "Glossary: Kubernetes, Jira.".
 /// Returns `None` when there are no usable terms.
 pub fn normalized_vocabulary_prompt(raw: Option<&str>) -> Option<String> {
     let terms: Vec<&str> = raw?
@@ -919,8 +919,8 @@ mod tests {
     #[test]
     fn vocabulary_prompt_normalizes_commas_newlines_and_blanks() {
         assert_eq!(
-            normalized_vocabulary_prompt(Some("AcmeRAG, Jira\n Snyk ,,\n")),
-            Some("Glossary: AcmeRAG, Jira, Snyk.".to_string())
+            normalized_vocabulary_prompt(Some("Kubernetes, Jira\n Snyk ,,\n")),
+            Some("Glossary: Kubernetes, Jira, Snyk.".to_string())
         );
         assert_eq!(normalized_vocabulary_prompt(Some("  , \n ")), None);
         assert_eq!(normalized_vocabulary_prompt(None), None);
@@ -931,7 +931,7 @@ mod tests {
         // Every whisper BPE token covers at least one character, and product
         // names average well under four characters per token, so chars/4 + 1
         // must stay a safe underestimate that leaves no rolling-context room.
-        let prompt = normalized_vocabulary_prompt(Some("AcmeRAG, Jira, Snyk, Langflow"))
+        let prompt = normalized_vocabulary_prompt(Some("Kubernetes, Jira, Snyk, Langflow"))
             .expect("prompt is built");
         let budget = vocabulary_max_context(&prompt);
         assert!(budget >= 1);

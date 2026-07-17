@@ -179,7 +179,7 @@ pub struct ScribeSettings {
     pub transcriber_bin_path: Option<String>,
     pub transcriber_model_path: Option<String>,
     /// Comma- or newline-separated domain terms (product names, tools) that
-    /// bias whisper toward correct spellings, e.g. "AcmeRAG, Jira".
+    /// bias whisper toward correct spellings, e.g. "Kubernetes, Jira".
     pub transcriber_vocabulary: Option<String>,
     pub speaker_embedding_model_path: Option<String>,
     pub speaker_segmentation_model_path: Option<String>,

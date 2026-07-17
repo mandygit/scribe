@@ -1751,13 +1751,13 @@ function SettingsView({
           <div>
             <div className="field-label">Custom vocabulary</div>
             <p className="field-desc">
-              Product names and jargon whisper should spell correctly, separated by commas (e.g. AcmeRAG, Jira). Applies
-              to meetings and dictation.
+              Product names and jargon whisper should spell correctly, separated by commas (e.g. Kubernetes, Jira).
+              Applies to meetings and dictation.
             </p>
           </div>
           <textarea
             value={transcriberVocabulary}
-            placeholder="AcmeRAG, Jira, Confluence"
+            placeholder="Kubernetes, Jira, Confluence"
             rows={3}
             maxLength={600}
             onChange={(event) => setTranscriberVocabulary(event.target.value)}
