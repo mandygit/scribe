@@ -8,6 +8,12 @@ questions, action items) with a local LLM — nothing leaves your Mac. It also
 ships a system-wide dictation mode: hold a hotkey, speak, and the transcribed
 (optionally polished) text is pasted into whatever app you were typing into.
 
+The dictation mode makes Scribe a private, local alternative to
+[Wispr Flow](https://wisprflow.ai): the same speak-anywhere workflow (hotkey,
+floating pill, AI-polished text injected into the focused app), but
+transcription and polish run entirely on-device — no subscription, no audio
+leaving your machine.
+
 ## What it does today
 
 | Capability | What it gives you |
