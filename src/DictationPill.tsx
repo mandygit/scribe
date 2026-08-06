@@ -5,6 +5,7 @@ import {
   getAppStatus,
   isTauriRuntime,
   listenToDictationLevel,
+  listenToDictationPasteFailed,
   listenToDictationPillHover,
   listenToDictationState,
   listenToPolishSelectionNotice,
@@ -15,6 +16,14 @@ import {
 
 /** How long a polish-selection notice (e.g. "select text first") stays visible. */
 const NOTICE_DURATION_MS = 2500;
+
+/**
+ * Paste-failed notices stay up longer than a normal notice: the message is
+ * longer (it has to point the user at the Dictation tab, not just say "try
+ * again"), and missing it means the dictated text looks lost until they
+ * happen to open the app.
+ */
+const PASTE_FAILED_NOTICE_DURATION_MS = 6000;
 
 /** Bars in the listening waveform; must fit the listening capsule width. */
 const BAR_COUNT = 9;
@@ -105,12 +114,12 @@ export default function DictationPill() {
 
   const layout: PillLayout = notice !== null ? 'notice' : state === 'idle' && hovered ? 'hover' : state;
 
-  const showNotice = useCallback((message: string) => {
+  const showNotice = useCallback((message: string, durationMs: number = NOTICE_DURATION_MS) => {
     if (noticeTimeoutRef.current !== null) {
       window.clearTimeout(noticeTimeoutRef.current);
     }
     setNotice(message);
-    noticeTimeoutRef.current = window.setTimeout(() => setNotice(null), NOTICE_DURATION_MS);
+    noticeTimeoutRef.current = window.setTimeout(() => setNotice(null), durationMs);
   }, []);
 
   /** Pushes one mic level into the scrolling waveform, bypassing React state (30 Hz). */
@@ -161,6 +170,9 @@ export default function DictationPill() {
           await listenToPolishSelectionNotice(showNotice),
           await listenToDictationLevel(pushLevel),
           await listenToDictationPillHover(setHovered),
+          await listenToDictationPasteFailed(() =>
+            showNotice('Paste failed — recover it from Dictation', PASTE_FAILED_NOTICE_DURATION_MS),
+          ),
         ];
         if (cancelled) {
           for (const handle of handles) {

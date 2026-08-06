@@ -68,6 +68,47 @@ struct AppState {
     /// The "record this meeting?" prompt's state machine (see
     /// `meeting_detection::advance`).
     meeting_call_state: Mutex<CallPromptState>,
+    /// The app that was frontmost when the current dictation session started
+    /// (see `dictation::capture_frontmost_app`), so the paste at the end can
+    /// explicitly reactivate it instead of relying on key focus implicitly
+    /// falling back there once the pill hides — a race that gets less
+    /// reliable across multiple displays/Spaces. `None` once consumed by the
+    /// paste, or if no dictation is in flight.
+    dictation_target_app: Mutex<Option<dictation::TargetAppPid>>,
+    /// The most recently dictated text, kept in memory only (never written to
+    /// disk — dictation sessions are deliberately not persisted with their
+    /// text, see `CreateDictationSession`'s doc comment) so that if the
+    /// auto-paste didn't land, the user can still retrieve it from within the
+    /// app instead of relying on the clipboard alone, which may already have
+    /// been overwritten by something else by the time they notice. Replaced
+    /// by the next dictation regardless of that one's own paste outcome.
+    last_dictation: Mutex<Option<LastDictationRecovery>>,
+}
+
+/// See `AppState::last_dictation`.
+#[derive(Debug, Clone)]
+struct LastDictationRecovery {
+    text: String,
+    pasted: bool,
+    at_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LastDictationRecoveryDto {
+    text: String,
+    pasted: bool,
+    at_ms: u64,
+}
+
+impl From<LastDictationRecovery> for LastDictationRecoveryDto {
+    fn from(recovery: LastDictationRecovery) -> Self {
+        Self {
+            text: recovery.text,
+            pasted: recovery.pasted,
+            at_ms: recovery.at_ms,
+        }
+    }
 }
 
 fn load_effective_settings(repository: &SqliteRepository) -> Result<ScribeSettings, AppError> {
@@ -812,9 +853,13 @@ fn stop_dictation_capture(state: &AppState) -> Result<(PathBuf, ScribeSettings, 
 const MIN_DICTATION_DURATION_MS: u64 = 500;
 
 /// Computes word count and words-per-minute for a finished dictation and
-/// persists a stats-only summary row (never the transcript itself). Best-effort:
-/// logs and continues on failure so persistence can never disrupt the inject
-/// flow, and skips near-zero-duration captures that are likely stray taps.
+/// persists the summary row together with the dictated text itself, so the
+/// Dictation history page can show and copy it later. The text is subject to
+/// the same `raw_audio_retention_days` window as meeting audio (see
+/// `apply_dictation_text_retention_policy`), so it doesn't linger forever.
+/// Best-effort: logs and continues on failure so persistence can never
+/// disrupt the inject flow, and skips near-zero-duration captures that are
+/// likely stray taps.
 fn record_dictation_session(state: &AppState, started_at_ms: u64, text: &str) {
     if text.trim().is_empty() {
         return;
@@ -846,6 +891,7 @@ fn record_dictation_session(state: &AppState, started_at_ms: u64, text: &str) {
         word_count,
         words_per_minute,
         created_at_ms: ended_at_ms,
+        text: Some(text.to_string()),
     };
     let result = state
         .repository
@@ -919,6 +965,12 @@ struct DictationStateEvent {
 fn emit_dictation_state(app: &AppHandle, state: &'static str) {
     let _ = app.emit(DICTATION_STATE_EVENT, DictationStateEvent { state });
 }
+
+/// Event the pill listens to when a dictation's paste didn't land (e.g. the
+/// Accessibility permission was revoked, or the target app's focus handoff
+/// failed), so it can point the user at the in-app recovery text instead of
+/// the paste silently going nowhere.
+const DICTATION_PASTE_FAILED_EVENT: &str = "scribe://dictation-paste-failed";
 
 /// Event the pill listens to while dictation records: the live microphone
 /// input level (RMS, 0..=1) driving its waveform.
@@ -1873,6 +1925,13 @@ fn start_dictation_session(app: &AppHandle) {
     let state = app.state::<AppState>();
     match begin_dictation(&state) {
         Ok(()) => {
+            // Snapshot the paste target now, before the pill (or anything
+            // else) can steal key focus — this is a point-in-time query, so
+            // capturing it any later would risk recording the wrong app.
+            #[cfg(target_os = "macos")]
+            if let Ok(mut target) = state.dictation_target_app.lock() {
+                *target = dictation::capture_frontmost_app();
+            }
             eprintln!("dictation: listening…");
             set_recording_indicator(app, true);
             emit_dictation_state(app, "listening");
@@ -1915,27 +1974,45 @@ fn stop_and_process_dictation(app: &AppHandle) {
                     }
                 }
                 record_dictation_session(&state, started_at_ms, &text);
-                // Before pasting, hand key focus back to the user's app: clicking the
-                // pill can make it the key window (dropping the user's field as first
+                // Before pasting, hand focus back to the user's app: clicking the pill
+                // can make it the key window (dropping the user's field as first
                 // responder), so a synthesised Cmd+V would land nowhere. Hiding the
-                // always-on-top pill returns key to the previously-active window;
-                // after the paste, bring the pill back without re-keying it. Skipped
-                // for empty transcripts (inject is a no-op then).
+                // always-on-top pill is a first step (it can't hold key focus while
+                // hidden); after the paste, bring the pill back without re-keying it.
+                // Skipped for empty transcripts (inject is a no-op then).
                 #[cfg(target_os = "macos")]
                 let restore_pill = !text.trim().is_empty();
                 #[cfg(target_os = "macos")]
                 if restore_pill {
                     set_pill_visible(&app, false);
-                    // Brief: just long enough for key focus to return to the user's
-                    // window before the synthesised paste fires.
-                    std::thread::sleep(std::time::Duration::from_millis(70));
                 }
-                let inject_result = dictation::inject_text(&text);
+                // The real handoff: explicitly reactivate whichever app was frontmost
+                // when dictation started (captured in `start_dictation_session`),
+                // rather than just hiding the pill and hoping key focus falls back
+                // there on its own — that implicit fallback gets less reliable the
+                // more displays/Spaces are in play, since there is more than one
+                // place focus could land. Consumed (taken) so a later dictation
+                // doesn't accidentally reuse a stale target.
+                #[cfg(target_os = "macos")]
+                let target_app = state
+                    .dictation_target_app
+                    .lock()
+                    .ok()
+                    .and_then(|mut target| target.take());
+                #[cfg(not(target_os = "macos"))]
+                let target_app = None;
+                let inject_result = dictation::inject_text(&text, target_app);
                 #[cfg(target_os = "macos")]
                 if restore_pill {
                     // inject_text already waited for the paste keystroke, so the pill
                     // can float back immediately.
                     set_pill_visible(&app, true);
+                }
+                // Record the outcome before propagating any error, so a failed paste
+                // doesn't also lose the only copy of what was dictated — see
+                // `AppState::last_dictation`.
+                if !text.trim().is_empty() {
+                    record_last_dictation(&state, &text, inject_result.is_ok());
                 }
                 inject_result?;
                 Ok(text)
@@ -1951,10 +2028,59 @@ fn stop_and_process_dictation(app: &AppHandle) {
             }
             Err(error) => {
                 eprintln!("dictation stop failed: {} ({})", error.message, error.code);
+                emit_dictation_paste_failed(&app);
             }
         }
         emit_dictation_state(&app, "idle");
     });
+}
+
+/// Saves the just-dictated text in memory (see `AppState::last_dictation`) so
+/// it can be recovered from the app if the paste didn't land, regardless of
+/// whether this particular paste succeeded.
+fn record_last_dictation(state: &AppState, text: &str, pasted: bool) {
+    let at_ms = match current_time_ms() {
+        Ok(ms) => ms,
+        Err(error) => {
+            eprintln!(
+                "dictation: could not timestamp recovery text ({})",
+                error.code
+            );
+            return;
+        }
+    };
+    if let Ok(mut last) = state.last_dictation.lock() {
+        *last = Some(LastDictationRecovery {
+            text: text.to_string(),
+            pasted,
+            at_ms,
+        });
+    }
+}
+
+/// Reads back whatever was last saved by `record_last_dictation`, for the
+/// Dictation view's recovery card.
+#[tauri::command]
+fn get_last_dictation_recovery(
+    state: State<'_, AppState>,
+) -> Result<Option<LastDictationRecoveryDto>, AppError> {
+    let last = state.last_dictation.lock().map_err(map_lock_error)?;
+    Ok(last.clone().map(LastDictationRecoveryDto::from))
+}
+
+/// Notifies every window that the last dictation's paste failed, so the pill
+/// can point the user at the in-app recovery text instead of leaving them to
+/// notice a silently-missing paste. Reads the just-recorded text back out of
+/// state rather than threading it through the call stack, since it was
+/// already saved by `record_last_dictation` moments earlier.
+fn emit_dictation_paste_failed(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let Ok(last) = state.last_dictation.lock() else {
+        return;
+    };
+    if last.as_ref().is_some_and(|recovery| !recovery.pasted) {
+        let _ = app.emit(DICTATION_PASTE_FAILED_EVENT, ());
+    }
 }
 
 /// Handles one dictation hotkey press: advances the Wispr-style press tracker and
@@ -2011,7 +2137,7 @@ fn toggle_dictation(app: AppHandle, state: State<'_, AppState>) -> Result<(), Ap
 /// main thread because it spawns `pbcopy` and `osascript`.
 #[tauri::command]
 async fn inject_dictation_text(text: String) -> Result<(), AppError> {
-    tauri::async_runtime::spawn_blocking(move || dictation::inject_text(&text))
+    tauri::async_runtime::spawn_blocking(move || dictation::inject_text(&text, None))
         .await
         .map_err(|error| AppError {
             code: "dictation_inject_task_failed".to_string(),
@@ -2315,7 +2441,8 @@ fn update_privacy_settings(
             skipped_audio_file_count: 0,
         }
     } else {
-        let cutoff_ms = retention_cutoff_ms(retention_days, current_time_ms()?);
+        let now_ms = current_time_ms()?;
+        let cutoff_ms = retention_cutoff_ms(retention_days, now_ms);
         let expired_metadata = {
             let repository = state.repository.lock().map_err(map_lock_error)?;
             repository.list_audio_metadata_before(cutoff_ms)?
@@ -2323,6 +2450,11 @@ fn update_privacy_settings(
         let mut cleanup = delete_retained_audio_files(&expired_metadata, &app_data_dir(&app)?)?;
         let repository = state.repository.lock().map_err(map_lock_error)?;
         remove_retained_audio_metadata(&repository, &expired_metadata, &mut cleanup)?;
+        // Applying the new retention window immediately, not just on next
+        // app launch, matches how the audio cleanup above already behaves —
+        // a user who shortens the window shouldn't have to relaunch to see
+        // old dictated text actually clear.
+        apply_dictation_text_retention_policy(&repository, retention_days, now_ms)?;
         cleanup
     };
 
@@ -2473,6 +2605,7 @@ pub fn run() {
             list_dictation_sessions,
             delete_dictation_session,
             get_dictation_stats_summary,
+            get_last_dictation_recovery,
             toggle_dictation,
             set_pill_layout,
             inject_dictation_text,
@@ -2519,8 +2652,12 @@ pub fn run() {
                 polish_selection_notice_count: Mutex::new(0),
                 meeting_detector: Mutex::new(TeamsCallDetector::new()),
                 meeting_call_state: Mutex::new(CallPromptState::default()),
+                dictation_target_app: Mutex::new(None),
+                last_dictation: Mutex::new(None),
             });
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
+            #[cfg(target_os = "macos")]
+            dictation::spawn_frontmost_app_tracker();
 
             #[cfg(desktop)]
             {
@@ -3155,6 +3292,19 @@ fn apply_audio_retention_policy(
     Ok(summary)
 }
 
+/// Clears the `text` of dictation sessions older than `retention_days`,
+/// mirroring `apply_audio_retention_policy` — same setting
+/// (`raw_audio_retention_days`), same cutoff calculation, just no files to
+/// delete since dictation text lives only in the database.
+fn apply_dictation_text_retention_policy(
+    repository: &SqliteRepository,
+    retention_days: u16,
+    now_ms: u64,
+) -> Result<usize, AppError> {
+    let cutoff_ms = retention_cutoff_ms(retention_days, now_ms);
+    repository.clear_expired_dictation_text(cutoff_ms)
+}
+
 fn spawn_audio_retention_cleanup(database_path: PathBuf, app_data_dir: PathBuf) {
     std::thread::spawn(move || {
         if let Err(error) = run_audio_retention_cleanup(database_path, app_data_dir) {
@@ -3169,12 +3319,14 @@ fn run_audio_retention_cleanup(
 ) -> Result<(), AppError> {
     let repository = SqliteRepository::open(database_path)?;
     let settings = repository.get_settings()?;
+    let now_ms = current_time_ms()?;
     apply_audio_retention_policy(
         &repository,
         &app_data_dir,
         settings.raw_audio_retention_days,
-        current_time_ms()?,
+        now_ms,
     )?;
+    apply_dictation_text_retention_policy(&repository, settings.raw_audio_retention_days, now_ms)?;
     Ok(())
 }
 
@@ -3879,6 +4031,57 @@ mod tests {
             .get_audio_metadata(&fresh_meeting_id)
             .expect("fresh metadata lookup succeeds")
             .is_some());
+    }
+
+    #[test]
+    fn dictation_text_retention_policy_clears_only_expired_text() {
+        let repository = test_repository("dictation-text-retention-policy");
+
+        repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-expired"),
+                started_at_ms: 1_000,
+                ended_at_ms: 2_000,
+                duration_ms: 1_000,
+                word_count: 3,
+                words_per_minute: 90.0,
+                created_at_ms: 1_000,
+                text: Some("old dictated text".to_string()),
+            })
+            .expect("expired session can be created");
+        repository
+            .create_dictation_session(&CreateDictationSession {
+                id: DictationSessionId::new("dictation-fresh"),
+                started_at_ms: MILLIS_PER_DAY * 3,
+                ended_at_ms: MILLIS_PER_DAY * 3 + 1_000,
+                duration_ms: 1_000,
+                word_count: 3,
+                words_per_minute: 90.0,
+                created_at_ms: MILLIS_PER_DAY * 3,
+                text: Some("fresh dictated text".to_string()),
+            })
+            .expect("fresh session can be created");
+
+        let cleared =
+            apply_dictation_text_retention_policy(&repository, 1, MILLIS_PER_DAY * 2)
+                .expect("retention policy can run");
+        assert_eq!(cleared, 1);
+
+        let sessions = repository
+            .list_dictation_sessions(10, 0)
+            .expect("sessions can be listed");
+        let expired = sessions
+            .iter()
+            .find(|session| session.id == DictationSessionId::new("dictation-expired"))
+            .expect("expired session is still present");
+        let fresh = sessions
+            .iter()
+            .find(|session| session.id == DictationSessionId::new("dictation-fresh"))
+            .expect("fresh session is still present");
+        // The stats row survives — only the text is cleared.
+        assert_eq!(expired.word_count, 3);
+        assert_eq!(expired.text, None);
+        assert_eq!(fresh.text, Some("fresh dictated text".to_string()));
     }
 
     #[test]

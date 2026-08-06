@@ -61,7 +61,7 @@ pub fn polish_selection() -> Result<SelectionPolishOutcome, AppError> {
         return Ok(SelectionPolishOutcome::NoSelection);
     }
 
-    match inject_text(&polished) {
+    match inject_text(&polished, None) {
         Ok(()) => Ok(SelectionPolishOutcome::Applied),
         Err(_) => Ok(SelectionPolishOutcome::PasteFailed),
     }

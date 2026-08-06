@@ -9,14 +9,92 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardWriting};
+use objc2_app_kit::{
+    NSApplicationActivationOptions, NSPasteboard, NSPasteboardItem, NSPasteboardWriting,
+    NSRunningApplication, NSWorkspace,
+};
 use objc2_foundation::{NSArray, NSData, NSString};
 
 use crate::domain::AppError;
+
+/// The process id of whichever app was frontmost just before dictation
+/// started, i.e. the paste target.
+pub type TargetAppPid = libc::pid_t;
+
+/// How often the background tracker in [`spawn_frontmost_app_tracker`]
+/// polls `NSWorkspace.frontmostApplication`.
+const FRONTMOST_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// The most recent frontmost app that was NOT Scribe itself, kept fresh by
+/// [`spawn_frontmost_app_tracker`]. Read by [`last_external_frontmost_app`].
+static LAST_EXTERNAL_FRONTMOST: StdMutex<Option<TargetAppPid>> = StdMutex::new(None);
+
+/// A single point-in-time read of `NSWorkspace.frontmostApplication`'s pid.
+fn frontmost_app_pid() -> Option<TargetAppPid> {
+    Some(NSWorkspace::sharedWorkspace().frontmostApplication()?.processIdentifier())
+}
+
+/// Starts a background thread that keeps [`LAST_EXTERNAL_FRONTMOST`] fresh
+/// for the lifetime of the app. Must be called once at startup.
+///
+/// A point-in-time "what's frontmost right now" query, taken only when
+/// dictation starts, is too late for the pill's click-to-start path: clicking
+/// the pill's mic button routes through Scribe's own WKWebView, which makes
+/// Scribe itself `NSWorkspace.frontmostApplication` by the time the resulting
+/// IPC call reaches Rust (confirmed live 2026-08-06 — the point-in-time
+/// version captured pid/name of "Scribe" itself as the paste target, every
+/// time dictation was started by clicking the pill). Continuously tracking
+/// the last *external* (non-Scribe) frontmost app sidesteps this: whatever
+/// the user was in right before touching the pill is still the most recent
+/// value recorded, regardless of what Scribe's own click momentarily did to
+/// activation. The hotkey-triggered start path never touches Scribe's own
+/// windows at all, so it's unaffected either way — the tracked value is
+/// already correct there too.
+///
+/// Polling (like the pill's hover detection) rather than an
+/// `NSWorkspaceDidActivateApplicationNotification` observer, for the same
+/// reason: it avoids Cocoa notification/observer plumbing for a value that's
+/// cheap to re-read a few times a second.
+pub fn spawn_frontmost_app_tracker() {
+    let own_pid = std::process::id() as TargetAppPid;
+    std::thread::spawn(move || loop {
+        if let Some(pid) = frontmost_app_pid() {
+            if pid != own_pid {
+                if let Ok(mut last) = LAST_EXTERNAL_FRONTMOST.lock() {
+                    *last = Some(pid);
+                }
+            }
+        }
+        std::thread::sleep(FRONTMOST_POLL_INTERVAL);
+    });
+}
+
+/// The most recently observed non-Scribe frontmost app, to be handed back to
+/// [`reactivate`] right before pasting. Returns `None` if none has been
+/// observed yet (e.g. dictation started within the first poll tick after
+/// launch), in which case paste falls back to the prior implicit
+/// hide-the-pill-and-hope behavior.
+pub fn capture_frontmost_app() -> Option<TargetAppPid> {
+    LAST_EXTERNAL_FRONTMOST.lock().ok().and_then(|guard| *guard)
+}
+
+/// Explicitly reactivates the app captured by [`capture_frontmost_app`] so
+/// the synthesised Cmd+V has a real target to land in, instead of relying on
+/// key focus implicitly falling back to "whatever window was previously
+/// active" after hiding the pill — a race that gets less reliable across
+/// multiple displays/Spaces, since there is more than one place focus could
+/// land. A no-op (returns `false`) if the app has since quit.
+pub fn reactivate(pid: TargetAppPid) -> bool {
+    let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+        return false;
+    };
+    app.activateWithOptions(NSApplicationActivationOptions::empty())
+}
 
 /// How long to wait after the Cmd+V keystroke before restoring the previous
 /// clipboard. The keystroke call returning only means the event was posted;
@@ -24,19 +102,39 @@ use crate::domain::AppError;
 /// would paste the old contents instead of the transcript.
 const PASTE_SETTLE: Duration = Duration::from_millis(300);
 
+/// How long to wait after [`reactivate`] succeeds before firing the paste
+/// keystroke, so the target app has actually become key by the time it does.
+const TARGET_ACTIVATION_SETTLE: Duration = Duration::from_millis(100);
+
 /// Every flavor of every item on the pasteboard, as raw bytes keyed by UTI.
 /// Full fidelity — screenshots, rich text, and multi-item copies all survive.
 type ClipboardSnapshot = Vec<Vec<(String, Vec<u8>)>>;
 
-/// Injects `text` into the focused app. Blank text is a no-op so a silent
-/// dictation doesn't clear the clipboard or fire a stray paste.
+/// Injects `text` into `target` (the app that was frontmost when dictation
+/// started, from [`capture_frontmost_app`]). Blank text is a no-op so a
+/// silent dictation doesn't clear the clipboard or fire a stray paste.
 ///
 /// The previous clipboard contents — including images and other non-text
 /// flavors — are saved first and put back once the paste has landed, so
 /// dictating doesn't eat whatever the user last copied.
-pub fn inject_text(text: &str) -> Result<(), AppError> {
+pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<(), AppError> {
     if text.trim().is_empty() {
         return Ok(());
+    }
+    // Explicitly reactivate the app that was frontmost when dictation
+    // started, rather than trusting key focus to fall back there on its own
+    // once the pill hides — that implicit handoff gets less reliable the
+    // more displays/Spaces are in play. Best-effort: if the app already quit
+    // or there was no captured target, fall through to the caller's existing
+    // hide-the-pill-and-settle behavior.
+    if let Some(pid) = target {
+        if reactivate(pid) {
+            // activateWithOptions returning true only means the request was
+            // accepted; the window server still processes the actual key
+            // window handoff asynchronously. Same order of magnitude as the
+            // settle this replaces (the old hide-pill sleep).
+            std::thread::sleep(TARGET_ACTIVATION_SETTLE);
+        }
     }
     // Best-effort save: an unreadable pasteboard just means there is nothing
     // to put back.
@@ -274,7 +372,7 @@ mod tests {
     #[test]
     fn blank_text_is_a_no_op() {
         // No clipboard write and no paste keystroke should fire for blank input.
-        inject_text("   \n\t").expect("blank input is a no-op");
+        inject_text("   \n\t", None).expect("blank input is a no-op");
     }
 
     /// Minimal valid 1x1 transparent PNG, standing in for a screenshot.

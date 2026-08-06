@@ -1,6 +1,6 @@
 [package]
 name = "scribe"
-version = "0.1.0"
+version = "0.2.0"
 description = "Scribe desktop meeting coach scaffold"
 authors = ["Scribe"]
 edition = "2021"
@@ -31,8 +31,14 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2"
 # clipboard with full fidelity (images, rich text, multiple items) — pbpaste
 # round-trips only plain text.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSRunningApplication",
+    "NSWorkspace",
+] }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSString"] }
+libc = "0.2"
 
 [profile.dev]
 debug = 1

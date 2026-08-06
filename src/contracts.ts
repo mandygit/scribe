@@ -293,6 +293,8 @@ export interface DictationSessionRecord {
   wordCount: number;
   wordsPerMinute: number;
   createdAtMs: number;
+  /** Null once this session has aged past the raw-audio retention window (see ScribeSettings.rawAudioRetentionDays) — the stats row survives, only the text is cleared. */
+  text: string | null;
 }
 
 export interface DictationSessionPage {
@@ -305,6 +307,18 @@ export interface DictationStatsSummary {
   totalWords: number;
   averageWordsPerMinute: number;
   totalDurationMs: number;
+}
+
+/**
+ * The most recently dictated text, kept in memory only on the Rust side (see
+ * `AppState::last_dictation`) so it can be recovered from the app if the
+ * auto-paste didn't land — never written to disk, unlike the stats-only
+ * `DictationSessionRecord` history.
+ */
+export interface LastDictationRecovery {
+  text: string;
+  pasted: boolean;
+  atMs: number;
 }
 
 export type PermissionStatus = 'granted' | 'denied';

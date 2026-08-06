@@ -8,7 +8,7 @@ use crate::domain::{
     Score, ScribeSettings, SegmentId, SummarizerProvider, SummaryId, ThemePreference,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 17;
+const CURRENT_SCHEMA_VERSION: i64 = 18;
 const SETTINGS_ID: &str = "default";
 
 /// SQLite-backed repository for local Scribe data.
@@ -38,9 +38,13 @@ pub struct MeetingRecord {
     pub updated_at_ms: u64,
 }
 
-/// Data needed to create a dictation session summary row. Deliberately carries no
-/// transcript text — only counts and timing, since dictation may include
-/// sensitive content the user never asked to have logged.
+/// Data needed to create a dictation session summary row. Carries the
+/// dictated text itself (unlike the original stats-only design) so the
+/// Dictation history page can show and let the user copy what they actually
+/// said — subject to the same `raw_audio_retention_days` window as meeting
+/// audio (see `apply_dictation_text_retention_policy`), which is why `text`
+/// is optional: once a session ages out, its row is kept for the stats but
+/// the text is cleared.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateDictationSession {
     pub id: DictationSessionId,
@@ -50,6 +54,7 @@ pub struct CreateDictationSession {
     pub word_count: u32,
     pub words_per_minute: f64,
     pub created_at_ms: u64,
+    pub text: Option<String>,
 }
 
 /// Persisted dictation session summary returned by repository reads.
@@ -63,6 +68,7 @@ pub struct DictationSessionRecord {
     pub word_count: u32,
     pub words_per_minute: f64,
     pub created_at_ms: u64,
+    pub text: Option<String>,
 }
 
 /// Aggregate dictation stats across all persisted sessions.
@@ -328,8 +334,9 @@ impl SqliteRepository {
                     duration_ms,
                     word_count,
                     words_per_minute,
-                    created_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    created_at_ms,
+                    text
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     session.id.as_str(),
                     to_db_i64(session.started_at_ms)?,
@@ -338,6 +345,7 @@ impl SqliteRepository {
                     session.word_count,
                     session.words_per_minute,
                     to_db_i64(session.created_at_ms)?,
+                    session.text,
                 ],
             )
             .map_err(map_db_error)?;
@@ -350,6 +358,7 @@ impl SqliteRepository {
             word_count: session.word_count,
             words_per_minute: session.words_per_minute,
             created_at_ms: session.created_at_ms,
+            text: session.text.clone(),
         })
     }
 
@@ -362,7 +371,7 @@ impl SqliteRepository {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, started_at_ms, ended_at_ms, duration_ms, word_count, words_per_minute, created_at_ms
+                "SELECT id, started_at_ms, ended_at_ms, duration_ms, word_count, words_per_minute, created_at_ms, text
                 FROM dictation_sessions
                 ORDER BY started_at_ms DESC, id ASC
                 LIMIT ?1 OFFSET ?2",
@@ -401,8 +410,8 @@ impl SqliteRepository {
             .map_err(map_db_error)
     }
 
-    /// Deletes a single dictation session summary row. No files on disk are
-    /// tied to a dictation session — it's stats-only.
+    /// Deletes a single dictation session row (stats and text together). No
+    /// files on disk are tied to a dictation session.
     pub fn delete_dictation_session(&self, id: &DictationSessionId) -> Result<bool, AppError> {
         self.connection
             .execute(
@@ -410,6 +419,22 @@ impl SqliteRepository {
                 params![id.as_str()],
             )
             .map(|deleted_rows| deleted_rows > 0)
+            .map_err(map_db_error)
+    }
+
+    /// Clears the `text` of every dictation session started at or before
+    /// `cutoff_ms`, leaving its stats row (word count, duration, etc.)
+    /// intact — mirrors how meeting audio retention deletes the audio file
+    /// but keeps the meeting/transcript row. Returns the number of rows
+    /// cleared, for cleanup logging/tests.
+    pub fn clear_expired_dictation_text(&self, cutoff_ms: u64) -> Result<usize, AppError> {
+        self.connection
+            .execute(
+                "UPDATE dictation_sessions
+                SET text = NULL
+                WHERE text IS NOT NULL AND started_at_ms <= ?1",
+                params![to_db_i64(cutoff_ms)?],
+            )
             .map_err(map_db_error)
     }
 
@@ -1548,6 +1573,7 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
                 word_count INTEGER NOT NULL,
                 words_per_minute REAL NOT NULL,
                 created_at_ms INTEGER NOT NULL,
+                text TEXT,
                 CHECK (ended_at_ms >= started_at_ms)
             );
 
@@ -1770,6 +1796,13 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
             [],
         )
         .map_err(map_db_error)?;
+    ensure_column(connection, "dictation_sessions", "text", "TEXT")?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO schema_versions(version) VALUES (18)",
+            [],
+        )
+        .map_err(map_db_error)?;
 
     let version = connection
         .query_row(
@@ -1897,6 +1930,7 @@ fn read_dictation_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dictation
         word_count: from_db_u32(row.get(4)?, 4)?,
         words_per_minute: row.get(5)?,
         created_at_ms: from_db_u64(row.get(6)?)?,
+        text: row.get(7)?,
     })
 }
 
@@ -3601,6 +3635,7 @@ mod tests {
                 word_count: 6,
                 words_per_minute: 120.0,
                 created_at_ms: 4_000,
+                text: Some("hello world".to_string()),
             })
             .expect("first session can be created");
         assert_eq!(first.word_count, 6);
@@ -3615,6 +3650,7 @@ mod tests {
                 word_count: 2,
                 words_per_minute: 120.0,
                 created_at_ms: 6_000,
+                text: None,
             })
             .expect("second session can be created");
 
@@ -3638,6 +3674,7 @@ mod tests {
                 word_count: 3,
                 words_per_minute: 90.0,
                 created_at_ms: 2_000,
+                text: Some("keep me".to_string()),
             })
             .expect("first session can be created");
         test_repository
@@ -3650,6 +3687,7 @@ mod tests {
                 word_count: 5,
                 words_per_minute: 150.0,
                 created_at_ms: 4_000,
+                text: Some("remove me".to_string()),
             })
             .expect("second session can be created");
 
@@ -3696,6 +3734,7 @@ mod tests {
                 word_count: 6,
                 words_per_minute: 100.0,
                 created_at_ms: 4_000,
+                text: Some("first".to_string()),
             })
             .expect("first session can be created");
         test_repository
@@ -3708,6 +3747,7 @@ mod tests {
                 word_count: 4,
                 words_per_minute: 140.0,
                 created_at_ms: 7_000,
+                text: Some("second".to_string()),
             })
             .expect("second session can be created");
 

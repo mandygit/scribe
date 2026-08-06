@@ -5,6 +5,7 @@ import type {
   AudioDevice,
   DictationSessionPage,
   DictationStatsSummary,
+  LastDictationRecovery,
   LiveNudgeEvent,
   MeetingHistoryDetail,
   MeetingHistoryPage,
@@ -26,6 +27,7 @@ export const TRANSCRIPT_SEGMENT_EVENT = 'scribe://transcript-segment';
 export const TRANSCRIPT_STREAM_COMPLETE_EVENT = 'scribe://transcript-stream-complete';
 export const LIVE_NUDGE_EVENT = 'scribe://live-nudge';
 export const DICTATION_STATE_EVENT = 'scribe://dictation-state';
+export const DICTATION_PASTE_FAILED_EVENT = 'scribe://dictation-paste-failed';
 export const DICTATION_LEVEL_EVENT = 'scribe://dictation-level';
 export const DICTATION_PILL_HOVER_EVENT = 'scribe://dictation-pill-hover';
 export const POLISH_SELECTION_NOTICE_EVENT = 'scribe://polish-selection-notice';
@@ -49,6 +51,7 @@ export type {
   DictationSessionPage,
   DictationSessionRecord,
   DictationStatsSummary,
+  LastDictationRecovery,
   LiveNudgeEvent,
   MeetingActionItem,
   MeetingHistoryDetail,
@@ -143,6 +146,9 @@ export const getDictationStatsSummary = async (): Promise<DictationStatsSummary>
 
 export const deleteDictationSession = async (sessionId: string): Promise<void> =>
   invokeNative<void>('delete_dictation_session', { sessionId });
+
+export const getLastDictationRecovery = async (): Promise<LastDictationRecovery | null> =>
+  invokeNative<LastDictationRecovery | null>('get_last_dictation_recovery');
 
 export const startRecording = async (meetingId: string, deviceId?: string): Promise<RecordingStarted> =>
   invokeNative<RecordingStarted>('start_recording', { meetingId, deviceId: deviceId ?? null });
@@ -266,6 +272,16 @@ export const listenToDictationLevel = async (onLevel: (level: number) => void): 
 export const listenToDictationPillHover = async (onHover: (hovering: boolean) => void): Promise<UnlistenFn> => {
   assertTauriRuntime();
   return listen<{ hovering: boolean }>(DICTATION_PILL_HOVER_EVENT, (event) => onHover(event.payload.hovering));
+};
+
+/**
+ * Fires when a dictation's paste didn't land (e.g. missing Accessibility
+ * permission, or the target app's focus handoff failed). The recovered text
+ * itself isn't in the payload — fetch it via `getLastDictationRecovery`.
+ */
+export const listenToDictationPasteFailed = async (onFailed: () => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen(DICTATION_PASTE_FAILED_EVENT, () => onFailed());
 };
 
 export const listenToPolishSelectionNotice = async (onNotice: (message: string) => void): Promise<UnlistenFn> => {

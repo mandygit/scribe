@@ -150,3 +150,24 @@ segment of its title is not a known nav-tab name. Comparing the whole
 prefix (the original implementation) misread every open conversation as a
 live call, popping the record prompt when the user merely clicked around
 Teams.
+
+## Addendum (2026-08-06): title fallback false-positives on popped-out chat windows
+
+Confirmed live: using Teams' "Open in new window" on a chat pops it into its
+own window titled `<Chat name> | Microsoft Teams` — with no "Chat |" nav
+prefix, since it's no longer inside the nav window. That's structurally
+identical to a real meeting window's `<Meeting Name> | Microsoft Teams`
+title; nothing in the text distinguishes them. The fallback signal
+misfired, showing the record prompt for a window that was never a call.
+
+Fix: `currentCallState()` now only trusts the title-based fallback while
+Teams' mic was seen running within the last 60 seconds
+(`lastAudioActiveAt` / `fallbackAudioRecencyWindow` in `main.swift`). A real
+call always runs the mic at least briefly (the primary signal's own
+pre-join mic-check trigger), so this preserves the fallback's original
+purpose — bridging a momentary mic gap mid-call — while a chat/channel
+window that never had any mic activity can no longer trip it. A call
+joined muted from the very start, with the mic literally never active even
+during the pre-join screen, would go undetected until audio starts (a
+known, accepted trade-off — no live session has exhibited that pattern so
+far, only ordinary Teams navigation being misread as a call).

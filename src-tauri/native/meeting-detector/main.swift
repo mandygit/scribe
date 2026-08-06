@@ -244,15 +244,48 @@ enum CallState: String {
     case notInCall = "NOT_IN_CALL"
 }
 
+/// Timestamp of the most recent tick where `isTeamsRunningAudioInput()` was
+/// true. Bounds how long the title-based fallback below stays armed.
+///
+/// Confirmed 2026-08-06: a chat or channel popped out via Teams' "Open in
+/// new window" gets a window titled `<Chat/Channel name> | Microsoft
+/// Teams` -- structurally identical to a real meeting window
+/// (`<Meeting Name> | Microsoft Teams`), since neither has the "Chat |" nav
+/// prefix `looksLikeActiveMeetingWindow` was filtering on. Title text alone
+/// can't tell them apart. Gating the fallback on "the mic ran recently"
+/// closes this false positive: a real call always runs the mic at least
+/// briefly, from the pre-join mic-check screen onward (the primary signal's
+/// own documented behavior above), while a plain popped-out chat window
+/// never triggers any mic activity at all.
+var lastAudioActiveAt: Date?
+
+/// How long the title-based fallback stays armed after mic input was last
+/// seen. Generous enough to bridge the "joined muted, briefly not running"
+/// gap the fallback exists for, without staying armed indefinitely (which
+/// would let a stale meeting window keep matching long after a call ends
+/// and the window lingers on screen).
+let fallbackAudioRecencyWindow: TimeInterval = 60
+
 /// A call is active if Teams is either actively capturing microphone input
 /// (true from the pre-join mic-check screen onward, the primary signal) or,
-/// as a fallback, has an active meeting window open (covers any moment the
-/// mic briefly isn't running, e.g. joined muted with no preview step).
+/// as a fallback -- only while the mic was seen running within the last
+/// `fallbackAudioRecencyWindow` seconds -- has an active meeting window open
+/// (covers any moment the mic briefly isn't running, e.g. a transient mute).
+/// Without the recency gate, this fallback alone can't distinguish a real
+/// meeting window from any other secondary Teams window (see
+/// `lastAudioActiveAt`'s doc comment).
 func currentCallState() -> CallState {
     if isTeamsRunningAudioInput() {
+        lastAudioActiveAt = Date()
         return .inCall
     }
     guard let pid = runningTeamsProcessId() else {
+        return .notInCall
+    }
+    guard
+        let lastActive = lastAudioActiveAt,
+        Date().timeIntervalSince(lastActive) < fallbackAudioRecencyWindow
+    else {
         return .notInCall
     }
     let windows = onScreenWindows(ownedBy: pid)

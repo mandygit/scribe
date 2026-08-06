@@ -20,10 +20,13 @@ import {
   deleteMeeting,
   getAppStatus,
   getDictationStatsSummary,
+  getLastDictationRecovery,
   getMeetingHistoryDetail,
   isTauriRuntime,
+  type LastDictationRecovery,
   listAudioDevices,
   listDictationSessions,
+  listenToDictationState,
   listenToRecordingStarted,
   listenToRecordingStopped,
   listMeetingHistory,
@@ -99,6 +102,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [dictationStats, setDictationStats] = useState<DictationStatsSummary | null>(null);
   const [dictationSessions, setDictationSessions] = useState<DictationSessionRecord[]>([]);
+  const [lastDictation, setLastDictation] = useState<LastDictationRecovery | null>(null);
   const [trendPoints, setTrendPoints] = useState<MeetingTrendPoint[]>([]);
   const [permissions, setPermissions] = useState<PermissionsSnapshot | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
@@ -149,16 +153,47 @@ export default function App() {
   const refreshDictation = useCallback(async () => {
     if (!tauri) return;
     try {
-      const [stats, page] = await Promise.all([
+      const [stats, page, recovery] = await Promise.all([
         getDictationStatsSummary(),
         listDictationSessions(DICTATION_HISTORY_LIMIT, 0),
+        getLastDictationRecovery(),
       ]);
       setDictationStats(stats);
       setDictationSessions(page.items);
+      setLastDictation(recovery);
     } catch (cause) {
       setError(messageFromUnknownError(cause, 'Could not load dictation history.'));
     }
   }, [tauri]);
+
+  // Refreshes the whole Dictation view every time a dictation finishes —
+  // pasted successfully, failed to paste, or no speech detected — not just
+  // the next time the tab happens to be opened. A failed session is already
+  // persisted with its text by that point (Rust writes the DB row before
+  // attempting the paste), so it belongs in the History list right away, not
+  // only in the "Last dictation" recovery card; a successful one deserves
+  // the same live update instead of looking stale until the user navigates
+  // away and back.
+  useEffect(() => {
+    if (!tauri) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listenToDictationState((state) => {
+      if (state === 'idle') {
+        void refreshDictation();
+      }
+    }).then((handle) => {
+      if (cancelled) {
+        handle();
+      } else {
+        unlisten = handle;
+      }
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [tauri, refreshDictation]);
 
   useEffect(() => {
     if (!tauri) return;
@@ -571,6 +606,7 @@ export default function App() {
             <DictationView
               stats={dictationStats}
               sessions={dictationSessions}
+              lastDictation={lastDictation}
               onDelete={(sessionId) => void handleDeleteDictationSession(sessionId)}
             />
           ) : view === 'trends' ? (
@@ -698,10 +734,12 @@ const formatSessionTimestamp = (ms: number): string =>
 function DictationView({
   stats,
   sessions,
+  lastDictation,
   onDelete,
 }: {
   stats: DictationStatsSummary | null;
   sessions: DictationSessionRecord[];
+  lastDictation: LastDictationRecovery | null;
   onDelete: (sessionId: string) => void;
 }) {
   const hasSessions = sessions.length > 0;
@@ -714,6 +752,8 @@ function DictationView({
           <p className="meeting-sub">How much you've dictated on this Mac.</p>
         </div>
       </div>
+
+      {lastDictation ? <LastDictationCard recovery={lastDictation} /> : null}
 
       <div className="stat-grid">
         <StatCard label="Sessions" value={stats ? stats.totalSessions.toLocaleString() : '—'} />
@@ -729,20 +769,7 @@ function DictationView({
       {hasSessions ? (
         <div className="dictation-list">
           {sessions.map((session) => (
-            <div className="dictation-item" key={session.id}>
-              <span className="di-time">{formatSessionTimestamp(session.startedAtMs)}</span>
-              <span className="di-metric">{formatDuration(session.durationMs)}</span>
-              <span className="di-metric">{session.wordCount} words</span>
-              <span className="di-metric">{Math.round(session.wordsPerMinute)} wpm</span>
-              <button
-                type="button"
-                className="mi-delete"
-                aria-label="Delete dictation session"
-                onClick={() => onDelete(session.id)}
-              >
-                <Icon name="trash" size={13} />
-              </button>
-            </div>
+            <DictationHistoryItem key={session.id} session={session} onDelete={onDelete} />
           ))}
         </div>
       ) : (
@@ -754,6 +781,94 @@ function DictationView({
           <p>Double-press your dictation hotkey to start, press it again to insert. Sessions show up here.</p>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * One row of dictation history: the existing time/duration/wpm summary line,
+ * plus (when the session hasn't aged past the retention window) the dictated
+ * text itself with its own copy button — every dictation is recoverable this
+ * way, not just the latest one covered by `LastDictationCard`.
+ */
+function DictationHistoryItem({
+  session,
+  onDelete,
+}: {
+  session: DictationSessionRecord;
+  onDelete: (sessionId: string) => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    if (!session.text) return;
+    void navigator.clipboard.writeText(session.text).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    });
+  }, [session.text]);
+
+  return (
+    <div className="dictation-item">
+      <div className="dictation-item__row">
+        <span className="di-time">{formatSessionTimestamp(session.startedAtMs)}</span>
+        <span className="di-metric">{formatDuration(session.durationMs)}</span>
+        <span className="di-metric">{session.wordCount} words</span>
+        <span className="di-metric">{Math.round(session.wordsPerMinute)} wpm</span>
+        <button
+          type="button"
+          className="mi-delete"
+          aria-label="Delete dictation session"
+          onClick={() => onDelete(session.id)}
+        >
+          <Icon name="trash" size={13} />
+        </button>
+      </div>
+      {session.text ? (
+        <div className="dictation-item__text-row">
+          <p className="dictation-item__text">{session.text}</p>
+          <button type="button" className="dictation-item__copy" onClick={handleCopy}>
+            <Icon name={copied ? 'check' : 'copy'} size={12} />
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Surfaces the most recently dictated text so it can be recovered from
+ * inside the app when the auto-paste doesn't land (missing Accessibility
+ * permission, focus lost to another display, etc.) — the text otherwise only
+ * ever lived on the system clipboard, which the user may have already
+ * overwritten with something else by the time they notice the paste failed.
+ * Shown whenever a recent dictation exists, not only on failure, since the
+ * clipboard is transient either way.
+ */
+function LastDictationCard({ recovery }: { recovery: LastDictationRecovery }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    void navigator.clipboard.writeText(recovery.text).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    });
+  }, [recovery.text]);
+
+  return (
+    <div className={`last-dictation-card${recovery.pasted ? '' : ' is-paste-failed'}`}>
+      <div className="last-dictation-card__header">
+        <span className="last-dictation-card__label">
+          {recovery.pasted ? 'Last dictation' : "Last dictation — didn't paste"}
+        </span>
+        <span className="last-dictation-card__time">{formatSessionTimestamp(recovery.atMs)}</span>
+      </div>
+      <p className="last-dictation-card__text">{recovery.text}</p>
+      <button type="button" className="last-dictation-card__copy" onClick={handleCopy}>
+        <Icon name={copied ? 'check' : 'copy'} size={13} />
+        {copied ? 'Copied' : 'Copy'}
+      </button>
     </div>
   );
 }
@@ -1782,11 +1897,14 @@ function SettingsView({
 
       <section className="settings-group">
         <h2>Privacy</h2>
-        <p className="hint">Audio is deleted after the retention window; transcripts and notes are kept.</p>
+        <p className="hint">
+          Audio is deleted after the retention window; meeting transcripts and notes are kept. Dictated text follows the
+          same window.
+        </p>
         <div className="field">
           <div>
             <div className="field-label">Keep raw audio for</div>
-            <p className="field-desc">Days before recordings are deleted.</p>
+            <p className="field-desc">Days before recordings and dictated text are deleted.</p>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <input

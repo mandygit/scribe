@@ -739,17 +739,73 @@ button {
   margin: 0;
 }
 
+.last-dictation-card {
+  padding: 14px 16px;
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-1);
+  margin-bottom: 20px;
+}
+.last-dictation-card.is-paste-failed {
+  border-color: var(--danger);
+}
+.last-dictation-card__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.last-dictation-card__label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.is-paste-failed .last-dictation-card__label {
+  color: var(--danger);
+}
+.last-dictation-card__time {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.last-dictation-card__text {
+  font-size: 13px;
+  color: var(--text-primary);
+  margin: 0 0 10px;
+  white-space: pre-wrap;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.last-dictation-card__copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-pill, 999px);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+.last-dictation-card__copy:hover {
+  border-color: var(--accent);
+}
+
 .dictation-list {
   display: flex;
   flex-direction: column;
 }
 .dictation-item {
-  display: flex;
-  align-items: center;
-  gap: 16px;
   padding: 10px 0;
   border-bottom: 0.5px solid var(--border);
   font-size: 13px;
+}
+.dictation-item__row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
 .dictation-item .di-time {
   flex: 1;
@@ -760,6 +816,33 @@ button {
   font-variant-numeric: tabular-nums;
   min-width: 70px;
   text-align: right;
+}
+.dictation-item__text-row {
+  margin-top: 8px;
+  padding-left: 2px;
+}
+.dictation-item__text {
+  color: var(--text-secondary);
+  margin: 0 0 6px;
+  white-space: pre-wrap;
+  max-height: 80px;
+  overflow-y: auto;
+}
+.dictation-item__copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-pill, 999px);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.dictation-item__copy:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
 }
 
 /* ---------- Permissions onboarding ---------- */

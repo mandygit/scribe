@@ -18,7 +18,10 @@ pub use capture::{
     DictationRecorder,
 };
 pub use hotkey::{DictationHotkey, HotkeyAction};
-pub use inject::{inject_text, probe_accessibility};
+pub use inject::{
+    capture_frontmost_app, inject_text, probe_accessibility, spawn_frontmost_app_tracker,
+    TargetAppPid,
+};
 pub use selection::{polish_selection, SelectionPolishOutcome};
 
 fn polish_helper_unavailable() -> AppError {
