@@ -61,8 +61,12 @@ pub fn polish_selection() -> Result<SelectionPolishOutcome, AppError> {
         return Ok(SelectionPolishOutcome::NoSelection);
     }
 
+    // No target pid is passed, so the paste-target check never runs and the
+    // outcome is always `Pasted` - correct here, since polish-selection only
+    // gets this far when the focused app handed over a real selection, which
+    // means there is somewhere for the replacement to land.
     match inject_text(&polished, None) {
-        Ok(()) => Ok(SelectionPolishOutcome::Applied),
+        Ok(_) => Ok(SelectionPolishOutcome::Applied),
         Err(_) => Ok(SelectionPolishOutcome::PasteFailed),
     }
 }

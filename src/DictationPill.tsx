@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import './pill.css';
 import {
+  copyLastDictation,
+  type DictationPasteFailure,
   type DictationState,
   getAppStatus,
   isTauriRuntime,
@@ -17,13 +19,8 @@ import {
 /** How long a polish-selection notice (e.g. "select text first") stays visible. */
 const NOTICE_DURATION_MS = 2500;
 
-/**
- * Paste-failed notices stay up longer than a normal notice: the message is
- * longer (it has to point the user at the Dictation tab, not just say "try
- * again"), and missing it means the dictated text looks lost until they
- * happen to open the app.
- */
-const PASTE_FAILED_NOTICE_DURATION_MS = 6000;
+/** Characters of transcript shown in the recovery widget before ellipsis. */
+const RECOVERY_PREVIEW_CHARS = 140;
 
 /** Bars in the listening waveform; must fit the listening capsule width. */
 const BAR_COUNT = 9;
@@ -49,6 +46,7 @@ const LAYOUT_RANK: Record<PillLayout, number> = {
   listening: 2,
   transcribing: 2,
   notice: 3,
+  'paste-failed': 4,
 };
 
 /**
@@ -92,6 +90,7 @@ interface PillDevWindow {
     setState: (state: DictationState) => void;
     showNotice: (message: string) => void;
     pushLevel: (level: number) => void;
+    showPasteFailure: (failure: DictationPasteFailure) => void;
   };
 }
 
@@ -108,11 +107,16 @@ export default function DictationPill() {
   const [notice, setNotice] = useState<string | null>(null);
   const [hovered, setHovered] = useState(false);
   const [hotkeyHint, setHotkeyHint] = useState<string | null>(null);
+  const [pasteFailure, setPasteFailure] = useState<DictationPasteFailure | null>(null);
   const noticeTimeoutRef = useRef<number | null>(null);
   const barsRef = useRef<Array<HTMLSpanElement | null>>([]);
   const levelsRef = useRef<number[]>(Array.from({ length: BAR_COUNT }, () => 0));
 
-  const layout: PillLayout = notice !== null ? 'notice' : state === 'idle' && hovered ? 'hover' : state;
+  // The recovery widget outranks every other layout: it is the only one
+  // holding text the user cannot get back any other way without opening the
+  // app, so a stray hover or notice must not displace it.
+  const layout: PillLayout =
+    pasteFailure !== null ? 'paste-failed' : notice !== null ? 'notice' : state === 'idle' && hovered ? 'hover' : state;
 
   const showNotice = useCallback((message: string, durationMs: number = NOTICE_DURATION_MS) => {
     if (noticeTimeoutRef.current !== null) {
@@ -137,6 +141,12 @@ export default function DictationPill() {
 
   const handleState = useCallback((next: DictationState) => {
     setState(next);
+    // Starting a new dictation supersedes the previous one's recovery widget:
+    // the text behind it is about to be replaced in `AppState::last_dictation`
+    // anyway, so leaving the widget up would offer to copy the wrong thing.
+    if (next === 'listening') {
+      setPasteFailure(null);
+    }
     // A resize under a stationary cursor does not fire mouseleave, which
     // would strand the pill in its hover layout; drop the flag and let a real
     // mousemove re-assert it.
@@ -156,7 +166,12 @@ export default function DictationPill() {
       // No Tauri events exist in a plain browser tab; expose a dev handle so
       // the visual states can still be exercised end-to-end there.
       const devWindow = window as PillDevWindow;
-      devWindow.__scribePillDev = { setState: handleState, showNotice, pushLevel };
+      devWindow.__scribePillDev = {
+        setState: handleState,
+        showNotice,
+        pushLevel,
+        showPasteFailure: setPasteFailure,
+      };
       return () => {
         delete devWindow.__scribePillDev;
       };
@@ -170,9 +185,7 @@ export default function DictationPill() {
           await listenToPolishSelectionNotice(showNotice),
           await listenToDictationLevel(pushLevel),
           await listenToDictationPillHover(setHovered),
-          await listenToDictationPasteFailed(() =>
-            showNotice('Paste failed — recover it from Dictation', PASTE_FAILED_NOTICE_DURATION_MS),
-          ),
+          await listenToDictationPasteFailed(setPasteFailure),
         ];
         if (cancelled) {
           for (const handle of handles) {
@@ -235,6 +248,10 @@ export default function DictationPill() {
     void toggleDictation();
   };
 
+  if (pasteFailure !== null) {
+    return <PasteRecoveryWidget failure={pasteFailure} onDismiss={() => setPasteFailure(null)} />;
+  }
+
   // Hover comes from the Rust cursor watcher in the native shell (DOM mouse
   // events never fire in the non-activating panel); the DOM handlers are the
   // browser-tab fallback for the dev harness.
@@ -288,5 +305,117 @@ export default function DictationPill() {
         <span className="dpill__notice-text">{notice}</span>
       </span>
     </button>
+  );
+}
+
+/**
+ * The recovery widget: what the user sees when a dictation had nowhere to go.
+ *
+ * Rendered as its own root rather than another layout inside the pill's
+ * capsule because it is the only state with controls of its own - the pill is
+ * a single `<button>`, and buttons cannot nest.
+ *
+ * It never closes itself -- not on a timer, and not after Copy. The user
+ * dismisses it, or the next dictation replaces it. A dictation that didn't
+ * paste is only recoverable from here or the app's Dictation tab, and anything
+ * that disappears on its own can disappear while the user is still staring at
+ * the app they expected the text to land in, which is exactly how the text got
+ * lost in the first place.
+ */
+function PasteRecoveryWidget({ failure, onDismiss }: { failure: DictationPasteFailure; onDismiss: () => void }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    // In the native shell the text lives in Rust (it was deliberately never
+    // put on the clipboard on the no-target path), so the copy has to go
+    // through the backend rather than navigator.clipboard -- which is also
+    // unavailable to this panel, being a never-key window.
+    const copy = isTauriRuntime()
+      ? copyLastDictation().then(() => undefined)
+      : navigator.clipboard.writeText(failure.text);
+    void copy
+      .then(() => setCopied(true))
+      .catch((cause) => {
+        console.error('DictationPill: copying the recovered dictation failed', cause);
+      });
+  }, [failure.text]);
+
+  const preview =
+    failure.text.length > RECOVERY_PREVIEW_CHARS
+      ? `${failure.text.slice(0, RECOVERY_PREVIEW_CHARS).trimEnd()}…`
+      : failure.text;
+
+  return (
+    <div className="dpill dpill--recovery" data-layout="paste-failed">
+      <div className="drecover">
+        <div className="drecover__head">
+          <svg
+            className="drecover__icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+            <line x1="12" y1="9" x2="12" y2="13" />
+            <line x1="12" y1="17" x2="12.01" y2="17" />
+          </svg>
+          <span className="drecover__title">
+            {failure.reason === 'no_target'
+              ? 'Nothing to paste into'
+              : failure.reason === 'accessibility_denied'
+                ? 'Accessibility permission needed'
+                : "Couldn't paste"}
+          </span>
+          <button type="button" className="drecover__close" onClick={onDismiss} aria-label="Dismiss">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.4"
+              strokeLinecap="round"
+              aria-hidden="true"
+            >
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+        <p className="drecover__text">{preview}</p>
+        <div className="drecover__actions">
+          <span className="drecover__hint">
+            {failure.reason === 'no_target'
+              ? 'Your cursor wasn\u2019t in a text field.'
+              : failure.reason === 'accessibility_denied'
+                ? 'Re-grant Scribe in System Settings > Privacy & Security > Accessibility.'
+                : 'The paste keystroke was blocked.'}
+          </span>
+          <button type="button" className="drecover__copy" onClick={handleCopy} disabled={copied}>
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              {copied ? (
+                <polyline points="20 6 9 17 4 12" />
+              ) : (
+                <>
+                  <rect x="9" y="9" width="12" height="12" rx="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </>
+              )}
+            </svg>
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AppStatus,
   AudioDevice,
+  DictationPasteFailure,
   DictationSessionPage,
   DictationStatsSummary,
   LastDictationRecovery,
@@ -41,13 +42,15 @@ export type DictationState = 'idle' | 'listening' | 'transcribing';
 /**
  * Visual layouts of the dictation pill. Superset of {@link DictationState}:
  * `hover` is the idle sliver expanded under the cursor, `notice` is the
- * transient polish-selection feedback text.
+ * transient polish-selection feedback text, and `paste-failed` is the
+ * recovery widget - the only layout that persists until dismissed.
  */
-export type PillLayout = DictationState | 'hover' | 'notice';
+export type PillLayout = DictationState | 'hover' | 'notice' | 'paste-failed';
 
 export type {
   AppStatus,
   AudioDevice,
+  DictationPasteFailure,
   DictationSessionPage,
   DictationSessionRecord,
   DictationStatsSummary,
@@ -275,14 +278,25 @@ export const listenToDictationPillHover = async (onHover: (hovering: boolean) =>
 };
 
 /**
- * Fires when a dictation's paste didn't land (e.g. missing Accessibility
- * permission, or the target app's focus handoff failed). The recovered text
- * itself isn't in the payload — fetch it via `getLastDictationRecovery`.
+ * Fires when a dictation's paste didn't land, carrying the transcript so the
+ * pill can raise its recovery widget with the text and a Copy button.
+ *
+ * `no_target` means the app the user was in had nothing focused that takes
+ * text, so nothing was pasted *and* nothing was written to the clipboard --
+ * the widget's Copy button is the only way to get the text without opening
+ * the app. `keystroke_failed` means the paste keystroke itself was refused
+ * (usually a revoked Accessibility permission), in which case the transcript
+ * is already sitting on the clipboard.
  */
-export const listenToDictationPasteFailed = async (onFailed: () => void): Promise<UnlistenFn> => {
+export const listenToDictationPasteFailed = async (
+  onFailed: (failure: DictationPasteFailure) => void,
+): Promise<UnlistenFn> => {
   assertTauriRuntime();
-  return listen(DICTATION_PASTE_FAILED_EVENT, () => onFailed());
+  return listen<DictationPasteFailure>(DICTATION_PASTE_FAILED_EVENT, (event) => onFailed(event.payload));
 };
+
+/** Puts the last dictation back on the clipboard; false if there is none. */
+export const copyLastDictation = async (): Promise<boolean> => invokeNative<boolean>('copy_last_dictation');
 
 export const listenToPolishSelectionNotice = async (onNotice: (message: string) => void): Promise<UnlistenFn> => {
   assertTauriRuntime();

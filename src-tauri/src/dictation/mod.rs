@@ -11,6 +11,7 @@ use crate::domain::AppError;
 pub mod capture;
 pub mod hotkey;
 pub mod inject;
+pub mod paste_target;
 pub mod selection;
 
 pub use capture::{
@@ -19,8 +20,8 @@ pub use capture::{
 };
 pub use hotkey::{DictationHotkey, HotkeyAction};
 pub use inject::{
-    capture_frontmost_app, inject_text, probe_accessibility, spawn_frontmost_app_tracker,
-    TargetAppPid,
+    capture_frontmost_app, copy_to_clipboard, inject_text, probe_accessibility,
+    spawn_frontmost_app_tracker, InjectOutcome, TargetAppPid,
 };
 pub use selection::{polish_selection, SelectionPolishOutcome};
 

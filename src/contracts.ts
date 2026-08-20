@@ -321,6 +321,22 @@ export interface LastDictationRecovery {
   atMs: number;
 }
 
+/** Why a dictation's paste didn't land. See `listenToDictationPasteFailed`. */
+export type DictationPasteFailureReason =
+  | 'no_target'
+  | 'keystroke_failed'
+  | 'accessibility_denied';
+
+/**
+ * Payload of the paste-failed event: the transcript that had nowhere to go,
+ * plus why. Carried on the event rather than fetched separately so the pill's
+ * recovery widget can render the text the moment the failure happens.
+ */
+export interface DictationPasteFailure {
+  text: string;
+  reason: DictationPasteFailureReason;
+}
+
 export type PermissionStatus = 'granted' | 'denied';
 
 export interface PermissionsSnapshot {

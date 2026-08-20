@@ -22,6 +22,20 @@ use objc2_foundation::{NSArray, NSData, NSString};
 
 use crate::domain::AppError;
 
+use super::paste_target;
+
+/// What [`inject_text`] actually did, so the caller can tell a real paste from
+/// one that was deliberately not attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectOutcome {
+    /// Cmd+V was sent to the target app.
+    Pasted,
+    /// The target app had no editable focus, so nothing was pasted and the
+    /// clipboard was left untouched. The text is still held in memory for the
+    /// recovery widget - see `AppState::last_dictation`.
+    NoPasteTarget,
+}
+
 /// The process id of whichever app was frontmost just before dictation
 /// started, i.e. the paste target.
 pub type TargetAppPid = libc::pid_t;
@@ -34,9 +48,23 @@ const FRONTMOST_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// [`spawn_frontmost_app_tracker`]. Read by [`last_external_frontmost_app`].
 static LAST_EXTERNAL_FRONTMOST: StdMutex<Option<TargetAppPid>> = StdMutex::new(None);
 
+/// Records one step of an injection to the app debug log. A paste that goes
+/// missing leaves no other trace: the installed app's stderr is discarded, and
+/// `osascript` reports success for a keystroke nothing consumed.
+fn log_inject(message: &str) {
+    #[cfg(target_os = "macos")]
+    crate::debug_log(&format!("inject {message}"));
+    #[cfg(not(target_os = "macos"))]
+    let _ = message;
+}
+
 /// A single point-in-time read of `NSWorkspace.frontmostApplication`'s pid.
 fn frontmost_app_pid() -> Option<TargetAppPid> {
-    Some(NSWorkspace::sharedWorkspace().frontmostApplication()?.processIdentifier())
+    Some(
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()?
+            .processIdentifier(),
+    )
 }
 
 /// Starts a background thread that keeps [`LAST_EXTERNAL_FRONTMOST`] fresh
@@ -86,14 +114,50 @@ pub fn capture_frontmost_app() -> Option<TargetAppPid> {
 /// Explicitly reactivates the app captured by [`capture_frontmost_app`] so
 /// the synthesised Cmd+V has a real target to land in, instead of relying on
 /// key focus implicitly falling back to "whatever window was previously
-/// active" after hiding the pill — a race that gets less reliable across
-/// multiple displays/Spaces, since there is more than one place focus could
-/// land. A no-op (returns `false`) if the app has since quit.
+/// active" - a race that gets less reliable across multiple displays/Spaces,
+/// since there is more than one place focus could land. Returns `false` if the
+/// app has since quit.
+///
+/// Activation is cooperative on modern macOS - an app can only bring another
+/// forward while it is itself active, and `ActivateIgnoringOtherApps` has been
+/// deprecated to a no-op since macOS 14, so there is no way to force it. That
+/// is survivable: the path that needs the handoff is the one where the user
+/// clicked the pill, and Scribe *is* active then. What is not survivable is
+/// assuming it happened - see [`wait_until_frontmost`], and note that a
+/// backgrounded app describes neither a focused element nor a focused window,
+/// which reads exactly like having nothing to paste into (observed
+/// 2026-08-20: a dictation aimed at Claude's message box was refused with
+/// "nothing can receive keys" because Claude had not come forward yet).
 pub fn reactivate(pid: TargetAppPid) -> bool {
     let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
         return false;
     };
+    // Deliberately plain activation, NOT `ActivateAllWindows`: that option
+    // raises every window the app owns, which in a multi-window app can
+    // reorder them and hand key status to one the user was not typing in.
+    // Restoring the right window is the target app's own job, so ask for the
+    // narrowest thing that gets the app forward.
     app.activateWithOptions(NSApplicationActivationOptions::empty())
+}
+
+/// Blocks until `pid` is actually the frontmost app, or the deadline passes.
+///
+/// `activateWithOptions` returning only means the request was accepted; the
+/// window server processes the handoff asynchronously. A fixed sleep either
+/// wastes time or is too short, and the old code skipped the wait entirely
+/// whenever the activation call returned `false` - which is exactly when the
+/// target needed the most time.
+fn wait_until_frontmost(pid: TargetAppPid) -> bool {
+    let deadline = std::time::Instant::now() + TARGET_ACTIVATION_TIMEOUT;
+    loop {
+        if frontmost_app_pid() == Some(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(TARGET_ACTIVATION_POLL);
+    }
 }
 
 /// How long to wait after the Cmd+V keystroke before restoring the previous
@@ -102,9 +166,12 @@ pub fn reactivate(pid: TargetAppPid) -> bool {
 /// would paste the old contents instead of the transcript.
 const PASTE_SETTLE: Duration = Duration::from_millis(300);
 
-/// How long to wait after [`reactivate`] succeeds before firing the paste
-/// keystroke, so the target app has actually become key by the time it does.
-const TARGET_ACTIVATION_SETTLE: Duration = Duration::from_millis(100);
+/// How long to wait for the target app to actually become frontmost after
+/// [`reactivate`], before giving up and pasting anyway.
+const TARGET_ACTIVATION_TIMEOUT: Duration = Duration::from_millis(700);
+
+/// Gap between frontmost checks while waiting.
+const TARGET_ACTIVATION_POLL: Duration = Duration::from_millis(25);
 
 /// Every flavor of every item on the pasteboard, as raw bytes keyed by UTI.
 /// Full fidelity — screenshots, rich text, and multi-item copies all survive.
@@ -117,9 +184,9 @@ type ClipboardSnapshot = Vec<Vec<(String, Vec<u8>)>>;
 /// The previous clipboard contents — including images and other non-text
 /// flavors — are saved first and put back once the paste has landed, so
 /// dictating doesn't eat whatever the user last copied.
-pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<(), AppError> {
+pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<InjectOutcome, AppError> {
     if text.trim().is_empty() {
-        return Ok(());
+        return Ok(InjectOutcome::Pasted);
     }
     // Explicitly reactivate the app that was frontmost when dictation
     // started, rather than trusting key focus to fall back there on its own
@@ -128,18 +195,38 @@ pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<(), AppEr
     // or there was no captured target, fall through to the caller's existing
     // hide-the-pill-and-settle behavior.
     if let Some(pid) = target {
-        if reactivate(pid) {
-            // activateWithOptions returning true only means the request was
-            // accepted; the window server still processes the actual key
-            // window handoff asynchronously. Same order of magnitude as the
-            // settle this replaces (the old hide-pill sleep).
-            std::thread::sleep(TARGET_ACTIVATION_SETTLE);
-        }
+        let before = frontmost_app_pid();
+        let accepted = reactivate(pid);
+        // Wait for the handoff to actually happen rather than sleeping a fixed
+        // guess - everything below reads the target's live focus state, and
+        // reading it before the app is frontmost answers about the wrong app.
+        let arrived = wait_until_frontmost(pid);
+        log_inject(&format!(
+            "activation target={pid} frontmost_before={before:?} accepted={accepted} arrived={arrived}"
+        ));
+    }
+    // Only now, with the target app actually frontmost, is it meaningful to
+    // ask where the paste would land: the focused element is read live, and
+    // asking any earlier answers for Scribe's own pill. Bailing out before
+    // touching the pasteboard is the whole point - the original bug was that
+    // this pasted into the void and then restored the previous clipboard over
+    // the transcript, losing it entirely.
+    if target.is_some_and(|pid| !paste_target::has_paste_target(pid)) {
+        return Ok(InjectOutcome::NoPasteTarget);
     }
     // Best-effort save: an unreadable pasteboard just means there is nothing
     // to put back.
     let saved = snapshot_clipboard();
     set_clipboard(text)?;
+    // The single most useful line in the log when a paste goes missing: a
+    // synthesised Cmd+V lands in whatever is frontmost *now*, so if this does
+    // not name the target, the text went somewhere else entirely and no amount
+    // of reasoning about focused elements explains it.
+    log_inject(&format!(
+        "keystroke target={target:?} frontmost_now={:?} clipboard_chars={}",
+        frontmost_app_pid(),
+        text.chars().count()
+    ));
     // On paste failure, return with the transcript still on the clipboard so
     // the user can paste it by hand instead of losing the dictation outright.
     send_cmd_keystroke("v", "dictation_paste_failed")?;
@@ -150,7 +237,14 @@ pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<(), AppEr
         // the transcript on the clipboard.
         restore_clipboard(&saved);
     }
-    Ok(())
+    Ok(InjectOutcome::Pasted)
+}
+
+/// Puts `text` on the clipboard and nothing else - no paste, no restore. Backs
+/// the recovery widget's Copy button, where the user is explicitly asking for
+/// the transcript and the clipboard replacement is the point.
+pub fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
+    set_clipboard(text)
 }
 
 /// Reads every item and flavor off the general pasteboard. Lazily-promised
@@ -373,6 +467,17 @@ mod tests {
     fn blank_text_is_a_no_op() {
         // No clipboard write and no paste keystroke should fire for blank input.
         inject_text("   \n\t", None).expect("blank input is a no-op");
+    }
+
+    #[test]
+    fn no_captured_target_still_pastes() {
+        // Without a target pid there is nothing to ask about, so the paste
+        // must go ahead exactly as it did before the check existed rather
+        // than being suppressed on a guess.
+        assert_eq!(
+            inject_text("", None).expect("blank is a no-op"),
+            InjectOutcome::Pasted
+        );
     }
 
     /// Minimal valid 1x1 transparent PNG, standing in for a screenshot.

@@ -561,12 +561,29 @@ fn list_meeting_trends(
 }
 
 #[tauri::command]
-fn list_audio_devices(state: State<'_, AppState>) -> Result<Vec<AudioDevice>, AppError> {
-    state
-        .recordings
-        .lock()
-        .map_err(map_lock_error)?
-        .list_audio_devices()
+async fn list_audio_devices(app: AppHandle) -> Result<Vec<AudioDevice>, AppError> {
+    // Off the main thread. Enumerating CoreAudio devices is slow - cpal probes
+    // each device's supported configs, which goes through `AudioUnitSetProperty`
+    // - and it is slowest exactly when it is first called after the app bundle
+    // is replaced, with the app's TCC identity newly changed. As a synchronous
+    // command this ran on the main thread and blocked it for 17-80s (measured
+    // 2026-08-20 over three installs, main thread parked in
+    // `list_audio_devices` → cpal `supported_configs` → CoreAudio): no windows
+    // appeared, and the app looked hung to the user - and to Accessibility and
+    // CGWindowList, which both need the app to service its main run loop.
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AppState>()
+            .recordings
+            .lock()
+            .map_err(map_lock_error)?
+            .list_audio_devices()
+    })
+    .await
+    .map_err(|error| AppError {
+        code: "audio_device_enumeration_task_failed".to_string(),
+        message: "The audio device enumeration task did not finish.".to_string(),
+        details: Some(error.to_string()),
+    })?
 }
 
 #[tauri::command]
@@ -945,6 +962,76 @@ const DICTATION_DONE_SOUND: &str = "/System/Library/Sounds/Glass.aiff";
 /// recording indicator during dictation.
 const TRAY_ICON_ID: &str = "scribe";
 
+/// Label of the app's ordinary (non-floating) window - the one holding the
+/// Meetings/Dictation/Settings UI. The three floating panels are labelled
+/// separately (`DICTATION_PILL_WINDOW` and friends).
+const MAIN_WINDOW: &str = "main";
+
+/// Brings the main window back no matter which way it was put away -
+/// minimized, hidden by `hide_main_window`, or behind other apps - and
+/// recreates it outright if it somehow no longer exists.
+///
+/// Every "open Scribe" entry point routes through here (tray icon, tray menu,
+/// Dock icon via `RunEvent::Reopen`), because each of the put-away states
+/// needs a different call and no single one covers the rest:
+///
+/// - `unminimize` is required first: tao's `set_focus` is a deliberate no-op
+///   while a window is miniaturized, so `show` + `set_focus` alone leaves a
+///   minimized window sitting in the Dock.
+/// - `show` is required for a window parked by `hide_main_window`, which is
+///   ordered out rather than destroyed.
+/// - `set_focus` is required when the window is merely buried behind another
+///   app.
+///
+/// The recreate fallback is the backstop for the bug this all replaces: the
+/// main window used to be *destroyed* on close, after which every entry point
+/// found `None` here and silently did nothing, stranding the app with no
+/// window and no way back short of quitting (verified 2026-08-20 - the Dock
+/// icon, `open -a Scribe`, and the tray's "Show Scribe" all did nothing,
+/// while the pill kept floating and dictation kept working). `hide_main_window`
+/// now prevents that state, and this rebuilds the window if anything else ever
+/// produces it.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+    let Some(config) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == MAIN_WINDOW)
+        .cloned()
+    else {
+        eprintln!("main_window_recreate_failed: no \"main\" window in the app config");
+        return;
+    };
+    match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|builder| builder.build())
+    {
+        Ok(window) => {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        Err(error) => eprintln!("main_window_recreate_failed: {error}"),
+    }
+}
+
+/// Hides the main window instead of letting a close destroy it, so Scribe
+/// survives its window being closed the way a menu-bar-resident app should:
+/// the tray icon, the hotkey, the pill and any in-flight transcription all
+/// keep running, and reopening restores the same window with its React state
+/// (current tab, scroll position, in-progress notes) intact rather than a
+/// blank rebuild.
+///
+/// Quitting is unaffected - ⌘Q and the tray's Quit item both go through
+/// `RunEvent::ExitRequested`, not this window-level close.
+fn hide_main_window(window: &tauri::Window) {
+    let _ = window.hide();
+}
+
 /// Plays a short macOS system sound as fire-and-forget dictation feedback.
 fn play_cue(sound_file: &str) {
     let _ = Command::new("afplay").arg(sound_file).spawn();
@@ -966,11 +1053,35 @@ fn emit_dictation_state(app: &AppHandle, state: &'static str) {
     let _ = app.emit(DICTATION_STATE_EVENT, DictationStateEvent { state });
 }
 
-/// Event the pill listens to when a dictation's paste didn't land (e.g. the
-/// Accessibility permission was revoked, or the target app's focus handoff
-/// failed), so it can point the user at the in-app recovery text instead of
-/// the paste silently going nowhere.
+/// Event the pill listens to when a dictation's paste didn't land - either
+/// because the target app had nothing focused that takes text, or because the
+/// keystroke itself failed (e.g. the Accessibility permission was revoked).
+/// Carries the transcript so the pill can raise a recovery widget with the
+/// text and a Copy button, instead of the dictation silently going nowhere.
 const DICTATION_PASTE_FAILED_EVENT: &str = "scribe://dictation-paste-failed";
+
+/// Why a paste didn't land, so the widget can say something true about it.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PasteFailureReason {
+    /// The target app had no editable focus - the user's cursor wasn't in a
+    /// text field. Nothing was written to the clipboard.
+    NoTarget,
+    /// The paste keystroke itself failed. The transcript is on the clipboard.
+    KeystrokeFailed,
+    /// macOS refused the paste keystroke because Scribe does not currently
+    /// hold the Accessibility permission. Distinct from `KeystrokeFailed`
+    /// because the fix is a specific user action (re-grant in System
+    /// Settings), and the widget should say so instead of shrugging.
+    AccessibilityDenied,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationPasteFailedEvent {
+    text: String,
+    reason: PasteFailureReason,
+}
 
 /// Event the pill listens to while dictation records: the live microphone
 /// input level (RMS, 0..=1) driving its waveform.
@@ -1168,33 +1279,6 @@ fn emit_polish_selection_notice(app: &AppHandle, message: impl Into<String>) {
     );
 }
 
-/// Shows or hides a floating panel window (the dictation pill or the meeting
-/// popup) on the main thread (AppKit calls must run there). Hiding it hands
-/// key focus back to the user's previously-active window so e.g. a
-/// synthesised paste lands in their field; `order_front_regardless` brings it
-/// back without making it the key window again.
-#[cfg(target_os = "macos")]
-fn set_panel_visible(app: &AppHandle, label: &'static str, visible: bool) {
-    let app = app.clone();
-    let _ = app.clone().run_on_main_thread(move || {
-        use tauri_nspanel::ManagerExt;
-        if let Ok(panel) = app.get_webview_panel(label) {
-            if visible {
-                panel.order_front_regardless();
-            } else {
-                panel.order_out(None);
-            }
-        }
-    });
-}
-
-/// Shows or hides the dictation pill. Thin wrapper over [`set_panel_visible`]
-/// kept as a named function since most call sites only care about the pill.
-#[cfg(target_os = "macos")]
-fn set_pill_visible(app: &AppHandle, visible: bool) {
-    set_panel_visible(app, DICTATION_PILL_WINDOW, visible);
-}
-
 /// A coordinate far outside any real display, used to "hide" the meeting
 /// popup and recording indicator by moving them off-screen rather than
 /// ordering them out (see `set_positioned_panel_visible`'s doc comment).
@@ -1370,6 +1454,14 @@ const PILL_HOVER_SIZE: (f64, f64) = (210.0, 64.0);
 const PILL_ACTIVE_SIZE: (f64, f64) = (160.0, 40.0);
 #[cfg(desktop)]
 const PILL_NOTICE_SIZE: (f64, f64) = (300.0, 40.0);
+/// The paste-failure recovery widget: the one layout that has to hold real
+/// content - a line of explanation, a preview of the transcript, and two
+/// buttons - rather than a single short string, and the one that stays up
+/// until the user acts on it. Sized to the measured card (336x112) plus the
+/// `.dpill` bottom padding and room for the shadow, so the transparent window
+/// stays as close to the painted content as every other layout.
+#[cfg(desktop)]
+const PILL_PASTE_FAILED_SIZE: (f64, f64) = (360.0, 124.0);
 #[cfg(desktop)]
 const PILL_BOTTOM_MARGIN: f64 = 8.0;
 
@@ -1477,6 +1569,7 @@ fn pill_layout_size(layout: &str) -> Result<(f64, f64), AppError> {
         "hover" => Ok(PILL_HOVER_SIZE),
         "listening" | "transcribing" => Ok(PILL_ACTIVE_SIZE),
         "notice" => Ok(PILL_NOTICE_SIZE),
+        "paste-failed" => Ok(PILL_PASTE_FAILED_SIZE),
         other => Err(AppError {
             code: "pill_layout_unknown".to_string(),
             message: format!("Unknown dictation pill layout: {other}"),
@@ -1974,19 +2067,17 @@ fn stop_and_process_dictation(app: &AppHandle) {
                     }
                 }
                 record_dictation_session(&state, started_at_ms, &text);
-                // Before pasting, hand focus back to the user's app: clicking the pill
-                // can make it the key window (dropping the user's field as first
-                // responder), so a synthesised Cmd+V would land nowhere. Hiding the
-                // always-on-top pill is a first step (it can't hold key focus while
-                // hidden); after the paste, bring the pill back without re-keying it.
-                // Skipped for empty transcripts (inject is a no-op then).
-                #[cfg(target_os = "macos")]
-                let restore_pill = !text.trim().is_empty();
-                #[cfg(target_os = "macos")]
-                if restore_pill {
-                    set_pill_visible(&app, false);
-                }
-                // The real handoff: explicitly reactivate whichever app was frontmost
+                // The pill deliberately stays on screen across the paste. It used to
+                // be hidden and restored around it, on the theory that clicking it
+                // could make it the key window and strand the user's text field - but
+                // it is a non-activating NSPanel that never becomes key, and focus is
+                // handed back explicitly by `reactivate` below, so the hide was doing
+                // no work. It was, however, plainly visible: sampling the screen at
+                // 30Hz through a real paste (2026-08-20) showed the pill blinking out
+                // for ~700ms every time, which is the flicker users notice when
+                // dictating.
+                //
+                // Explicitly reactivate whichever app was frontmost
                 // when dictation started (captured in `start_dictation_session`),
                 // rather than just hiding the pill and hoping key focus falls back
                 // there on its own — that implicit fallback gets less reliable the
@@ -2002,33 +2093,59 @@ fn stop_and_process_dictation(app: &AppHandle) {
                 #[cfg(not(target_os = "macos"))]
                 let target_app = None;
                 let inject_result = dictation::inject_text(&text, target_app);
-                #[cfg(target_os = "macos")]
-                if restore_pill {
-                    // inject_text already waited for the paste keystroke, so the pill
-                    // can float back immediately.
-                    set_pill_visible(&app, true);
-                }
                 // Record the outcome before propagating any error, so a failed paste
                 // doesn't also lose the only copy of what was dictated — see
                 // `AppState::last_dictation`.
                 if !text.trim().is_empty() {
-                    record_last_dictation(&state, &text, inject_result.is_ok());
+                    record_last_dictation(
+                        &state,
+                        &text,
+                        matches!(inject_result, Ok(dictation::InjectOutcome::Pasted)),
+                    );
                 }
-                inject_result?;
-                Ok(text)
+                let injected = inject_result?;
+                Ok((text, injected))
             });
         match outcome {
-            Ok(text) if text.trim().is_empty() => {
+            Ok((text, _)) if text.trim().is_empty() => {
                 eprintln!("dictation: no speech detected, nothing inserted");
             }
-            Ok(text) => {
+            Ok((text, dictation::InjectOutcome::NoPasteTarget)) => {
+                // Not an error: the transcription worked, there was just
+                // nowhere to put it. Log only the length, never the text.
+                eprintln!(
+                    "dictation: no editable focus in the target app, held {} characters for recovery",
+                    text.chars().count()
+                );
+                // Deliberately no success cue - the paste didn't happen, and
+                // the "done" sound is what tells the user it did.
+                emit_dictation_paste_failed(&app, PasteFailureReason::NoTarget);
+            }
+            Ok((text, dictation::InjectOutcome::Pasted)) => {
                 // Log only the length, not the dictated text itself.
                 eprintln!("dictation: inserted {} characters", text.chars().count());
+                debug_log(&format!(
+                    "dictation: pasted {} characters",
+                    text.chars().count()
+                ));
                 play_cue(DICTATION_DONE_SOUND);
             }
             Err(error) => {
                 eprintln!("dictation stop failed: {} ({})", error.message, error.code);
-                emit_dictation_paste_failed(&app);
+                // Into the persistent log too: the installed app's stderr goes
+                // nowhere, and a paste that fails with no trace is exactly the
+                // bug class that cost a day to diagnose (2026-08-20, the
+                // revoked-Accessibility incident).
+                debug_log(&format!(
+                    "dictation stop failed: code={} message={}",
+                    error.code, error.message
+                ));
+                let reason = if error.code == "dictation_accessibility_permission_required" {
+                    PasteFailureReason::AccessibilityDenied
+                } else {
+                    PasteFailureReason::KeystrokeFailed
+                };
+                emit_dictation_paste_failed(&app, reason);
             }
         }
         emit_dictation_state(&app, "idle");
@@ -2068,19 +2185,40 @@ fn get_last_dictation_recovery(
     Ok(last.clone().map(LastDictationRecoveryDto::from))
 }
 
-/// Notifies every window that the last dictation's paste failed, so the pill
-/// can point the user at the in-app recovery text instead of leaving them to
-/// notice a silently-missing paste. Reads the just-recorded text back out of
-/// state rather than threading it through the call stack, since it was
-/// already saved by `record_last_dictation` moments earlier.
-fn emit_dictation_paste_failed(app: &AppHandle) {
+/// Raises the pill's recovery widget for a dictation whose paste didn't land,
+/// carrying the transcript so the user can copy it straight from the widget
+/// rather than having to notice the missing paste and go hunting in the app.
+/// Reads the text back out of state rather than threading it through the call
+/// stack, since `record_last_dictation` saved it moments earlier.
+fn emit_dictation_paste_failed(app: &AppHandle, reason: PasteFailureReason) {
     let state = app.state::<AppState>();
     let Ok(last) = state.last_dictation.lock() else {
         return;
     };
-    if last.as_ref().is_some_and(|recovery| !recovery.pasted) {
-        let _ = app.emit(DICTATION_PASTE_FAILED_EVENT, ());
-    }
+    let Some(recovery) = last.as_ref().filter(|recovery| !recovery.pasted) else {
+        return;
+    };
+    let _ = app.emit(
+        DICTATION_PASTE_FAILED_EVENT,
+        DictationPasteFailedEvent {
+            text: recovery.text.clone(),
+            reason,
+        },
+    );
+}
+
+/// Puts the last dictation back on the clipboard. Backs the recovery widget's
+/// Copy button: on the no-target path nothing was ever written to the
+/// clipboard (deliberately - see `inject_text`), so this is how the user gets
+/// the text, and it only replaces their clipboard when they ask for it.
+#[tauri::command]
+fn copy_last_dictation(state: State<'_, AppState>) -> Result<bool, AppError> {
+    let last = state.last_dictation.lock().map_err(map_lock_error)?;
+    let Some(recovery) = last.as_ref() else {
+        return Ok(false);
+    };
+    dictation::copy_to_clipboard(&recovery.text)?;
+    Ok(true)
 }
 
 /// Handles one dictation hotkey press: advances the Wispr-style press tracker and
@@ -2143,7 +2281,10 @@ async fn inject_dictation_text(text: String) -> Result<(), AppError> {
             code: "dictation_inject_task_failed".to_string(),
             message: "The dictation injection task did not finish.".to_string(),
             details: Some(error.to_string()),
-        })?
+        })??;
+    // The outcome is always `Pasted` without a target pid (the paste-target
+    // check needs one), so there is nothing for the caller to distinguish.
+    Ok(())
 }
 
 #[tauri::command]
@@ -2585,6 +2726,18 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_nspanel::init());
     builder
+        // Closing the main window hides it instead of destroying it; see
+        // `hide_main_window`. Without this, Tauri's default destroys the
+        // window while the process keeps running, leaving the app with no
+        // window and no entry point able to bring one back.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == MAIN_WINDOW {
+                    api.prevent_close();
+                    hide_main_window(window);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_app_status,
             list_meeting_history,
@@ -2606,6 +2759,7 @@ pub fn run() {
             delete_dictation_session,
             get_dictation_stats_summary,
             get_last_dictation_recovery,
+            copy_last_dictation,
             toggle_dictation,
             set_pill_layout,
             inject_dictation_text,
@@ -2658,6 +2812,18 @@ pub fn run() {
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
             #[cfg(target_os = "macos")]
             dictation::spawn_frontmost_app_tracker();
+            // State the Accessibility verdict outright at every launch instead
+            // of inferring it later from a paste that did nothing. Off the main
+            // thread: the probe shells out to osascript, and startup is not the
+            // place to block on it (see the `list_audio_devices` hang).
+            #[cfg(target_os = "macos")]
+            std::thread::spawn(|| {
+                let verdict = match dictation::probe_accessibility() {
+                    Ok(()) => "granted".to_string(),
+                    Err(error) => format!("DENIED code={} ({})", error.code, error.message),
+                };
+                debug_log(&format!("startup accessibility={verdict}"));
+            });
 
             #[cfg(desktop)]
             {
@@ -2677,12 +2843,7 @@ pub fn run() {
                     .menu(&menu)
                     .tooltip("Scribe")
                     .on_menu_event(|app, event| match event.id.as_ref() {
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
+                        "show" => show_main_window(app),
                         "quit" => app.exit(0),
                         _ => {}
                     })
@@ -2693,11 +2854,7 @@ pub fn run() {
                             ..
                         } = event
                         {
-                            let app = tray.app_handle();
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
+                            show_main_window(tray.app_handle());
                         }
                     })
                     .build(app)?;
@@ -2784,12 +2941,22 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Scribe")
         .run(|app_handle, event| {
-            // The meeting-detector sidecar loops forever; without an explicit
-            // stop here it would leak as an orphaned process after Scribe
-            // quits (unlike the system-audio-capture sidecar, which only runs
-            // for the bounded duration of an active recording).
-            if let tauri::RunEvent::Exit = event {
-                stop_meeting_detection(app_handle);
+            match event {
+                // The meeting-detector sidecar loops forever; without an
+                // explicit stop here it would leak as an orphaned process
+                // after Scribe quits (unlike the system-audio-capture
+                // sidecar, which only runs for the bounded duration of an
+                // active recording).
+                tauri::RunEvent::Exit => stop_meeting_detection(app_handle),
+                // Clicking the Dock icon. macOS routes this through
+                // `applicationShouldHandleReopen`, whose default handling
+                // never restores Scribe's window: the three floating panels
+                // are always-visible NSPanels, so AppKit sees an app that
+                // already has visible windows and leaves the real one
+                // minimized or hidden. Restoring it explicitly is the only
+                // thing that makes the Dock icon work in every state.
+                tauri::RunEvent::Reopen { .. } => show_main_window(app_handle),
+                _ => {}
             }
         });
 }
@@ -4062,9 +4229,8 @@ mod tests {
             })
             .expect("fresh session can be created");
 
-        let cleared =
-            apply_dictation_text_retention_policy(&repository, 1, MILLIS_PER_DAY * 2)
-                .expect("retention policy can run");
+        let cleared = apply_dictation_text_retention_policy(&repository, 1, MILLIS_PER_DAY * 2)
+            .expect("retention policy can run");
         assert_eq!(cleared, 1);
 
         let sessions = repository

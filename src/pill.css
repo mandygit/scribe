@@ -209,3 +209,187 @@
 .dpill[data-layout="notice"] .dpill__notice-text {
   display: block;
 }
+
+/* ---------------------------------------------------------------------------
+   Paste-recovery widget: shown when a dictation had nowhere to land. Its own
+   root (see PasteRecoveryWidget) rather than another capsule layout, because
+   it carries controls and the pill itself is a single button. Sized to sit
+   inside PILL_PASTE_FAILED_SIZE in src-tauri/src/lib.rs, like every other
+   layout here.
+   --------------------------------------------------------------------------- */
+
+.dpill--recovery {
+  cursor: default;
+}
+
+.drecover {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: 336px;
+  padding: 10px 12px 11px;
+  border-radius: 14px;
+  background: var(--dpill-bg);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+  border: 0.5px solid rgba(255, 255, 255, 0.11);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.42);
+  color: var(--dpill-text);
+  text-align: left;
+  animation: drecover-in 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Scales up rather than sliding up: the card is bottom-anchored with only a
+   few pixels of padding under it, so a translate would clip against the
+   window edge mid-animation. */
+@keyframes drecover-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.drecover__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.drecover__icon {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  color: var(--dpill-polish);
+}
+
+.drecover__title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--dpill-text);
+}
+
+/* 26x26 rather than the glyph's own 10px: this panel never delivers hover, so
+   there is no cursor feedback to aim by and the target should not be tight.
+   The negative margin keeps the larger hit area from pushing the header row
+   taller. */
+.drecover__close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  margin: -6px -7px -6px 0;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dpill-muted);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.drecover__close svg {
+  width: 10px;
+  height: 10px;
+}
+
+/* :hover is dead weight in the native shell -- WebKit's mouse tracking is
+   key-window-scoped and this panel is never key, so mouseenter/mousemove
+   never reach the webview (the pill's own hover is polled from Rust instead).
+   It is kept for the browser dev harness. :active works in both, because
+   mousedown *is* delivered, so the press feedback is what actually reads as
+   the affordance on screen. */
+.drecover__close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--dpill-text);
+}
+
+.drecover__close:active {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--dpill-text);
+}
+
+/* The transcript itself. Two lines then ellipsis: enough to recognise what
+   was dictated, not so much that the widget grows past its window. */
+/* Always exactly two lines tall, short transcript or long. The window around
+   this card is a fixed size (PILL_PASTE_FAILED_SIZE) and the card is
+   bottom-anchored, so letting a one-line transcript shrink the card leaves a
+   band of transparent-but-still-clickable window above it -- the invisible
+   click-trap the pill layouts otherwise go out of their way to avoid. It also
+   keeps the buttons in the same place from one dictation to the next. */
+.drecover__text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  min-height: calc(2 * 1.42 * 12px);
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.42;
+  color: rgba(244, 243, 238, 0.9);
+  user-select: text;
+}
+
+.drecover__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.drecover__hint {
+  flex: 1;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--dpill-muted);
+}
+
+.drecover__copy {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 11px;
+  border: 0.5px solid rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.13);
+  color: var(--dpill-text);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.drecover__copy svg {
+  width: 12px;
+  height: 12px;
+}
+
+.drecover__copy:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+/* See the note on .drecover__close:hover -- this is the press feedback that
+   actually fires inside the panel. */
+.drecover__copy:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.26);
+  border-color: rgba(255, 255, 255, 0.3);
+  transform: scale(0.97);
+}
+
+.drecover__copy:disabled {
+  cursor: default;
+  color: #7fd39b;
+  border-color: rgba(127, 211, 155, 0.32);
+  background: rgba(127, 211, 155, 0.14);
+}
