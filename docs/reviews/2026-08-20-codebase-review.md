@@ -16,7 +16,7 @@ Rendered version (same content, easier to read):
 | --- | --- | --- |
 | Security & privacy | 9 | 0 |
 | Correctness | 4 | 0 |
-| Performance | 8 | 0 |
+| Performance | 7 | 1 |
 | Features | 12 | 0 |
 | Engineering health | 5 | 1 |
 
@@ -288,7 +288,7 @@ and it removes the two full-length intermediate WAVs.
 
 ### PERF-2 — Up to 5,000 transcript rows render as plain DOM with no virtualisation
 
-- [ ] **Medium** · `src/App.tsx:1231` · `src-tauri/src/lib.rs:239`
+- [x] **Medium** · `src/App.tsx:1231` · `src-tauri/src/lib.rs:239`
 
 `HISTORY_DETAIL_TRANSCRIPT_LIMIT` was raised from 200 to 5,000 to stop truncating long
 meetings — correct fix for the data, but the render is a flat

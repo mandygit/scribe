@@ -616,6 +616,15 @@ button {
 .segment {
   padding: 10px 0;
   border-bottom: 0.5px solid var(--border);
+  /* Skip layout and paint for rows that are scrolled out of view. A long
+     meeting is thousands of these, and mounting them all is what made opening
+     one jank. `auto` in contain-intrinsic-size means the browser remembers each
+     row's real height once it has been rendered, so the estimate below only has
+     to be close enough for the first pass and the scrollbar stays honest.
+     Ignored by WebKit versions that do not support it, which simply renders
+     everything as before. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 76px;
 }
 .segment .speaker {
   font-size: 12px;
