@@ -3,6 +3,7 @@ import './pill.css';
 import {
   copyLastDictation,
   type DictationPasteFailure,
+  type DictationPasteFailureReason,
   type DictationState,
   getAppStatus,
   isTauriRuntime,
@@ -309,6 +310,42 @@ export default function DictationPill() {
 }
 
 /**
+ * What the recovery widget says for each way a paste can fail. A lookup rather
+ * than nested ternaries because every one of these is a sentence the user
+ * reads at the exact moment they are wondering where their words went: they
+ * are content, and they belong somewhere they can be read end to end.
+ *
+ * Each hint says what happened, and where the user's own action is what fixes
+ * it, says that instead.
+ */
+const RECOVERY_COPY: Record<DictationPasteFailureReason, { title: string; hint: string }> = {
+  no_target: {
+    title: 'Nothing to paste into',
+    hint: 'Your cursor wasn\u2019t in a text field.',
+  },
+  target_not_frontmost: {
+    title: 'Couldn\u2019t reach that app',
+    hint: 'It never came back to the front, so nothing was pasted.',
+  },
+  secure_input_active: {
+    title: 'Secure input is active',
+    hint: 'macOS blocks pasting while a password field or secure terminal has focus.',
+  },
+  paste_did_not_land: {
+    title: 'Nothing was inserted',
+    hint: 'The app ignored the paste. The text is on your clipboard.',
+  },
+  accessibility_denied: {
+    title: 'Accessibility permission needed',
+    hint: 'Re-grant Scribe in System Settings > Privacy & Security > Accessibility.',
+  },
+  keystroke_failed: {
+    title: 'Couldn\u2019t paste',
+    hint: 'The paste keystroke was blocked.',
+  },
+};
+
+/**
  * The recovery widget: what the user sees when a dictation had nowhere to go.
  *
  * Rendered as its own root rather than another layout inside the pill's
@@ -324,6 +361,7 @@ export default function DictationPill() {
  */
 function PasteRecoveryWidget({ failure, onDismiss }: { failure: DictationPasteFailure; onDismiss: () => void }) {
   const [copied, setCopied] = useState(false);
+  const message = RECOVERY_COPY[failure.reason];
 
   const handleCopy = useCallback(() => {
     // In the native shell the text lives in Rust (it was deliberately never
@@ -363,13 +401,7 @@ function PasteRecoveryWidget({ failure, onDismiss }: { failure: DictationPasteFa
             <line x1="12" y1="9" x2="12" y2="13" />
             <line x1="12" y1="17" x2="12.01" y2="17" />
           </svg>
-          <span className="drecover__title">
-            {failure.reason === 'no_target'
-              ? 'Nothing to paste into'
-              : failure.reason === 'accessibility_denied'
-                ? 'Accessibility permission needed'
-                : "Couldn't paste"}
-          </span>
+          <span className="drecover__title">{message.title}</span>
           <button type="button" className="drecover__close" onClick={onDismiss} aria-label="Dismiss">
             <svg
               viewBox="0 0 24 24"
@@ -386,13 +418,7 @@ function PasteRecoveryWidget({ failure, onDismiss }: { failure: DictationPasteFa
         </div>
         <p className="drecover__text">{preview}</p>
         <div className="drecover__actions">
-          <span className="drecover__hint">
-            {failure.reason === 'no_target'
-              ? 'Your cursor wasn\u2019t in a text field.'
-              : failure.reason === 'accessibility_denied'
-                ? 'Re-grant Scribe in System Settings > Privacy & Security > Accessibility.'
-                : 'The paste keystroke was blocked.'}
-          </span>
+          <span className="drecover__hint">{message.hint}</span>
           <button type="button" className="drecover__copy" onClick={handleCopy} disabled={copied}>
             <svg
               viewBox="0 0 24 24"

@@ -51,6 +51,7 @@ export type {
   AppStatus,
   AudioDevice,
   DictationPasteFailure,
+  DictationPasteFailureReason,
   DictationSessionPage,
   DictationSessionRecord,
   DictationStatsSummary,

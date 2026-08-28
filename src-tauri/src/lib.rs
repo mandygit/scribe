@@ -1067,6 +1067,20 @@ enum PasteFailureReason {
     /// The target app had no editable focus - the user's cursor wasn't in a
     /// text field. Nothing was written to the clipboard.
     NoTarget,
+    /// The app the user dictated into never came back to the front, so nothing
+    /// was sent anywhere. Distinct from `NoTarget` because the user's cursor
+    /// may well have been in a text field - Scribe just could not get back to
+    /// it, and saying "nothing to paste into" would be a lie about their app.
+    /// Nothing was written to the clipboard.
+    TargetNotFrontmost,
+    /// macOS secure input was active, so no keystroke could be delivered.
+    /// Distinct from `KeystrokeFailed` because nothing failed - the paste was
+    /// never attempted, and the fix is the user's (leave the password field),
+    /// not a permission to re-grant. Nothing was written to the clipboard.
+    SecureInputActive,
+    /// The paste keystroke was delivered and the app inserted nothing. The
+    /// transcript is on the clipboard, deliberately left there.
+    PasteDidNotLand,
     /// The paste keystroke itself failed. The transcript is on the clipboard.
     KeystrokeFailed,
     /// macOS refused the paste keystroke because Scribe does not currently
@@ -1473,6 +1487,38 @@ const PILL_BOTTOM_MARGIN: f64 = 8.0;
 #[cfg(desktop)]
 static PILL_RECT: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
 
+/// The monitor the cursor is currently on, which is the one the user is
+/// working on and therefore the only place these floating windows are any use.
+///
+/// Anchoring to the primary monitor instead put the paste-failure recovery
+/// widget on a different screen from the app the dictation was aimed at - and
+/// a recovery affordance nobody is looking at is the same as none at all,
+/// since the transcript it holds is otherwise only reachable from the app's
+/// Dictation tab. Multiple displays are also where the activation races these
+/// windows report on are worst, so it is the case that needs it most.
+///
+/// Work areas are compared in logical points, the space `macos_cursor` reports
+/// in and `position_window` computes frames in. `None` when the cursor cannot
+/// be read or sits outside every work area (the menu bar, say), leaving the
+/// caller its primary-monitor fallback.
+#[cfg(desktop)]
+fn monitor_under_cursor(window: &tauri::WebviewWindow) -> Option<tauri::Monitor> {
+    #[cfg(target_os = "macos")]
+    let (cursor_x, cursor_y) = macos_cursor::location()?;
+    #[cfg(not(target_os = "macos"))]
+    return None;
+    #[cfg(target_os = "macos")]
+    window.available_monitors().ok()?.into_iter().find(|monitor| {
+        let scale = monitor.scale_factor();
+        let area = monitor.work_area();
+        let x = area.position.x as f64 / scale;
+        let y = area.position.y as f64 / scale;
+        let width = area.size.width as f64 / scale;
+        let height = area.size.height as f64 / scale;
+        cursor_x >= x && cursor_x < x + width && cursor_y >= y && cursor_y < y + height
+    })
+}
+
 /// Records the pill frame most recently applied by `position_window`.
 #[cfg(desktop)]
 fn remember_pill_rect(position: Option<(f64, f64)>, width: f64, height: f64) {
@@ -1721,9 +1767,8 @@ fn position_window(
     window_height: f64,
     margin: f64,
 ) -> Option<(f64, f64)> {
-    let Ok(Some(monitor)) = window.primary_monitor() else {
-        return None;
-    };
+    let monitor = monitor_under_cursor(window)
+        .or_else(|| window.primary_monitor().ok().flatten())?;
     let scale = monitor.scale_factor();
     let work_area = monitor.work_area();
     let work_x = work_area.position.x as f64 / scale;
@@ -2023,7 +2068,7 @@ fn start_dictation_session(app: &AppHandle) {
             // capturing it any later would risk recording the wrong app.
             #[cfg(target_os = "macos")]
             if let Ok(mut target) = state.dictation_target_app.lock() {
-                *target = dictation::capture_frontmost_app();
+                *target = dictation_target_app(app);
             }
             eprintln!("dictation: listening…");
             set_recording_indicator(app, true);
@@ -2039,6 +2084,34 @@ fn start_dictation_session(app: &AppHandle) {
             emit_dictation_state(app, "idle");
         }
     }
+}
+
+/// Which app this dictation should be pasted into.
+///
+/// Normally the app the user was last in, tracked continuously because a
+/// point-in-time reading is wrong for the pill (see `capture_frontmost_app`).
+/// The exception is Scribe itself: dictating with the notes editor focused used
+/// to reactivate whatever external app the user last touched, drag it forward -
+/// across a Space, if that is where it lives - and type into it, so Scribe was
+/// the one app in the system that could not be dictated into, and an unrelated
+/// app silently received the text.
+///
+/// Keyed on Scribe's *main window* holding key focus rather than on Scribe
+/// being frontmost. Those differ exactly where it matters: clicking the pill
+/// routes through Scribe's own WKWebView and can briefly make Scribe frontmost
+/// without its main window ever becoming key, which is the whole reason the
+/// external tracker exists (confirmed live 2026-08-06). A background app has no
+/// key window at all, so this is false whenever the user is in another app.
+#[cfg(target_os = "macos")]
+fn dictation_target_app(app: &AppHandle) -> Option<dictation::TargetAppPid> {
+    let in_scribes_own_window = app
+        .get_webview_window(MAIN_WINDOW)
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false);
+    if in_scribes_own_window {
+        return Some(std::process::id() as dictation::TargetAppPid);
+    }
+    dictation::capture_frontmost_app()
 }
 
 /// Stops the in-flight dictation and runs transcribe → optional polish → inject
@@ -2109,6 +2182,48 @@ fn stop_and_process_dictation(app: &AppHandle) {
         match outcome {
             Ok((text, _)) if text.trim().is_empty() => {
                 eprintln!("dictation: no speech detected, nothing inserted");
+            }
+            Ok((text, dictation::InjectOutcome::PasteDidNotLand)) => {
+                // The app took the keystroke and did nothing with it. Not an
+                // error anywhere in the stack, which is exactly why this went
+                // unnoticed before. Log only the length, never the text.
+                eprintln!(
+                    "dictation: paste did not land, {} characters left on the clipboard",
+                    text.chars().count()
+                );
+                debug_log(&format!(
+                    "dictation: paste did not land, {} characters left on the clipboard",
+                    text.chars().count()
+                ));
+                emit_dictation_paste_failed(&app, PasteFailureReason::PasteDidNotLand);
+            }
+            Ok((text, dictation::InjectOutcome::SecureInputActive)) => {
+                // Not an error either: macOS was refusing synthesised
+                // keystrokes, so the paste was withheld rather than fired into
+                // a window server that would drop it. Log only the length.
+                eprintln!(
+                    "dictation: secure input active, held {} characters for recovery",
+                    text.chars().count()
+                );
+                debug_log(&format!(
+                    "dictation: secure input active, held {} characters for recovery",
+                    text.chars().count()
+                ));
+                emit_dictation_paste_failed(&app, PasteFailureReason::SecureInputActive);
+            }
+            Ok((text, dictation::InjectOutcome::TargetNotFrontmost)) => {
+                // Also not an error: the transcription worked and the paste was
+                // deliberately withheld rather than fired at whichever app
+                // happened to be in front. Log only the length, never the text.
+                eprintln!(
+                    "dictation: target app never came forward, held {} characters for recovery",
+                    text.chars().count()
+                );
+                debug_log(&format!(
+                    "dictation: target app never came forward, held {} characters for recovery",
+                    text.chars().count()
+                ));
+                emit_dictation_paste_failed(&app, PasteFailureReason::TargetNotFrontmost);
             }
             Ok((text, dictation::InjectOutcome::NoPasteTarget)) => {
                 // Not an error: the transcription worked, there was just

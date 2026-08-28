@@ -56,19 +56,10 @@
 //! That is what makes the recovery widget reachable inside a Chromium app,
 //! which it otherwise never would be.
 
-use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use objc2::rc::Retained;
-use objc2_foundation::NSString;
-
+use super::ax::{self, Element};
 use super::inject::TargetAppPid;
-
-type CFTypeRef = *const c_void;
-type AXUIElementRef = CFTypeRef;
-type AXError = i32;
-
-const AX_SUCCESS: AXError = 0;
 
 /// Roles that are text entry outright. Checked after `AXValue` settability for
 /// controls that expose the role but not a writable value.
@@ -97,103 +88,17 @@ const CONTAINER_ROLES: [&str; 1] = ["AXWebArea"];
 /// treating it as one that handles keys itself. An app that was just activated
 /// needs a moment: Microsoft Teams answers 10 times out of 10 within the
 /// activation settle, but never while it is in the background.
-const FOCUS_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+///
+/// Raised from 250ms, which was exactly the larger of the two measurements it
+/// had to separate (a composer sharpening in 18ms, a blurred one standing for
+/// the full 250ms) and so had no margin at all: a cold or busy page resolving
+/// at 300ms was indistinguishable from one with nothing focused, and got its
+/// dictation withheld. The only cost of the extra budget is a slightly later
+/// recovery widget in the case that really has nowhere to go.
+const FOCUS_POLL_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// Gap between those attempts.
 const FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(60);
-
-// AX lives in ApplicationServices (HIServices). Linked explicitly rather than
-// relying on AppKit to drag it in.
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn AXUIElementCreateApplication(pid: libc::pid_t) -> AXUIElementRef;
-    fn AXUIElementCopyAttributeValue(
-        element: AXUIElementRef,
-        attribute: *const NSString,
-        value: *mut CFTypeRef,
-    ) -> AXError;
-    fn AXUIElementIsAttributeSettable(
-        element: AXUIElementRef,
-        attribute: *const NSString,
-        settable: *mut u8,
-    ) -> AXError;
-    fn CFRelease(cf: CFTypeRef);
-    fn CFGetTypeID(cf: CFTypeRef) -> usize;
-    fn CFStringGetTypeID() -> usize;
-    fn AXIsProcessTrusted() -> bool;
-}
-
-/// Whether this process may read other apps' Accessibility trees at all.
-///
-/// Without it every `AXUIElementCopyAttributeValue` below returns nothing, so
-/// every app looks like it "named no focused element" and the paste target is
-/// undetectable - which silently degrades this module into "always paste,
-/// never warn". That is not a hypothetical: on 2026-08-20 an ad-hoc-signed
-/// reinstall dropped the grant, and because nothing checked or reported it,
-/// several rounds of debugging went into the paste-target rules while the real
-/// answer was that Scribe could not see anything at all.
-pub fn accessibility_is_trusted() -> bool {
-    // SAFETY: a plain predicate with no arguments and no ownership transfer.
-    unsafe { AXIsProcessTrusted() }
-}
-
-/// A CoreFoundation value owned by us, released on drop. AX hands back +1
-/// references from every `Copy` call.
-struct OwnedCfType(CFTypeRef);
-
-impl Drop for OwnedCfType {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: non-null and owned - every construction site is a
-            // CoreFoundation `Copy`/`Create` call, which returns +1.
-            unsafe { CFRelease(self.0) };
-        }
-    }
-}
-
-/// Reads one attribute off an element, taking ownership of the result.
-/// `None` for any error, including "no value".
-fn copy_attribute(element: AXUIElementRef, attribute: &str) -> Option<OwnedCfType> {
-    let name = NSString::from_str(attribute);
-    let mut value: CFTypeRef = std::ptr::null();
-    // SAFETY: `element` is a live AX element, `name` outlives the call, and
-    // `value` is only read when the call reports success.
-    let error = unsafe {
-        AXUIElementCopyAttributeValue(element, Retained::as_ptr(&name), &mut value as *mut _)
-    };
-    if error != AX_SUCCESS || value.is_null() {
-        return None;
-    }
-    Some(OwnedCfType(value))
-}
-
-/// Reads a CFString-valued attribute as a Rust string, via the toll-free
-/// bridge to `NSString`. The type is checked rather than assumed: AX returns
-/// whatever the app put there.
-fn string_attribute(element: AXUIElementRef, attribute: &str) -> Option<String> {
-    let value = copy_attribute(element, attribute)?;
-    // SAFETY: CFStringGetTypeID/CFGetTypeID are pure reads of live CF values.
-    if unsafe { CFGetTypeID(value.0) } != unsafe { CFStringGetTypeID() } {
-        return None;
-    }
-    // SAFETY: confirmed a CFString above, which is toll-free bridged to
-    // NSString; the borrow ends before `value` is released.
-    let string: &NSString = unsafe { &*(value.0 as *const NSString) };
-    Some(string.to_string())
-}
-
-/// Whether the element's `AXValue` can be written - the most direct "this
-/// takes text" signal, and the one that works for custom controls with
-/// non-standard roles.
-fn value_is_settable(element: AXUIElementRef) -> bool {
-    let name = NSString::from_str("AXValue");
-    let mut settable: u8 = 0;
-    // SAFETY: as `copy_attribute`; `settable` is only read on success.
-    let error = unsafe {
-        AXUIElementIsAttributeSettable(element, Retained::as_ptr(&name), &mut settable as *mut _)
-    };
-    error == AX_SUCCESS && settable != 0
-}
 
 /// Whether a Cmd+V sent to `pid` has somewhere to land.
 ///
@@ -210,14 +115,13 @@ fn value_is_settable(element: AXUIElementRef) -> bool {
 /// paste that did not happen, or a widget that should not have appeared - and
 /// this is the only way to tell which rule fired without guessing.
 pub fn has_paste_target(pid: TargetAppPid) -> bool {
-    // SAFETY: creating an application element is safe for any pid; AX returns
-    // an element that simply answers errors if the process is gone.
-    let app = unsafe { AXUIElementCreateApplication(pid) };
-    if app.is_null() {
+    // AX makes an element for any pid, and one for a dead or unresponsive
+    // process simply answers errors to everything - which reads the same as an
+    // app with nothing to say, and is handled as such below.
+    let Some(app) = Element::for_app(pid) else {
         log_decision(pid, true, "no application element; not withholding on that");
         return true;
-    }
-    let app = OwnedCfType(app);
+    };
 
     // Poll: an app that was just activated needs a moment before it will name
     // its focused element. Deliberately the *first* thing tried, and the only
@@ -228,8 +132,8 @@ pub fn has_paste_target(pid: TargetAppPid) -> bool {
     let deadline = Instant::now() + FOCUS_POLL_TIMEOUT;
     let mut unresolved_role: Option<String> = None;
     loop {
-        if let Some(focused) = copy_attribute(app.0, "AXFocusedUIElement") {
-            match classify(focused.0) {
+        if let Some(focused) = app.focused() {
+            match classify(&focused) {
                 Verdict::Paste(reason) => {
                     log_decision(pid, true, &reason);
                     return true;
@@ -275,7 +179,7 @@ pub fn has_paste_target(pid: TargetAppPid) -> bool {
     // Distinguish "this app has nothing to say" from "we are not allowed to
     // ask". Both look identical from here, and conflating them is what made a
     // revoked permission masquerade as a paste-target bug.
-    if !accessibility_is_trusted() {
+    if !ax::is_trusted() {
         log_decision(
             pid,
             true,
@@ -304,7 +208,7 @@ pub fn has_paste_target(pid: TargetAppPid) -> bool {
     // focused element. If they differ on the focused window, that separates
     // them; if they match, this cannot be solved from Accessibility and the
     // probe comes out again.
-    log_silent_app_diagnostics(pid, app.0);
+    log_silent_app_diagnostics(pid, &app);
 
     log_decision(pid, true, "app named no focused element; not withholding");
     true
@@ -342,11 +246,27 @@ fn classify_role(role: Option<&str>) -> Verdict {
     ))
 }
 
-fn classify(element: AXUIElementRef) -> Verdict {
-    if value_is_settable(element) {
+fn classify(element: &Element) -> Verdict {
+    if element.attribute_is_settable("AXValue") {
         return Verdict::Paste("focused element has a settable AXValue".to_string());
     }
-    classify_role(string_attribute(element, "AXRole").as_deref())
+    // The invariant that keeps this module honest with `inject`: never withhold
+    // from an element injection could have written to. `inject` writes through
+    // `AXSelectedText`, so its settability is proof of a paste target no matter
+    // what role the element claims.
+    //
+    // This is not the same question as `AXValue` above, and Chromium is where
+    // they come apart. A `contenteditable` composer has no single settable
+    // value - measured 2026-08-26 in Claude, whose focused web node reports
+    // role `AXGroup` with `AXValue` unsettable - so it falls past that check to
+    // a role table that has never heard of `AXGroup` and withholds. Asking the
+    // insertion question directly gets those composers pasted into, while the
+    // read-only article regions that share the same role (subrole
+    // `AXDocumentArticle`, `AXSelectedText` unsettable) still correctly do not.
+    if element.attribute_is_settable(ax::SELECTED_TEXT) {
+        return Verdict::Paste("focused element has settable AXSelectedText".to_string());
+    }
+    classify_role(element.attribute_string("AXRole").as_deref())
 }
 
 /// Dumps what a frontmost app that named no focused element *will* say about
@@ -355,20 +275,20 @@ fn classify(element: AXUIElementRef) -> Verdict {
 /// Logs the window's role and subrole but NOT its title: a window title is
 /// user content (a document name, a chat partner, a page heading) and this log
 /// is deliberately free of anything the user said or is looking at.
-fn log_silent_app_diagnostics(pid: TargetAppPid, app: AXUIElementRef) {
-    let focused_window = copy_attribute(app, "AXFocusedWindow");
+fn log_silent_app_diagnostics(pid: TargetAppPid, app: &Element) {
+    let focused_window = app.attribute_element("AXFocusedWindow");
     let window_role = focused_window
         .as_ref()
-        .and_then(|window| string_attribute(window.0, "AXRole"))
+        .and_then(|window| window.attribute_string("AXRole"))
         .unwrap_or_else(|| "-".to_string());
     let window_subrole = focused_window
         .as_ref()
-        .and_then(|window| string_attribute(window.0, "AXSubrole"))
+        .and_then(|window| window.attribute_string("AXSubrole"))
         .unwrap_or_else(|| "-".to_string());
     // Whether the app answers anything at all, so a dead or unresponsive
     // target is not mistaken for a meaningful "no".
-    let app_role = string_attribute(app, "AXRole").unwrap_or_else(|| "-".to_string());
-    let main_window = copy_attribute(app, "AXMainWindow").is_some();
+    let app_role = app.attribute_string("AXRole").unwrap_or_else(|| "-".to_string());
+    let main_window = app.attribute_element("AXMainWindow").is_some();
 
     #[cfg(target_os = "macos")]
     crate::debug_log(&format!(
@@ -440,11 +360,12 @@ mod tests {
 
     #[test]
     fn a_live_process_answers_within_the_poll_budget() {
-        // Exercises the full FFI path (element creation, attribute copy, role
-        // read, settable query, release) against a live process, so a mistake
-        // in the ownership handling shows up as a crash here rather than in
-        // dictation. Scribe's own windows are not focused during tests, so the
-        // answer itself is not asserted -- only that it returns, promptly.
+        // The poll runs against a live app and must stay bounded: dictation
+        // blocks on this answer, and an app that keeps saying "container"
+        // forever must not hold the transcript hostage with it. Scribe's own
+        // windows are not focused during tests, so the answer itself is not
+        // asserted -- only that it arrives, promptly. (The FFI ownership path
+        // this walks is covered directly in `ax`.)
         let started = Instant::now();
         let _ = has_paste_target(std::process::id() as TargetAppPid);
         assert!(

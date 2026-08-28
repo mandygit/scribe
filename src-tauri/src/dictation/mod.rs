@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 
 use crate::domain::AppError;
 
+pub mod ax;
 pub mod capture;
 pub mod hotkey;
 pub mod inject;

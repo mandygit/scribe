@@ -1,11 +1,21 @@
-//! Text injection: drop dictated text into whatever app currently has focus by
-//! placing it on the clipboard, synthesising a Cmd+V paste, and then restoring
-//! the clipboard's previous contents. Also used in
-//! reverse by polish-selection: Cmd+C copies the focused app's current
-//! selection out to the clipboard so it can be read back and polished. Both
-//! need the Accessibility permission (System Events keystroke); without it
-//! macOS blocks the keystroke and `osascript` reports an error we surface
-//! with a stable code.
+//! Text injection: drop dictated text into the app the user was typing in.
+//!
+//! Two mechanisms, tried in that order:
+//!
+//! 1. **Write it into the focused element via Accessibility** - see
+//!    [`insert_via_accessibility`]. The text goes straight where the caret is,
+//!    the clipboard is never touched, and the app either accepts the write or
+//!    says why it did not.
+//! 2. **Clipboard and a synthesised Cmd+V**, restoring the clipboard's previous
+//!    contents afterwards. The fallback for everything the first mechanism
+//!    cannot address - terminals, VS Code, anything that names no focused
+//!    element - and the only mechanism that existed before.
+//!
+//! The second is also used in reverse by polish-selection: Cmd+C copies the
+//! focused app's current selection out to the clipboard so it can be read back
+//! and polished. Both need the Accessibility permission; without it macOS
+//! blocks the keystroke and `osascript` reports an error we surface with a
+//! stable code, and the AX writes silently fail too.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -22,18 +32,70 @@ use objc2_foundation::{NSArray, NSData, NSString};
 
 use crate::domain::AppError;
 
+use super::ax;
 use super::paste_target;
+
+// Secure input state lives in Carbon's HIToolbox. Deprecated, still the only
+// way to ask, and still exactly right.
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn IsSecureEventInputEnabled() -> bool;
+}
+
+/// Whether macOS is currently refusing synthesised keystrokes process-wide.
+///
+/// Deliberately consulted only on the clipboard path: this blocks *events*, and
+/// an Accessibility write is not an event. It is also a global condition rather
+/// than a property of the focused field - any app holding secure input turns it
+/// on for everyone - which is precisely why it has to be asked rather than
+/// inferred from what has focus.
+fn secure_input_is_active() -> bool {
+    // SAFETY: a plain predicate with no arguments and no ownership transfer.
+    unsafe { IsSecureEventInputEnabled() }
+}
 
 /// What [`inject_text`] actually did, so the caller can tell a real paste from
 /// one that was deliberately not attempted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectOutcome {
-    /// Cmd+V was sent to the target app.
+    /// The text is in the target app - written straight into its focused
+    /// element, or failing that pasted with Cmd+V.
     Pasted,
     /// The target app had no editable focus, so nothing was pasted and the
     /// clipboard was left untouched. The text is still held in memory for the
     /// recovery widget - see `AppState::last_dictation`.
     NoPasteTarget,
+    /// The app that was frontmost when dictation started never came back to the
+    /// front, so nothing was sent and the clipboard was left as it was found.
+    ///
+    /// A synthesised Cmd+V lands in whatever is frontmost *at that instant*,
+    /// not in whatever we aimed at, so pasting without the target in front is
+    /// how a dictation ends up in a different app entirely. Observed in the
+    /// wild on 2026-08-20: `arrived=false`, `frontmost_now` naming another app,
+    /// and 15 characters typed into it, with the previous clipboard restored
+    /// over them 300ms later.
+    TargetNotFrontmost,
+    /// macOS secure input was active, so a synthesised Cmd+V could not have
+    /// been delivered. Nothing was sent and the clipboard was left alone.
+    ///
+    /// The silent-loss case this exists to end: with a password field focused
+    /// (or a terminal in Secure Keyboard Entry), the window server drops
+    /// synthesised keystrokes, and `osascript` reports success anyway because
+    /// System Events did accept the event. Dictation read that as a paste,
+    /// played the done cue, and restored the previous clipboard over the
+    /// transcript.
+    SecureInputActive,
+    /// Cmd+V was delivered and the focused element did not change: the app
+    /// took the keystroke and inserted nothing. The transcript is deliberately
+    /// left on the clipboard.
+    ///
+    /// `osascript` cannot report this - it exits 0 once System Events accepts
+    /// the event, which says nothing about whether anything consumed it. Read
+    /// only text views (a log pane, a disabled field) and apps that bind Cmd+V
+    /// to something else both land here, and both used to be recorded as a
+    /// successful paste with the transcript then wiped by the clipboard
+    /// restore.
+    PasteDidNotLand,
 }
 
 /// The process id of whichever app was frontmost just before dictation
@@ -45,8 +107,9 @@ pub type TargetAppPid = libc::pid_t;
 const FRONTMOST_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The most recent frontmost app that was NOT Scribe itself, kept fresh by
-/// [`spawn_frontmost_app_tracker`]. Read by [`last_external_frontmost_app`].
+/// [`spawn_frontmost_app_tracker`].
 static LAST_EXTERNAL_FRONTMOST: StdMutex<Option<TargetAppPid>> = StdMutex::new(None);
+
 
 /// Records one step of an injection to the app debug log. A paste that goes
 /// missing leaves no other trace: the installed app's stderr is discarded, and
@@ -102,13 +165,26 @@ pub fn spawn_frontmost_app_tracker() {
     });
 }
 
-/// The most recently observed non-Scribe frontmost app, to be handed back to
-/// [`reactivate`] right before pasting. Returns `None` if none has been
-/// observed yet (e.g. dictation started within the first poll tick after
-/// launch), in which case paste falls back to the prior implicit
-/// hide-the-pill-and-hope behavior.
+/// Where the dictation about to start should end up, to be handed back to
+/// [`reactivate`] right before pasting.
+///
+/// The most recently observed non-Scribe frontmost app, falling back to a live
+/// reading when the tracker has not had a tick yet.
+///
+/// That fallback matters more than it looks: with no target at all, injection
+/// pastes blind into whatever is in front and reports success whatever
+/// happened, because every check it has - the activation guard, the paste
+/// target, the Accessibility write - needs a pid to ask about. There is always
+/// some frontmost app, so there is no reason to ever run without one.
+///
+/// Says nothing about the case where the user is typing in Scribe's own
+/// window; `dictation_target_app` handles that before calling this.
 pub fn capture_frontmost_app() -> Option<TargetAppPid> {
-    LAST_EXTERNAL_FRONTMOST.lock().ok().and_then(|guard| *guard)
+    LAST_EXTERNAL_FRONTMOST
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .or_else(frontmost_app_pid)
 }
 
 /// Explicitly reactivates the app captured by [`capture_frontmost_app`] so
@@ -167,8 +243,18 @@ fn wait_until_frontmost(pid: TargetAppPid) -> bool {
 const PASTE_SETTLE: Duration = Duration::from_millis(300);
 
 /// How long to wait for the target app to actually become frontmost after
-/// [`reactivate`], before giving up and pasting anyway.
-const TARGET_ACTIVATION_TIMEOUT: Duration = Duration::from_millis(700);
+/// [`reactivate`].
+///
+/// This used to be a gamble timer - it expired and the paste fired anyway, at
+/// whatever was in front. Now expiry withholds the text instead
+/// ([`InjectOutcome::TargetNotFrontmost`]), which changes what the number is
+/// for: every millisecond here buys a genuinely slow handoff the chance to
+/// finish, and the only cost of waiting too long is showing the recovery
+/// widget slightly later on a dictation that was already lost. Raised from
+/// 700ms on that basis, because the slow handoff is real - activating an app
+/// on another Space waits out the switch animation before it counts as
+/// frontmost.
+const TARGET_ACTIVATION_TIMEOUT: Duration = Duration::from_millis(1200);
 
 /// Gap between frontmost checks while waiting.
 const TARGET_ACTIVATION_POLL: Duration = Duration::from_millis(25);
@@ -191,9 +277,9 @@ pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<InjectOut
     // Explicitly reactivate the app that was frontmost when dictation
     // started, rather than trusting key focus to fall back there on its own
     // once the pill hides — that implicit handoff gets less reliable the
-    // more displays/Spaces are in play. Best-effort: if the app already quit
-    // or there was no captured target, fall through to the caller's existing
-    // hide-the-pill-and-settle behavior.
+    // more displays/Spaces are in play. With no captured target at all there
+    // is nothing to hand focus back to, and injection proceeds blind into
+    // whatever is frontmost, exactly as it did before any of this existed.
     if let Some(pid) = target {
         let before = frontmost_app_pid();
         let accepted = reactivate(pid);
@@ -202,8 +288,18 @@ pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<InjectOut
         // reading it before the app is frontmost answers about the wrong app.
         let arrived = wait_until_frontmost(pid);
         log_inject(&format!(
-            "activation target={pid} frontmost_before={before:?} accepted={accepted} arrived={arrived}"
+            "activation target={pid} ({}) frontmost_before={before:?} accepted={accepted} arrived={arrived}",
+            app_name(pid)
         ));
+        // Activation is cooperative and can simply not happen - the app quit
+        // mid-dictation, or Scribe was not itself active and macOS declined.
+        // Everything past this point either reads the target's focus (which
+        // answers about an app the user is not looking at) or sends a
+        // keystroke to whatever is frontmost *instead*. Stop here and let the
+        // recovery widget hold the text.
+        if !arrived {
+            return Ok(InjectOutcome::TargetNotFrontmost);
+        }
     }
     // Only now, with the target app actually frontmost, is it meaningful to
     // ask where the paste would land: the focused element is read live, and
@@ -214,6 +310,30 @@ pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<InjectOut
     if target.is_some_and(|pid| !paste_target::has_paste_target(pid)) {
         return Ok(InjectOutcome::NoPasteTarget);
     }
+    // Preferred mechanism: write the text where the caret already is. Nothing
+    // reaches the pasteboard, no keystroke is synthesised, it cannot land in
+    // the wrong app because it addresses the element rather than "whatever is
+    // frontmost", and the app answers whether it took. Only the apps this
+    // cannot address fall through to the clipboard.
+    if let Some(pid) = target {
+        if insert_via_accessibility(pid, text) {
+            return Ok(InjectOutcome::Pasted);
+        }
+    }
+    // Past here the only remaining mechanism is a synthesised keystroke, and
+    // secure input means the window server will drop it. Stop before touching
+    // the pasteboard: pasting anyway is not a harmless retry, it is how the
+    // transcript gets overwritten by the restore and lost.
+    if secure_input_is_active() {
+        log_inject("secure input is active; a synthesised paste cannot be delivered");
+        return Ok(InjectOutcome::SecureInputActive);
+    }
+    // Read the caret before the keystroke so the paste can be confirmed
+    // afterwards. Held across the paste deliberately: re-finding the focused
+    // element after the fact would ask a different question, since a paste can
+    // change which element has focus.
+    let focused = target.and_then(focused_element);
+    let caret_before = caret(focused.as_ref());
     // Best-effort save: an unreadable pasteboard just means there is nothing
     // to put back.
     let saved = snapshot_clipboard();
@@ -222,22 +342,134 @@ pub fn inject_text(text: &str, target: Option<TargetAppPid>) -> Result<InjectOut
     // synthesised Cmd+V lands in whatever is frontmost *now*, so if this does
     // not name the target, the text went somewhere else entirely and no amount
     // of reasoning about focused elements explains it.
+    let frontmost_now = frontmost_app_pid();
     log_inject(&format!(
-        "keystroke target={target:?} frontmost_now={:?} clipboard_chars={}",
-        frontmost_app_pid(),
+        "keystroke target={target:?} frontmost_now={frontmost_now:?} clipboard_chars={}",
         text.chars().count()
     ));
+    // The last possible moment to check, and the only one that counts: the
+    // keystroke is about to go to whatever is frontmost, and the target could
+    // have lost the front at any point during the focus poll above. Put the
+    // clipboard back first - nothing was pasted, so restoring it cannot race
+    // anything.
+    if target.is_some_and(|pid| frontmost_now != Some(pid)) {
+        if !saved.is_empty() {
+            restore_clipboard(&saved);
+        }
+        return Ok(InjectOutcome::TargetNotFrontmost);
+    }
     // On paste failure, return with the transcript still on the clipboard so
     // the user can paste it by hand instead of losing the dictation outright.
     send_cmd_keystroke("v", "dictation_paste_failed")?;
+    // Unconditional now, not just when there is a clipboard to put back: the
+    // app reads the pasteboard asynchronously, so this is also how long the
+    // check below has to wait before the answer means anything.
+    std::thread::sleep(PASTE_SETTLE);
+    // The keystroke was accepted. Whether anything consumed it is a different
+    // question, and this is the only chance to ask it - an unchanged caret is
+    // positive evidence that nothing was inserted, because inserting even one
+    // character moves it. An element that will not report a caret decides
+    // nothing and the paste is trusted, exactly as it was before this existed.
+    if let (Some(before), Some(after)) = (caret_before, caret(focused.as_ref())) {
+        if before == after {
+            log_inject(&format!(
+                "paste keystroke accepted but the caret never moved (still at {}+{}); \
+                 leaving the transcript on the clipboard",
+                before.location, before.length
+            ));
+            // Deliberately no restore: the clipboard is now the only place this
+            // dictation exists outside Scribe, and putting the old contents
+            // back over it is precisely the silent loss this check exists to
+            // stop.
+            return Ok(InjectOutcome::PasteDidNotLand);
+        }
+    }
     if !saved.is_empty() {
-        std::thread::sleep(PASTE_SETTLE);
         // Best-effort restore: the paste already succeeded, and failing the
         // whole dictation over a restore hiccup would be worse than leaving
         // the transcript on the clipboard.
         restore_clipboard(&saved);
     }
     Ok(InjectOutcome::Pasted)
+}
+
+/// Writes `text` straight into the focused element of `pid`, returning whether
+/// it landed there.
+///
+/// This is the mechanism a paste has always been a stand-in for. Setting
+/// `AXSelectedText` replaces the current selection, or inserts at the caret
+/// when nothing is selected - the same edit Cmd+V performs, except that it
+/// names the element it is editing instead of hoping the right window has key
+/// focus, leaves the pasteboard alone, and reports back.
+///
+/// Deliberately `AXSelectedText` and not `AXValue`, even though `AXValue`
+/// settability is what `paste_target` reads as "this takes text": writing
+/// `AXValue` replaces everything in the field, which would silently delete
+/// whatever the user had already typed there.
+///
+/// `false` means nothing was written and the caller must fall back - the app
+/// named no focused element (VS Code, terminals), the element does not accept
+/// this write, or it accepted and then did nothing. That last case is why the
+/// caret is read before and afterwards: an unchanged selection range is
+/// positive evidence that no text was inserted, since inserting even one
+/// character moves the caret past it. An unreadable range decides nothing and
+/// the write is trusted, because a needless fall-back would paste the text a
+/// second time.
+/// The element currently holding focus inside `pid`, if the app names one.
+fn focused_element(pid: TargetAppPid) -> Option<ax::Element> {
+    ax::Element::for_app(pid).and_then(|app| app.focused())
+}
+
+/// Where the caret sits in `element`, if it will say. `None` is not a failure -
+/// plenty of elements do not expose a selection - it just means an edit to this
+/// element cannot be confirmed or denied afterwards.
+fn caret(element: Option<&ax::Element>) -> Option<ax::CfRange> {
+    element?.attribute_range(ax::SELECTED_TEXT_RANGE)
+}
+
+fn insert_via_accessibility(pid: TargetAppPid, text: &str) -> bool {
+    let Some(focused) = focused_element(pid) else {
+        log_inject("ax_insert unavailable: app named no focused element");
+        return false;
+    };
+    if !focused.attribute_is_settable(ax::SELECTED_TEXT) {
+        log_inject("ax_insert unavailable: AXSelectedText is not settable");
+        return false;
+    }
+    let before = focused.attribute_range(ax::SELECTED_TEXT_RANGE);
+    if let Err(error) = focused.set_attribute_string(ax::SELECTED_TEXT, text) {
+        log_inject(&format!("ax_insert refused: AXError {error}"));
+        return false;
+    }
+    let after = focused.attribute_range(ax::SELECTED_TEXT_RANGE);
+    if let (Some(before), Some(after)) = (before, after) {
+        if before == after {
+            log_inject(&format!(
+                "ax_insert accepted but the caret never moved (still at {}+{}); falling back to paste",
+                before.location, before.length
+            ));
+            return false;
+        }
+    }
+    log_inject(&format!(
+        "ax_insert wrote {} characters, caret {:?} -> {:?}",
+        text.chars().count(),
+        before.map(|range| range.location),
+        after.map(|range| range.location)
+    ));
+    true
+}
+
+/// The target app's name, for the log. A pid alone stops meaning anything the
+/// moment the machine reboots, and the activation line is the one place a
+/// paste that went to the wrong app can be traced back to an app at all.
+/// Deliberately the app name and nothing from inside its windows - see
+/// `paste_target::log_silent_app_diagnostics` on why titles stay out of here.
+fn app_name(pid: TargetAppPid) -> String {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .and_then(|app| app.localizedName())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Puts `text` on the clipboard and nothing else - no paste, no restore. Backs
@@ -467,6 +699,60 @@ mod tests {
     fn blank_text_is_a_no_op() {
         // No clipboard write and no paste keystroke should fire for blank input.
         inject_text("   \n\t", None).expect("blank input is a no-op");
+    }
+
+    #[test]
+    fn a_target_that_never_comes_forward_is_never_pasted_into() {
+        // The regression this whole guard exists for, from the app's own log
+        // (2026-08-20): the target was accepted for activation, never actually
+        // arrived, and Cmd+V went to whichever app was in front instead - 15
+        // characters into a window the user was not dictating at, with their
+        // previous clipboard restored over them 300ms later.
+        //
+        // pid 1 (launchd) can never become frontmost, so it stands in for any
+        // target that does not come forward: an app that quit mid-dictation,
+        // or one macOS declined to activate.
+        let before = snapshot_clipboard();
+        assert_eq!(
+            inject_text("this must not go anywhere", Some(1))
+                .expect("a target that never arrives is not an error"),
+            InjectOutcome::TargetNotFrontmost
+        );
+        // ...and it must cost the user nothing: no transcript left on the
+        // pasteboard, no clipboard of theirs replaced.
+        assert_eq!(
+            sorted(snapshot_clipboard()),
+            sorted(before),
+            "withholding the paste must leave the clipboard exactly as it was"
+        );
+    }
+
+    #[test]
+    fn there_is_always_a_paste_target_to_ask_about() {
+        // Something is always frontmost, so the tracker having no reading yet
+        // must not degrade into a target-less injection - that is the one path
+        // with no activation guard, no paste-target check and no Accessibility
+        // write, which pastes blind and calls it a success either way.
+        assert!(
+            capture_frontmost_app().is_some(),
+            "capture_frontmost_app must fall back to a live reading"
+        );
+    }
+
+    #[test]
+    fn secure_input_state_is_readable() {
+        // The FFI declaration is the whole risk here - a wrong symbol or
+        // signature would be a link error or a garbage answer, and the result
+        // decides whether a dictation is delivered or held back.
+        let _: bool = secure_input_is_active();
+    }
+
+    #[test]
+    fn accessibility_insertion_declines_rather_than_claiming_success() {
+        // pid 1 names no focused element, so there is nothing to write into.
+        // Answering `true` here would report a dictation as delivered while
+        // skipping the clipboard fallback that would have delivered it.
+        assert!(!insert_via_accessibility(1, "nowhere to put this"));
     }
 
     #[test]
