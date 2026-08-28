@@ -27,7 +27,7 @@ leaving your machine.
 | Copy to Slack/Teams | One click copies the generated notes (bold section labels, bullet lists, no tables) as rich text that pastes cleanly into chat apps. |
 | Meeting workspace | Each meeting opens in Summary / Notes / Transcript tabs, with an editable notes pane alongside the generated summary. |
 | History & trends | Every meeting's transcript, metrics, and notes are stored locally in SQLite; a trends view charts pace/filler words/score over time. |
-| Dictation | Global hotkey (double-press to toggle), floating non-activating pill UI, optional on-device polish via Apple Intelligence (macOS 15+), paste-based injection into the focused app. |
+| Dictation | Global hotkey (double-press to toggle), esc to cancel, floating non-activating pill UI, optional on-device polish via Apple Intelligence (macOS 15+), paste-based injection into the focused app. |
 | Retention controls | Configure how long raw audio is kept; transcripts and notes are kept regardless. |
 | Permission onboarding | First-run flow for Microphone / Screen Recording / Accessibility, with a clear explanation of what's degraded without each. |
 

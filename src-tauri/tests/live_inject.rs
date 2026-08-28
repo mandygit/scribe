@@ -65,7 +65,9 @@ fn pid_of(app: &str) -> i32 {
 
 /// The app macOS currently considers frontmost.
 fn frontmost_app() -> String {
-    osascript("tell application \"System Events\" to get name of first process whose frontmost is true")
+    osascript(
+        "tell application \"System Events\" to get name of first process whose frontmost is true",
+    )
 }
 
 /// Brings `app` to the front, waits until macOS agrees it is there, and returns
@@ -133,8 +135,8 @@ fn live_inject_into_textedit() {
     osascript("tell application \"TextEdit\" to make new document");
     sleep(WINDOW_SETTLE);
 
-    let outcome = inject_text(&marker, Some(pid))
-        .expect("inject_text succeeds with Accessibility granted");
+    let outcome =
+        inject_text(&marker, Some(pid)).expect("inject_text succeeds with Accessibility granted");
     sleep(Duration::from_millis(500));
 
     let contents = osascript("tell application \"TextEdit\" to get text of front document");
@@ -240,8 +242,8 @@ fn live_inject_lands_in_the_focused_window_not_a_sibling() {
     osascript("tell application \"TextEdit\" to make new document");
     sleep(WINDOW_SETTLE);
 
-    let outcome = inject_text(&marker, Some(pid))
-        .expect("inject_text succeeds with Accessibility granted");
+    let outcome =
+        inject_text(&marker, Some(pid)).expect("inject_text succeeds with Accessibility granted");
     sleep(Duration::from_millis(600));
 
     let front = osascript("tell application \"TextEdit\" to get text of front document");
@@ -275,8 +277,8 @@ fn live_inject_leaves_the_clipboard_alone() {
     osascript("tell application \"TextEdit\" to make new document");
     sleep(WINDOW_SETTLE);
 
-    let outcome = inject_text(&marker, Some(pid))
-        .expect("inject_text succeeds with Accessibility granted");
+    let outcome =
+        inject_text(&marker, Some(pid)).expect("inject_text succeeds with Accessibility granted");
     sleep(Duration::from_millis(500));
 
     let contents = osascript("tell application \"TextEdit\" to get text of front document");

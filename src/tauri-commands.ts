@@ -47,6 +47,16 @@ export type DictationState = 'idle' | 'listening' | 'transcribing';
  */
 export type PillLayout = DictationState | 'hover' | 'notice' | 'paste-failed';
 
+/**
+ * Window footprints the pill can ask the native shell for. Every visual layout
+ * is one, plus `active-hover`: the listening/transcribing capsule completely
+ * unchanged, in a taller window so the "esc to cancel" hint raised above it
+ * isn't clipped. It is a footprint rather than a layout precisely because the
+ * capsule doesn't change - the pill never gets bigger for a user who isn't
+ * pointing at it. Keep in step with `pill_layout_size` in src-tauri/src/lib.rs.
+ */
+export type PillFootprint = PillLayout | 'active-hover';
+
 export type {
   AppStatus,
   AudioDevice,
@@ -247,11 +257,11 @@ export const sendCompletionNotification = async (title: string, body: string): P
 export const toggleDictation = async (): Promise<void> => invokeNative<void>('toggle_dictation');
 
 /**
- * Resizes the pill window to hug the given visual layout (see the Rust
+ * Resizes the pill window to hug the given footprint (see the Rust
  * `set_pill_layout` command): the window is transparent, so any area beyond
  * the painted content is an invisible click-trap over the user's screen.
  */
-export const setPillLayout = async (layout: PillLayout): Promise<void> =>
+export const setPillLayout = async (layout: PillFootprint): Promise<void> =>
   invokeNative<void>('set_pill_layout', { layout });
 
 export const listenToDictationState = async (onState: (state: DictationState) => void): Promise<UnlistenFn> => {

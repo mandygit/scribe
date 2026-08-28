@@ -12,6 +12,7 @@ import {
   listenToDictationPillHover,
   listenToDictationState,
   listenToPolishSelectionNotice,
+  type PillFootprint,
   type PillLayout,
   setPillLayout,
   toggleDictation,
@@ -40,12 +41,13 @@ const BAR_MAX_HEIGHT = 18;
  */
 const COLLAPSE_MS = 220;
 
-/** Footprint order of the layouts, to tell window grows from shrinks. */
-const LAYOUT_RANK: Record<PillLayout, number> = {
+/** Footprint order, to tell window grows from shrinks. */
+const FOOTPRINT_RANK: Record<PillFootprint, number> = {
   idle: 0,
   hover: 1,
   listening: 2,
   transcribing: 2,
+  'active-hover': 3,
   notice: 3,
   'paste-failed': 4,
 };
@@ -119,6 +121,18 @@ export default function DictationPill() {
   const layout: PillLayout =
     pasteFailure !== null ? 'paste-failed' : notice !== null ? 'notice' : state === 'idle' && hovered ? 'hover' : state;
 
+  // Cancel lives on the Escape key, not on a control in the capsule - the pill
+  // stays the size it is. This is where the key gets told to the user: point at
+  // a dictation in progress and it says how to call it off. Offered for the
+  // whole time Escape is claimed (see `sync_dictation_cancel_shortcut` in
+  // src-tauri/src/lib.rs), transcribing included, so the hint is never up while
+  // the key does nothing, nor down while it still works.
+  const showCancelHint = hovered && (layout === 'listening' || layout === 'transcribing');
+
+  // The capsule is identical either way; only the window has to grow, to keep
+  // the hint above it from being clipped.
+  const footprint: PillFootprint = showCancelHint ? 'active-hover' : layout;
+
   const showNotice = useCallback((message: string, durationMs: number = NOTICE_DURATION_MS) => {
     if (noticeTimeoutRef.current !== null) {
       window.clearTimeout(noticeTimeoutRef.current);
@@ -148,9 +162,13 @@ export default function DictationPill() {
     if (next === 'listening') {
       setPasteFailure(null);
     }
-    // A resize under a stationary cursor does not fire mouseleave, which
-    // would strand the pill in its hover layout; drop the flag and let a real
-    // mousemove re-assert it.
+    // A resize under a stationary cursor delivers no mouseleave, which would
+    // strand the pill in its hover layout; drop the flag. The Rust watcher
+    // re-asserts the truth within one poll - it forgets its last answer on
+    // every resize (see `PILL_HOVER_SENT`) - so a cursor that really is still
+    // on the pill gets hover straight back instead of having to leave and
+    // return, which is what makes the cancel hint show up when you start a
+    // dictation by clicking the pill.
     setHovered(false);
     if (next !== 'listening') {
       levelsRef.current = Array.from({ length: BAR_COUNT }, () => 0);
@@ -226,24 +244,24 @@ export default function DictationPill() {
   // Keep the window hugging the painted content: grows apply immediately so
   // the capsule has room to expand into; shrinks wait for the collapse
   // animation so the window doesn't clip it mid-transition.
-  const appliedLayoutRef = useRef<PillLayout>('idle');
+  const appliedFootprintRef = useRef<PillFootprint>('idle');
   useEffect(() => {
     if (!isTauriRuntime()) {
       return;
     }
-    const previous = appliedLayoutRef.current;
-    appliedLayoutRef.current = layout;
+    const previous = appliedFootprintRef.current;
+    appliedFootprintRef.current = footprint;
     const apply = () => {
-      void setPillLayout(layout).catch((cause) => {
+      void setPillLayout(footprint).catch((cause) => {
         console.error('DictationPill: window resize failed', cause);
       });
     };
-    if (LAYOUT_RANK[layout] < LAYOUT_RANK[previous]) {
+    if (FOOTPRINT_RANK[footprint] < FOOTPRINT_RANK[previous]) {
       const timeout = window.setTimeout(apply, COLLAPSE_MS);
       return () => window.clearTimeout(timeout);
     }
     apply();
-  }, [layout]);
+  }, [footprint]);
 
   const handleClick = () => {
     void toggleDictation();
@@ -274,6 +292,7 @@ export default function DictationPill() {
           {hotkeyHint !== null ? `Click or double-tap ${hotkeyHint}` : 'Click to dictate'}
         </span>
       )}
+      {showCancelHint && <span className="dpill__tooltip">esc to cancel</span>}
       <span className="dpill__body">
         <svg
           className="dpill__mic"

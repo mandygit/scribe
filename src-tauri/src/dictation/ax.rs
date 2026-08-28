@@ -172,7 +172,11 @@ impl Element {
         // SAFETY: `self.0` is a live AX element, `name` outlives the call, and
         // `settable` is only read on success.
         let error = unsafe {
-            AXUIElementIsAttributeSettable(self.raw(), Retained::as_ptr(&name), &mut settable as *mut _)
+            AXUIElementIsAttributeSettable(
+                self.raw(),
+                Retained::as_ptr(&name),
+                &mut settable as *mut _,
+            )
         };
         error == AX_SUCCESS && settable != 0
     }

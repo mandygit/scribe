@@ -2,7 +2,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 
 use analysis::{AnalysisTranscriptSegment, MeetingSummarizer, MeetingSummary};
@@ -83,6 +86,28 @@ struct AppState {
     /// been overwritten by something else by the time they notice. Replaced
     /// by the next dictation regardless of that one's own paste outcome.
     last_dictation: Mutex<Option<LastDictationRecovery>>,
+    /// How many dictations are between starting to listen and having their
+    /// text inserted - the exact window in which the pill is non-idle, Escape
+    /// is claimed as the cancel key, and a cancel has something to cancel.
+    ///
+    /// Deliberately wider than `DictationRecorder::is_recording`, which goes
+    /// false the instant the capture stops even though the transcribe →
+    /// polish → paste pipeline is still running and still cancellable.
+    ///
+    /// A count rather than a flag because sessions can overlap: the recorder
+    /// is free again while the previous dictation transcribes, so a fresh
+    /// double-press starts a second one on top of it. Escape is claimed on
+    /// 0 → 1 and released on 1 → 0, so an earlier session finishing can never
+    /// pull the cancel key (or the listening state) out from under a later
+    /// one that is still recording.
+    dictation_sessions_in_flight: AtomicUsize,
+    /// Bumped every time a dictation is cancelled. `stop_and_process_dictation`
+    /// snapshots it when the capture stops and re-checks once whisper and the
+    /// polish sidecar are done: a mismatch means Escape was pressed while they
+    /// ran, and the transcript is dropped instead of being saved, put on the
+    /// clipboard or pasted. Cancelling therefore works right up to the
+    /// instant the text lands, with no window where Escape looks ignored.
+    dictation_cancel_epoch: AtomicU64,
 }
 
 /// See `AppState::last_dictation`.
@@ -953,10 +978,15 @@ async fn stop_dictation(state: State<'_, AppState>) -> Result<String, AppError> 
         })?
 }
 
-/// Audible dictation feedback: a tick when listening starts and a chime when the
-/// text is inserted. Paired with the menu-bar indicator in case sound is off.
+/// Audible dictation feedback: a tick when listening starts, a chime when the
+/// text is inserted, and a flatter, unmistakably different note when the
+/// dictation is cancelled - cancelling is silent otherwise (nothing appears in
+/// the target app), so this is the only confirmation the user gets that Escape
+/// landed rather than being swallowed by whatever they were typing into.
+/// Paired with the menu-bar indicator in case sound is off.
 const DICTATION_START_SOUND: &str = "/System/Library/Sounds/Tink.aiff";
 const DICTATION_DONE_SOUND: &str = "/System/Library/Sounds/Glass.aiff";
+const DICTATION_CANCEL_SOUND: &str = "/System/Library/Sounds/Bottle.aiff";
 
 /// Id of the menu-bar tray icon, used both to build it and to flip its title to a
 /// recording indicator during dictation.
@@ -1154,30 +1184,50 @@ struct DictationPillHoverEvent {
 #[cfg(target_os = "macos")]
 const PILL_HOVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The hover state most recently sent to the pill, or `None` when it needs
+/// re-asserting.
+///
+/// Cleared by `remember_pill_rect` on every resize, because a resize changes
+/// the frame the cursor is tested against - the previous answer is stale even
+/// though the cursor never moved, and since the watcher only speaks up on a
+/// change it would otherwise never correct itself. That is what used to strand
+/// the pill: hover it, start a dictation, and the pill would not know the
+/// cursor was still on it until you moved off and back.
+#[cfg(target_os = "macos")]
+static PILL_HOVER_SENT: Mutex<Option<bool>> = Mutex::new(None);
+
 /// Watches the global cursor and tells the pill when it enters or leaves the
 /// pill window's frame. Runs for the app's whole lifetime.
 #[cfg(target_os = "macos")]
 fn spawn_pill_hover_watcher(app: &AppHandle) {
     let app = app.clone();
-    std::thread::spawn(move || {
-        let mut was_hovering = false;
-        loop {
-            std::thread::sleep(PILL_HOVER_POLL_INTERVAL);
-            let Some((cursor_x, cursor_y)) = macos_cursor::location() else {
-                continue;
-            };
-            let hovering = PILL_RECT.lock().ok().and_then(|rect| *rect).is_some_and(
-                |(x, y, width, height)| {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(PILL_HOVER_POLL_INTERVAL);
+        let Some((cursor_x, cursor_y)) = macos_cursor::location() else {
+            continue;
+        };
+        let hovering =
+            PILL_RECT
+                .lock()
+                .ok()
+                .and_then(|rect| *rect)
+                .is_some_and(|(x, y, width, height)| {
                     cursor_x >= x && cursor_x < x + width && cursor_y >= y && cursor_y < y + height
-                },
-            );
-            if hovering != was_hovering {
-                was_hovering = hovering;
-                let _ = app.emit(
-                    DICTATION_PILL_HOVER_EVENT,
-                    DictationPillHoverEvent { hovering },
-                );
+                });
+        // Decide and record under the lock, emit outside it: `emit` hops to
+        // the webview and has no business holding up the next poll.
+        let changed = match PILL_HOVER_SENT.lock() {
+            Ok(mut sent) if *sent != Some(hovering) => {
+                *sent = Some(hovering);
+                true
             }
+            _ => false,
+        };
+        if changed {
+            let _ = app.emit(
+                DICTATION_PILL_HOVER_EVENT,
+                DictationPillHoverEvent { hovering },
+            );
         }
     });
 }
@@ -1392,7 +1442,10 @@ fn debug_log(message: &str) {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    append_debug_log_line(&std::path::Path::new(&home).join("Library/Logs/Scribe"), message);
+    append_debug_log_line(
+        &std::path::Path::new(&home).join("Library/Logs/Scribe"),
+        message,
+    );
 }
 
 /// Serialises debug-log writes across threads. See [`append_debug_log_line`].
@@ -1493,6 +1546,12 @@ const PILL_IDLE_SIZE: (f64, f64) = (64.0, 18.0);
 const PILL_HOVER_SIZE: (f64, f64) = (210.0, 64.0);
 #[cfg(desktop)]
 const PILL_ACTIVE_SIZE: (f64, f64) = (160.0, 40.0);
+/// Same capsule as `PILL_ACTIVE_SIZE`, with headroom above it for the "esc to
+/// cancel" hint the pill raises when the cursor is on it mid-dictation. Only
+/// the window grows; the capsule itself is unchanged, so the pill never gets
+/// bigger for a user who isn't pointing at it.
+#[cfg(desktop)]
+const PILL_ACTIVE_HOVER_SIZE: (f64, f64) = (160.0, 68.0);
 #[cfg(desktop)]
 const PILL_NOTICE_SIZE: (f64, f64) = (300.0, 40.0);
 /// The paste-failure recovery widget: the one layout that has to hold real
@@ -1535,22 +1594,32 @@ fn monitor_under_cursor(window: &tauri::WebviewWindow) -> Option<tauri::Monitor>
     #[cfg(not(target_os = "macos"))]
     return None;
     #[cfg(target_os = "macos")]
-    window.available_monitors().ok()?.into_iter().find(|monitor| {
-        let scale = monitor.scale_factor();
-        let area = monitor.work_area();
-        let x = area.position.x as f64 / scale;
-        let y = area.position.y as f64 / scale;
-        let width = area.size.width as f64 / scale;
-        let height = area.size.height as f64 / scale;
-        cursor_x >= x && cursor_x < x + width && cursor_y >= y && cursor_y < y + height
-    })
+    window
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .find(|monitor| {
+            let scale = monitor.scale_factor();
+            let area = monitor.work_area();
+            let x = area.position.x as f64 / scale;
+            let y = area.position.y as f64 / scale;
+            let width = area.size.width as f64 / scale;
+            let height = area.size.height as f64 / scale;
+            cursor_x >= x && cursor_x < x + width && cursor_y >= y && cursor_y < y + height
+        })
 }
 
-/// Records the pill frame most recently applied by `position_window`.
+/// Records the pill frame most recently applied by `position_window`, and
+/// invalidates the hover watcher's last answer, which was about the old frame
+/// (see `PILL_HOVER_SENT`).
 #[cfg(desktop)]
 fn remember_pill_rect(position: Option<(f64, f64)>, width: f64, height: f64) {
     if let (Some((x, y)), Ok(mut rect)) = (position, PILL_RECT.lock()) {
         *rect = Some((x, y, width, height));
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(mut sent) = PILL_HOVER_SENT.lock() {
+        *sent = None;
     }
 }
 
@@ -1641,6 +1710,7 @@ fn pill_layout_size(layout: &str) -> Result<(f64, f64), AppError> {
         "idle" => Ok(PILL_IDLE_SIZE),
         "hover" => Ok(PILL_HOVER_SIZE),
         "listening" | "transcribing" => Ok(PILL_ACTIVE_SIZE),
+        "active-hover" => Ok(PILL_ACTIVE_HOVER_SIZE),
         "notice" => Ok(PILL_NOTICE_SIZE),
         "paste-failed" => Ok(PILL_PASTE_FAILED_SIZE),
         other => Err(AppError {
@@ -1794,8 +1864,8 @@ fn position_window(
     window_height: f64,
     margin: f64,
 ) -> Option<(f64, f64)> {
-    let monitor = monitor_under_cursor(window)
-        .or_else(|| window.primary_monitor().ok().flatten())?;
+    let monitor =
+        monitor_under_cursor(window).or_else(|| window.primary_monitor().ok().flatten())?;
     let scale = monitor.scale_factor();
     let work_area = monitor.work_area();
     let work_x = work_area.position.x as f64 / scale;
@@ -1935,7 +2005,11 @@ fn deny_key_window_to_panels() {
     };
     debug_log(&format!(
         "panel: canBecomeKeyWindow overridden to NO (previous impl {})",
-        if replaced.is_null() { "none" } else { "replaced" }
+        if replaced.is_null() {
+            "none"
+        } else {
+            "replaced"
+        }
     ));
 }
 
@@ -2112,6 +2186,95 @@ fn register_polish_selection_hotkey(app: &AppHandle, token: &str) -> Result<(), 
     })
 }
 
+/// Whether bare Escape is currently registered with the OS, and the lock that
+/// serialises changing it. Separate from `AppState::dictation_sessions_in_flight`
+/// (the intent) because the two move on different threads: the intent changes
+/// synchronously with the dictation, the registration catches up a moment
+/// later - see `sync_dictation_cancel_shortcut`.
+#[cfg(desktop)]
+static CANCEL_SHORTCUT_CLAIMED: Mutex<bool> = Mutex::new(false);
+
+/// Brings the Escape registration in line with whether a dictation is in
+/// flight. Call after every change to `AppState::dictation_sessions_in_flight`;
+/// it is idempotent, so no caller has to work out which way it should go.
+///
+/// Escape is claimed only for the seconds a dictation is actually running, not
+/// for the app's lifetime like the dictation and polish-selection hotkeys. A
+/// registered global shortcut is exclusive - while it is held, no other app on
+/// the system sees the key - and Escape is far too load-bearing to take
+/// permanently: it closes dialogs, leaves vim's insert mode, dismisses
+/// autocomplete.
+///
+/// **The OS call must never run on the calling thread.** Both the dictation
+/// hotkey and Escape itself reach this from inside a global-shortcut handler,
+/// and the plugin dispatches those while holding the very mutex that
+/// registering and unregistering take - its `build` keeps `shortcuts_.lock()`
+/// alive across the handler call. Doing it inline deadlocks the main thread and
+/// freezes the whole app, which is exactly what the first double-press did
+/// before this moved onto a thread. Off-thread, the plugin's own hop back to
+/// the main thread lands after the handler has returned and the lock is free.
+///
+/// The desired state is re-read here rather than passed in, so whichever thread
+/// runs last converges on the truth instead of applying a stale decision.
+/// Best-effort: a dictation that cannot claim Escape still records and inserts
+/// normally, it just can't be cancelled from the keyboard.
+#[cfg(desktop)]
+fn sync_dictation_cancel_shortcut(app: &AppHandle) {
+    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Ok(mut claimed) = CANCEL_SHORTCUT_CLAIMED.lock() else {
+            eprintln!("dictation: escape registration lock poisoned");
+            return;
+        };
+        let wanted = app
+            .state::<AppState>()
+            .dictation_sessions_in_flight
+            .load(Ordering::SeqCst)
+            > 0;
+        if wanted == *claimed {
+            return;
+        }
+        let shortcut = Shortcut::new(None, Code::Escape);
+        let global_shortcut = app.global_shortcut();
+        let result = if wanted {
+            global_shortcut.on_shortcut(shortcut, |app, _shortcut, event| {
+                if event.state == ShortcutState::Pressed {
+                    cancel_dictation_session(app);
+                }
+            })
+        } else {
+            global_shortcut.unregister(shortcut)
+        };
+        match result {
+            Ok(()) => {
+                *claimed = wanted;
+                // Logged on both edges, and deliberately not just on failure.
+                // "Escape stopped working everywhere" is the worst way this
+                // feature can break, an installed build has no stderr to read,
+                // and this line is the only thing that can tell a stuck claim
+                // apart from a keyboard the user thinks is broken.
+                debug_log(if wanted {
+                    "dictation: escape claimed for cancel"
+                } else {
+                    "dictation: escape released"
+                });
+            }
+            Err(error) => {
+                // A failed release is the one worth shouting about: it leaves
+                // Escape swallowed system-wide, which reads as the user's
+                // keyboard breaking rather than as a Scribe bug.
+                let verb = if wanted { "claim" } else { "release" };
+                eprintln!("dictation: could not {verb} escape ({error})");
+                debug_log(&format!("dictation: could not {verb} escape ({error})"));
+            }
+        }
+    });
+}
+
+#[cfg(not(desktop))]
+fn sync_dictation_cancel_shortcut(_app: &AppHandle) {}
+
 /// Handles the polish-selection hotkey: copies whatever is selected in the
 /// focused app, polishes it, and pastes the result back in place. Runs off
 /// the main thread since it shells out to `osascript`/`pbpaste` and the
@@ -2169,6 +2332,13 @@ fn start_dictation_session(app: &AppHandle) {
     let state = app.state::<AppState>();
     match begin_dictation(&state) {
         Ok(()) => {
+            // Claim Escape before anything else in this arm: the microphone is
+            // already live, so this is the first instant the user could want
+            // out, and the target-app handback below is not instant.
+            state
+                .dictation_sessions_in_flight
+                .fetch_add(1, Ordering::SeqCst);
+            sync_dictation_cancel_shortcut(app);
             // Snapshot the paste target now, before the pill (or anything
             // else) can steal key focus — this is a point-in-time query, so
             // capturing it any later would risk recording the wrong app.
@@ -2214,6 +2384,70 @@ fn start_dictation_session(app: &AppHandle) {
     }
 }
 
+/// Cancels every in-flight dictation: the audio is stopped and deleted without
+/// ever reaching whisper, and if whisper is already running its transcript is
+/// discarded before it can be saved, copied or pasted. Bound to Escape for as
+/// long as a dictation is in flight (see `sync_dictation_cancel_shortcut`).
+///
+/// A cancelled dictation leaves nothing behind - no clip on disk, no history
+/// row, no recovery text, no clipboard write, no paste. The cue is the only
+/// trace, and it earns its place: cancelling is otherwise completely silent,
+/// so without it the user cannot tell Escape reached Scribe rather than the
+/// app they were typing into.
+fn cancel_dictation_session(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    // Whoever swaps a non-zero count out owns the cancel. That makes this
+    // idempotent against a doubled Escape, and against an Escape racing the
+    // pipeline's own completion - only one of them gets to act.
+    if state.dictation_sessions_in_flight.swap(0, Ordering::SeqCst) == 0 {
+        return;
+    }
+    // Bump before touching anything else, so a pipeline that finishes
+    // transcribing part-way through this function already reads as superseded
+    // and drops its text rather than racing us to the user's text field.
+    state.dictation_cancel_epoch.fetch_add(1, Ordering::SeqCst);
+
+    let was_listening = match state.dictation.lock() {
+        Ok(mut recorder) if recorder.is_recording() => {
+            if let Err(error) = recorder.cancel() {
+                eprintln!(
+                    "dictation: could not stop the cancelled capture ({})",
+                    error.code
+                );
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(_) => {
+            eprintln!("dictation: recorder lock poisoned, cannot stop the cancelled capture");
+            false
+        }
+    };
+
+    // Put the press tracker back to idle so the next press is read as the
+    // start of a fresh dictation rather than a stop of the cancelled one, and
+    // drop the paste target so nothing can be reactivated on its behalf.
+    if let Ok(mut tracker) = state.dictation_hotkey.lock() {
+        tracker.mark_recording_stopped();
+    }
+    if let Ok(mut target) = state.dictation_target_app.lock() {
+        *target = None;
+    }
+
+    set_recording_indicator(app, false);
+    sync_dictation_cancel_shortcut(app);
+    emit_dictation_state(app, "idle");
+    play_cue(DICTATION_CANCEL_SOUND);
+
+    let phase = if was_listening {
+        "while listening"
+    } else {
+        "while transcribing"
+    };
+    eprintln!("dictation: cancelled {phase}, nothing kept");
+    debug_log(&format!("dictation: cancelled {phase}, nothing kept"));
+}
+
 /// Which app this dictation should be pasted into.
 ///
 /// Normally the app the user was last in, tracked continuously because a
@@ -2249,6 +2483,12 @@ fn stop_and_process_dictation(app: &AppHandle) {
     eprintln!("dictation: transcribing…");
     set_recording_indicator(app, false);
     emit_dictation_state(app, "transcribing");
+    // Read on the way in, not inside the task: `spawn_blocking` may not run
+    // for a while, and an Escape pressed in that gap has to count.
+    let cancel_epoch = app
+        .state::<AppState>()
+        .dictation_cancel_epoch
+        .load(Ordering::SeqCst);
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -2266,6 +2506,14 @@ fn stop_and_process_dictation(app: &AppHandle) {
                             error.code
                         ),
                     }
+                }
+                // Last chance to honour an Escape pressed while whisper and
+                // the polish sidecar were running. Everything below this line
+                // is irreversible from the user's side: the text goes into the
+                // database, onto the clipboard, and into whatever app they
+                // were in.
+                if state.dictation_cancel_epoch.load(Ordering::SeqCst) != cancel_epoch {
+                    return Ok(DictationOutcome::Cancelled);
                 }
                 record_dictation_session(&state, started_at_ms, &text);
                 // The pill deliberately stays on screen across the paste. It used to
@@ -2305,13 +2553,19 @@ fn stop_and_process_dictation(app: &AppHandle) {
                     );
                 }
                 let injected = inject_result?;
-                Ok((text, injected))
+                Ok(DictationOutcome::Inserted(text, injected))
             });
         match outcome {
-            Ok((text, _)) if text.trim().is_empty() => {
+            Ok(DictationOutcome::Cancelled) => {
+                // The user pressed Escape mid-pipeline. `cancel_dictation_session`
+                // has already put everything back; this run just declines to
+                // deliver what it produced.
+                eprintln!("dictation: cancelled mid-transcription, transcript discarded");
+            }
+            Ok(DictationOutcome::Inserted(text, _)) if text.trim().is_empty() => {
                 eprintln!("dictation: no speech detected, nothing inserted");
             }
-            Ok((text, dictation::InjectOutcome::PasteDidNotLand)) => {
+            Ok(DictationOutcome::Inserted(text, dictation::InjectOutcome::PasteDidNotLand)) => {
                 // The app took the keystroke and did nothing with it. Not an
                 // error anywhere in the stack, which is exactly why this went
                 // unnoticed before. Log only the length, never the text.
@@ -2325,7 +2579,7 @@ fn stop_and_process_dictation(app: &AppHandle) {
                 ));
                 emit_dictation_paste_failed(&app, PasteFailureReason::PasteDidNotLand);
             }
-            Ok((text, dictation::InjectOutcome::SecureInputActive)) => {
+            Ok(DictationOutcome::Inserted(text, dictation::InjectOutcome::SecureInputActive)) => {
                 // Not an error either: macOS was refusing synthesised
                 // keystrokes, so the paste was withheld rather than fired into
                 // a window server that would drop it. Log only the length.
@@ -2339,7 +2593,7 @@ fn stop_and_process_dictation(app: &AppHandle) {
                 ));
                 emit_dictation_paste_failed(&app, PasteFailureReason::SecureInputActive);
             }
-            Ok((text, dictation::InjectOutcome::TargetNotFrontmost)) => {
+            Ok(DictationOutcome::Inserted(text, dictation::InjectOutcome::TargetNotFrontmost)) => {
                 // Also not an error: the transcription worked and the paste was
                 // deliberately withheld rather than fired at whichever app
                 // happened to be in front. Log only the length, never the text.
@@ -2353,7 +2607,7 @@ fn stop_and_process_dictation(app: &AppHandle) {
                 ));
                 emit_dictation_paste_failed(&app, PasteFailureReason::TargetNotFrontmost);
             }
-            Ok((text, dictation::InjectOutcome::NoPasteTarget)) => {
+            Ok(DictationOutcome::Inserted(text, dictation::InjectOutcome::NoPasteTarget)) => {
                 // Not an error: the transcription worked, there was just
                 // nowhere to put it. Log only the length, never the text.
                 eprintln!(
@@ -2364,7 +2618,7 @@ fn stop_and_process_dictation(app: &AppHandle) {
                 // the "done" sound is what tells the user it did.
                 emit_dictation_paste_failed(&app, PasteFailureReason::NoTarget);
             }
-            Ok((text, dictation::InjectOutcome::Pasted)) => {
+            Ok(DictationOutcome::Inserted(text, dictation::InjectOutcome::Pasted)) => {
                 // Log only the length, not the dictated text itself.
                 eprintln!("dictation: inserted {} characters", text.chars().count());
                 debug_log(&format!(
@@ -2391,8 +2645,36 @@ fn stop_and_process_dictation(app: &AppHandle) {
                 emit_dictation_paste_failed(&app, reason);
             }
         }
-        emit_dictation_state(&app, "idle");
+        // A cancelled run leaves the bookkeeping alone: `cancel_dictation_session`
+        // has already zeroed the count and put the pill back, so decrementing
+        // here would underflow it.
+        if state.dictation_cancel_epoch.load(Ordering::SeqCst) != cancel_epoch {
+            return;
+        }
+        // Only the last session standing puts the pill back. A newer dictation
+        // started while this one was transcribing is still recording, and
+        // knocking it back to idle would strand a live microphone behind an
+        // idle pill.
+        let was_last = state
+            .dictation_sessions_in_flight
+            .fetch_sub(1, Ordering::SeqCst)
+            == 1;
+        sync_dictation_cancel_shortcut(&app);
+        if was_last {
+            emit_dictation_state(&app, "idle");
+        }
     });
+}
+
+/// What one run of the dictation pipeline ended up doing.
+///
+/// `Cancelled` is not a failure: the user pressed Escape while whisper or the
+/// polish sidecar was running, so the transcript was thrown away on purpose
+/// and none of the delivery paths - history row, recovery text, clipboard,
+/// paste - should fire for it.
+enum DictationOutcome {
+    Inserted(String, dictation::InjectOutcome),
+    Cancelled,
 }
 
 /// Saves the just-dictated text in memory (see `AppState::last_dictation`) so
@@ -3051,6 +3333,8 @@ pub fn run() {
                 meeting_call_state: Mutex::new(CallPromptState::default()),
                 dictation_target_app: Mutex::new(None),
                 last_dictation: Mutex::new(None),
+                dictation_sessions_in_flight: AtomicUsize::new(0),
+                dictation_cancel_epoch: AtomicU64::new(0),
             });
             spawn_audio_retention_cleanup(database_path, app_data_dir.clone());
             #[cfg(target_os = "macos")]
@@ -3915,7 +4199,11 @@ mod debug_log_tests {
         let contents =
             std::fs::read_to_string(dir.path().join("app-debug.log")).expect("log written");
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 8 * 60, "every write must produce exactly one line");
+        assert_eq!(
+            lines.len(),
+            8 * 60,
+            "every write must produce exactly one line"
+        );
         for line in lines {
             let (timestamp, rest) = line.split_once(' ').unwrap_or_else(|| {
                 panic!("line has no timestamp separator: {line:?}");
@@ -4423,6 +4711,33 @@ mod tests {
         assert!(super::hotkey_shortcut_for("cmd+space").is_none());
         assert!(super::hotkey_shortcut_for("f5").is_none());
         assert!(super::hotkey_shortcut_for("").is_none());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn escape_is_registrable_as_the_dictation_cancel_key() {
+        // The cancel key is claimed only while a dictation is in flight, but
+        // if bare Escape were not a shortcut this platform can express, that
+        // would only ever surface as cancel silently doing nothing.
+        use tauri_plugin_global_shortcut::{Code, Shortcut};
+        let escape = Shortcut::new(None, Code::Escape);
+        assert_eq!(escape.key, Code::Escape);
+        assert!(escape.mods.is_empty(), "cancel is bare Escape, unmodified");
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn the_cancel_hint_layout_only_adds_headroom_above_the_capsule() {
+        let active = super::pill_layout_size("listening").expect("listening is a known layout");
+        let hinted = super::pill_layout_size("active-hover").expect("hint is a known layout");
+        // Same width, so raising the hint cannot shift the capsule sideways
+        // mid-dictation; taller, so the hint above it isn't clipped.
+        assert_eq!(hinted.0, active.0);
+        assert!(hinted.1 > active.1);
+        assert_eq!(
+            super::pill_layout_size("transcribing").expect("transcribing is a known layout"),
+            active
+        );
     }
 
     #[test]

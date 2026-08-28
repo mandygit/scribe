@@ -110,7 +110,6 @@ const FRONTMOST_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// [`spawn_frontmost_app_tracker`].
 static LAST_EXTERNAL_FRONTMOST: StdMutex<Option<TargetAppPid>> = StdMutex::new(None);
 
-
 /// Records one step of an injection to the app debug log. A paste that goes
 /// missing leaves no other trace: the installed app's stderr is discarded, and
 /// `osascript` reports success for a keystroke nothing consumed.

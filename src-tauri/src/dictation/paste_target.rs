@@ -287,7 +287,9 @@ fn log_silent_app_diagnostics(pid: TargetAppPid, app: &Element) {
         .unwrap_or_else(|| "-".to_string());
     // Whether the app answers anything at all, so a dead or unresponsive
     // target is not mistaken for a meaningful "no".
-    let app_role = app.attribute_string("AXRole").unwrap_or_else(|| "-".to_string());
+    let app_role = app
+        .attribute_string("AXRole")
+        .unwrap_or_else(|| "-".to_string());
     let main_window = app.attribute_element("AXMainWindow").is_some();
 
     #[cfg(target_os = "macos")]

@@ -335,6 +335,8 @@ flowchart LR
     Polish -- no --> Raw["Raw transcript text"]
     PolishHelper --> Inject["Clipboard write + paste\ninto focused app"]
     Raw --> Inject
+    Esc["Escape\n(claimed only while in flight)"] -. cancels .-> Capture
+    Esc -. discards .-> Inject
     Pill["Floating pill (NSPanel)"] -. shows state .-> Hotkey
 ```
 
@@ -367,6 +369,19 @@ flowchart LR
   incidental single press) — modeled on the Wispr Flow interaction pattern,
   since a single global hotkey with no visual "recording" affordance needs a
   very deliberate trigger gesture to avoid accidental activation.
+- **Escape cancels, and is claimed only while a dictation is in flight.** A
+  registered global shortcut is exclusive - for as long as Escape is
+  registered, no other app on the system sees it - and Escape is far too
+  load-bearing to hold permanently. `sync_dictation_cancel_shortcut` therefore
+  claims it on the transition into listening and releases it on the way back
+  to idle, paired strictly with `AppState::dictation_sessions_in_flight` (a
+  count, not a flag, because a second dictation can start while the first is
+  still transcribing). Cancelling while listening deletes the clip without
+  transcribing it; cancelling later can't stop whisper, so
+  `AppState::dictation_cancel_epoch` is checked immediately before the text
+  would be persisted, copied and pasted, and the transcript is dropped
+  instead. Either way nothing survives: no clip, no history row, no recovery
+  text, no clipboard write.
 - **Dictation sessions store stats only, not transcript text**
   (`dictation_sessions` table) — word count, duration, whether polish was
   used — by design, since dictated text is often much more sensitive/

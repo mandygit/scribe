@@ -457,7 +457,10 @@ mod root_scope_tests {
     #[test]
     fn ordinary_directories_are_searched() {
         let home = Path::new("/Users/someone");
-        assert!(is_searchable_root(Path::new("/Users/someone/models"), Some(home)));
+        assert!(is_searchable_root(
+            Path::new("/Users/someone/models"),
+            Some(home)
+        ));
         assert!(is_searchable_root(Path::new("/Users/someone"), Some(home)));
         assert!(is_searchable_root(Path::new("/opt/models"), Some(home)));
     }

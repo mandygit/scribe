@@ -779,7 +779,10 @@ function DictationView({
             <Icon name="mic" size={26} />
           </span>
           <h2>No dictations yet</h2>
-          <p>Double-press your dictation hotkey to start, press it again to insert. Sessions show up here.</p>
+          <p>
+            Double-press your dictation hotkey to start, press it again to insert, or press esc to throw it away.
+            Sessions show up here.
+          </p>
         </div>
       )}
     </div>
@@ -1705,7 +1708,10 @@ function SettingsView({
 
       <section className="settings-group">
         <h2>Dictation</h2>
-        <p className="hint">Double-press the hotkey to start dictating, press it once to stop and insert.</p>
+        <p className="hint">
+          Double-press the hotkey to start dictating, press it once to stop and insert. Esc cancels a dictation in
+          progress: the audio is deleted, nothing is transcribed or inserted, and nothing is kept here.
+        </p>
         <div className="field">
           <div>
             <div className="field-label">Hotkey</div>

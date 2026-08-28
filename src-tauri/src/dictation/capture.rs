@@ -85,6 +85,24 @@ impl<B: AudioCaptureBackend> DictationRecorder<B> {
         handle.stop()?;
         Ok((file_path, started_at_ms))
     }
+
+    /// Abandons the in-flight capture: stops the stream and deletes the clip
+    /// without transcribing it. The counterpart to [`finish`](Self::finish) for
+    /// a dictation the user cancelled, so the audio never reaches whisper and
+    /// nothing is left on disk to reach it later.
+    ///
+    /// The clip is removed even if stopping the stream reports an error: a
+    /// half-written WAV is still a recording of the user speaking, and the
+    /// whole point of cancelling is that it should not survive.
+    pub fn cancel(&mut self) -> Result<(), AppError> {
+        let capture = self.active.take().ok_or_else(dictation_not_recording)?;
+        let ActiveCapture {
+            file_path, handle, ..
+        } = capture;
+        let stop_result = handle.stop();
+        let _ = std::fs::remove_file(&file_path);
+        stop_result.map(|_| ())
+    }
 }
 
 /// Computes word count and words-per-minute for a finished dictation, given the
@@ -235,6 +253,43 @@ mod tests {
             .finish()
             .expect_err("finish without start is rejected");
         assert_eq!(error.code, "dictation_not_recording");
+    }
+
+    #[test]
+    fn cancelling_deletes_the_clip_and_clears_the_capture() {
+        let path = new_dictation_wav_path().expect("temp path");
+        std::fs::write(&path, b"RIFF").expect("clip written");
+
+        let mut recorder = DictationRecorder::new(StubBackend);
+        recorder.start(path.clone(), None).expect("start succeeds");
+        recorder.cancel().expect("cancel succeeds");
+
+        assert!(!recorder.is_recording());
+        assert!(
+            !path.exists(),
+            "a cancelled dictation must leave no audio behind"
+        );
+    }
+
+    #[test]
+    fn cancelling_without_a_capture_is_rejected() {
+        let mut recorder = DictationRecorder::new(StubBackend);
+        let error = recorder
+            .cancel()
+            .expect_err("cancel without start is rejected");
+        assert_eq!(error.code, "dictation_not_recording");
+    }
+
+    #[test]
+    fn a_cancelled_recorder_can_start_again() {
+        let mut recorder = DictationRecorder::new(StubBackend);
+        recorder
+            .start(PathBuf::from("/tmp/scribe-dictation-cancel-a.wav"), None)
+            .expect("first start succeeds");
+        recorder.cancel().expect("cancel succeeds");
+        recorder
+            .start(PathBuf::from("/tmp/scribe-dictation-cancel-b.wav"), None)
+            .expect("cancel released the slot for a fresh dictation");
     }
 
     #[test]
