@@ -587,52 +587,113 @@ fn set_clipboard(text: &str) -> Result<(), AppError> {
     }
 }
 
-/// Synthesises a Cmd+`key` keystroke into the focused app via System Events —
-/// `"v"` to paste, `"c"` to copy. A failure here usually means the
-/// Accessibility permission has not been granted; `failure_code` is returned
-/// for any other failure so callers can tell the two apart.
+/// Posts a Cmd+`key` keystroke to the focused app - `"v"` to paste, `"c"` to
+/// copy - as a real CoreGraphics event.
+///
+/// This used to go through System Events (`osascript ... keystroke "v" using
+/// command down`), and that is why dictating into Claude silently did nothing:
+/// **Electron apps ignore AppleScript-synthesised keystrokes**, while
+/// `osascript` exits 0 regardless, because System Events accepting an event
+/// says nothing about anything consuming it. Proven by A/B on 2026-08-28
+/// against Claude's composer with the app frontmost and the field focused: the
+/// CoreGraphics event pasted, the System Events one did not, same clipboard,
+/// seconds apart.
+///
+/// A posted event is also layout-independent, where `keystroke "v"` asks the
+/// current keyboard layout where "v" lives and can send a different physical
+/// key on Dvorak or a non-Latin layout. And it costs no subprocess and no Apple
+/// Event round trip per paste.
+///
+/// The trade is that posting reports nothing: `CGEventPost` returns void, and
+/// without the Accessibility permission the event is dropped in silence rather
+/// than refused with a message. So the permission is checked up front instead
+/// of inferred from an error string - a direct question, and a more reliable
+/// answer than parsing System Events' wording across macOS versions.
 fn send_cmd_keystroke(key: &str, failure_code: &str) -> Result<(), AppError> {
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
-            r#"tell application "System Events" to keystroke "{key}" using command down"#
-        ))
-        .output()
-        .map_err(|error| AppError {
-            code: failure_code.to_string(),
+    // kVK_ANSI_C / kVK_ANSI_V: physical key positions, not characters, so the
+    // keyboard layout cannot redirect them.
+    let keycode: u16 = match key {
+        "c" => 8,
+        "v" => 9,
+        other => {
+            return Err(AppError {
+                code: failure_code.to_string(),
+                message: format!("No key code is mapped for Cmd+{}.", other.to_uppercase()),
+                details: None,
+            })
+        }
+    };
+    if !ax::is_trusted() {
+        return Err(AppError {
+            code: "dictation_accessibility_permission_required".to_string(),
             message: format!(
-                "Could not start osascript to send Cmd+{}.",
+                "Cannot send Cmd+{} without the Accessibility permission.",
                 key.to_uppercase()
             ),
-            details: Some(error.to_string()),
-        })?;
-
-    if output.status.success() {
-        return Ok(());
+            details: None,
+        });
     }
+    post_command_key(keycode).ok_or_else(|| AppError {
+        code: failure_code.to_string(),
+        message: format!("Could not create the Cmd+{} event.", key.to_uppercase()),
+        details: None,
+    })
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    // When the app lacks the Accessibility permission, System Events refuses the
-    // keystroke. The wording varies by macOS version: "not allowed to send
-    // keystrokes" (error 1002) or "not allowed assistive access" (error -1719).
-    // Flag both as the permission case so the UI can prompt the user to grant it.
-    let code = if is_accessibility_denied(&stderr) {
-        "dictation_accessibility_permission_required"
-    } else {
-        failure_code
-    };
-    Err(AppError {
-        code: code.to_string(),
-        message: format!(
-            "Could not send Cmd+{} to the focused app.",
-            key.to_uppercase()
-        ),
-        details: if stderr.is_empty() {
+/// `kCGEventSourceStateHIDSystemState` - the same source a real keyboard uses.
+const CG_EVENT_SOURCE_HID_SYSTEM_STATE: i32 = 1;
+/// `kCGHIDEventTap` - posted at the lowest point, so the event reaches apps
+/// that filter out higher-level synthetic input.
+const CG_HID_EVENT_TAP: u32 = 0;
+/// `kCGEventFlagMaskCommand`.
+const CG_FLAG_COMMAND: u64 = 1 << 20;
+/// Gap between key-down and key-up. Zero works on most apps and not on all;
+/// this is a keypress, and a keypress has a duration.
+const KEY_HOLD: Duration = Duration::from_millis(20);
+
+/// Posts one Cmd+keycode press and release. `None` if the events could not be
+/// created, which in practice only happens when the process is out of event
+/// sources. CoreGraphics is already linked by wry/tauri, so the symbols resolve
+/// without adding them to the link line (same approach as `macos_cursor`).
+fn post_command_key(keycode: u16) -> Option<()> {
+    unsafe extern "C" {
+        fn CGEventSourceCreate(state_id: i32) -> *const std::ffi::c_void;
+        fn CGEventCreateKeyboardEvent(
+            source: *const std::ffi::c_void,
+            keycode: u16,
+            key_down: bool,
+        ) -> *const std::ffi::c_void;
+        fn CGEventSetFlags(event: *const std::ffi::c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *const std::ffi::c_void);
+        fn CFRelease(object: *const std::ffi::c_void);
+    }
+    // SAFETY: every pointer below is checked for null before use, each Create
+    // call returns +1 and is released exactly once, and the flags/tap values
+    // are the documented CoreGraphics constants.
+    unsafe {
+        let source = CGEventSourceCreate(CG_EVENT_SOURCE_HID_SYSTEM_STATE);
+        let down = CGEventCreateKeyboardEvent(source, keycode, true);
+        let up = CGEventCreateKeyboardEvent(source, keycode, false);
+        let posted = if down.is_null() || up.is_null() {
             None
         } else {
-            Some(stderr)
-        },
-    })
+            // Set explicitly rather than inherited: whatever modifiers the user
+            // is physically holding - the dictation hotkey's own, moments
+            // earlier - must not turn this into a different shortcut.
+            CGEventSetFlags(down, CG_FLAG_COMMAND);
+            CGEventSetFlags(up, CG_FLAG_COMMAND);
+            CGEventPost(CG_HID_EVENT_TAP, down);
+            std::thread::sleep(KEY_HOLD);
+            CGEventPost(CG_HID_EVENT_TAP, up);
+            Some(())
+        };
+        for event in [down, up, source] {
+            if !event.is_null() {
+                CFRelease(event);
+            }
+        }
+        posted
+    }
 }
 
 /// Checks the Accessibility permission via `System Events`'s `UI elements

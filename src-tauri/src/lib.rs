@@ -1828,12 +1828,32 @@ fn make_window_non_activating(app: &AppHandle, label: &str) {
 
     // NSWindowStyleMaskNonactivatingPanel — a click must not activate Scribe (the
     // app stays in the background; only its key window changes). Both floating
-    // windows are borderless, so this is the only style bit either needs. The
-    // dictation pill still briefly takes *key* focus on click, so the dictation
-    // flow re-activates the user's previous app before pasting (see
-    // `start_dictation_session` / inject).
+    // windows are borderless, so this is the only style bit either needs.
     const NS_NONACTIVATING_PANEL: i32 = 1 << 7;
     panel.set_style_mask(NS_NONACTIVATING_PANEL);
+
+    // ...and a click must not take *key* focus either, which is a separate
+    // thing and was the cause of a much worse bug than it sounds.
+    deny_key_window_to_panels();
+    //
+    // Clicking the pill's mic button routes through Scribe's own WKWebView and
+    // made this panel key, blurring whatever the user was typing in. AppKit
+    // apps survive that: TextEdit restores its first responder when its window
+    // gets key back. Chromium web content does not - the DOM focus is simply
+    // gone - so an Electron composer came back with *nothing* focused, and
+    // dictation had nowhere to insert and nothing to paste into. Measured
+    // 2026-08-28 by sampling Claude's focused element every 50ms across a real
+    // dictation: `AXTextArea` before the click, no focused element at all for
+    // the entire 13.7s the pill was non-idle, `AXTextArea` again once it went
+    // back to idle. Same dictation via the hotkey - which never touches
+    // Scribe's windows - pasted perfectly.
+    //
+    // `becomesKeyOnlyIfNeeded` says: only take key focus if a control actually
+    // needs it, i.e. a text field. Neither of these windows has one - the pill
+    // is a button and the recovery widget is two - so neither ever needs key,
+    // and the click can fire without costing the user their focus. Mouse
+    // events do not require key status, so the buttons keep working.
+    panel.set_becomes_key_only_if_needed(true);
 
     // Keep the window visible across spaces and alongside other apps' full-screen
     // windows, matching its always-on-top intent.
@@ -1841,6 +1861,65 @@ fn make_window_non_activating(app: &AppHandle, label: &str) {
         NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
     );
+}
+
+/// Stops Scribe's floating panels from ever taking keyboard focus.
+///
+/// `tauri-nspanel` converts these windows to its own `RawNSPanel` class, which
+/// hardcodes `canBecomeKeyWindow` to YES ("to ensure that RawNSPanel can become
+/// a key window"). That overrides the `.focusable(false)` the windows are built
+/// with, and it is not configurable - `set_becomes_key_only_if_needed` cannot
+/// undo it either, because a WKWebView counts as a control that needs key.
+///
+/// The consequence was not subtle. Clicking the pill's mic button made the pill
+/// the key window, so the keyboard belonged to Scribe for the whole dictation:
+/// an Electron composer lost its focus and never got it back in time, dictated
+/// text had nowhere to land, and - the observation that finally explained it -
+/// the user could not TYPE into their own app either while the pill was up.
+/// Native apps hid the problem by restoring their first responder afterwards.
+///
+/// Mouse events do not require key status and `accept_first_mouse` is already
+/// set, so the mic button and the recovery widget's buttons keep working; they
+/// simply no longer cost the user their keyboard. Replacing the method on the
+/// shared class covers every panel Scribe creates, which is what we want -
+/// none of them has a text field, so none of them has any business being key.
+#[cfg(target_os = "macos")]
+fn deny_key_window_to_panels() {
+    use objc2::runtime::{AnyClass, Bool, Sel};
+    use objc2::sel;
+
+    extern "C" fn never_becomes_key(_: *mut objc2::runtime::AnyObject, _: Sel) -> Bool {
+        Bool::NO
+    }
+
+    let Some(class) = AnyClass::get(c"RawNSPanel") else {
+        debug_log("panel: RawNSPanel class not found; cannot deny key window");
+        return;
+    };
+    // SAFETY: replacing one method on a class we know the signature of
+    // (`- (BOOL)canBecomeKeyWindow`), with a function of exactly that shape.
+    let replaced = unsafe {
+        class_replaceMethod(
+            class as *const AnyClass,
+            sel!(canBecomeKeyWindow),
+            never_becomes_key as *const std::ffi::c_void,
+            c"c@:".as_ptr(),
+        )
+    };
+    debug_log(&format!(
+        "panel: canBecomeKeyWindow overridden to NO (previous impl {})",
+        if replaced.is_null() { "none" } else { "replaced" }
+    ));
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn class_replaceMethod(
+        class: *const objc2::runtime::AnyClass,
+        name: objc2::runtime::Sel,
+        imp: *const std::ffi::c_void,
+        types: *const std::ffi::c_char,
+    ) -> *const std::ffi::c_void;
 }
 
 /// Handles one line of output from the meeting-detector sidecar: advances the
@@ -2069,6 +2148,28 @@ fn start_dictation_session(app: &AppHandle) {
             #[cfg(target_os = "macos")]
             if let Ok(mut target) = state.dictation_target_app.lock() {
                 *target = dictation_target_app(app);
+                // Hand key focus straight back to the app being dictated into.
+                //
+                // Starting from the pill routes the click through Scribe's own
+                // WKWebView, which takes key focus, and AppKit gives it to the
+                // panel whatever we ask for - `becomesKeyOnlyIfNeeded` does not
+                // help, because a web view counts as a control that needs key.
+                // Native apps shrug that off (TextEdit restores its first
+                // responder), but Chromium web content drops DOM focus and only
+                // restores it when its window is key again. Holding key for the
+                // whole dictation therefore meant an Electron composer had
+                // nothing focused by the time the text was ready, and both
+                // insertion and paste had nowhere to go.
+                //
+                // Measured 2026-08-28, sampling Claude's focused element every
+                // 50ms: `AXTextArea` before the click, nothing at all for the
+                // 13.7s the pill was non-idle, and `AXTextArea` again the
+                // moment it went back to idle and gave key up. So the focus
+                // does come back on its own - just far too late. Giving it back
+                // now, rather than at the end, is the whole fix.
+                if let Some(pid) = *target {
+                    dictation::reactivate(pid);
+                }
             }
             eprintln!("dictation: listening…");
             set_recording_indicator(app, true);

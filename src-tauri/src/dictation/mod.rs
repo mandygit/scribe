@@ -21,7 +21,7 @@ pub use capture::{
 };
 pub use hotkey::{DictationHotkey, HotkeyAction};
 pub use inject::{
-    capture_frontmost_app, copy_to_clipboard, inject_text, probe_accessibility,
+    capture_frontmost_app, copy_to_clipboard, inject_text, probe_accessibility, reactivate,
     spawn_frontmost_app_tracker, InjectOutcome, TargetAppPid,
 };
 pub use selection::{polish_selection, SelectionPolishOutcome};
