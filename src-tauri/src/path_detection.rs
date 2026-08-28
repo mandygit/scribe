@@ -1,8 +1,9 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
     sync::OnceLock,
+    time::{Duration, Instant},
 };
 
 use crate::domain::ScribeSettings;
@@ -159,11 +160,14 @@ fn detect_model_path(kind: ModelKind) -> Option<String> {
 /// location, including Photos and Music libraries, which is why macOS was
 /// prompting for those permissions despite Scribe never touching them.
 fn search_roots() -> Vec<PathBuf> {
+    let home = env::var_os("HOME").map(PathBuf::from);
     let mut roots = Vec::new();
     if let Ok(current_dir) = env::current_dir() {
-        roots.push(current_dir);
+        if is_searchable_root(&current_dir, home.as_deref()) {
+            roots.push(current_dir);
+        }
     }
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = home {
         for suffix in ["models", "Downloads", "Documents", "Desktop", ".cache"] {
             let root = home.join(suffix);
             if root.is_dir() {
@@ -172,6 +176,64 @@ fn search_roots() -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+/// Whether `root` is narrow enough to search. Anything at or above the user's
+/// home is not.
+///
+/// The working directory is in the list so a model sitting next to the project
+/// can be found during development. That is harmless from a project directory
+/// and catastrophic from `/`: an app launched from Finder inherits `/` as its
+/// working directory, so the "scoped" search became `mdfind -onlyin /`, the
+/// very whole-disk query this scoping exists to prevent, and the fallback walk
+/// recursed five levels from the filesystem root. Observed 2026-08-28: a
+/// freshly installed build hung in `tauri::setup` on the main thread, before
+/// any window existed, with `mdfind -onlyin /` running for minutes. It only
+/// ever looked fine in development, where the working directory is the repo.
+fn is_searchable_root(root: &Path, home: Option<&Path>) -> bool {
+    if root.parent().is_none() {
+        return false;
+    }
+    // `/Users`, and anything else the home directory sits under, are as bad as
+    // `/` for this purpose.
+    match home {
+        Some(home) => !home.starts_with(root) || home == root,
+        None => true,
+    }
+}
+
+/// How long Spotlight gets to answer before its results are done without.
+///
+/// This runs inside `tauri::setup` on the main thread, so an unbounded wait is
+/// a hung app with no window and no way to quit it from the UI - which is
+/// exactly what an unscoped query produced. Detection is a convenience: a
+/// missing answer costs the user a manual path in Settings, where hanging
+/// costs them the app.
+const SPOTLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `command` to completion, killing it if it outlives `timeout`.
+/// `None` if it could not be started, was killed, or its output was unreadable.
+fn run_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn spotlight_search(query: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -185,7 +247,7 @@ fn spotlight_search(query: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
     }
     command.arg(query);
 
-    let Ok(output) = command.output() else {
+    let Some(output) = run_with_timeout(command, SPOTLIGHT_TIMEOUT) else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -364,6 +426,63 @@ fn score_speaker_segmentation_model(file_name: &str) -> i32 {
 
 fn is_file(path: &Path) -> bool {
     path.exists() && path.is_file()
+}
+
+#[cfg(test)]
+mod root_scope_tests {
+    use super::{is_searchable_root, run_with_timeout};
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_filesystem_root_is_never_searched() {
+        // The bug: an app launched from Finder inherits `/` as its working
+        // directory, so this list turned `mdfind -onlyin <scope>` into a
+        // whole-disk query and pointed a 5-deep directory walk at `/`. Startup
+        // hung on the main thread inside tauri::setup, with no window yet and
+        // no way to quit from the UI.
+        let home = Path::new("/Users/someone");
+        assert!(!is_searchable_root(Path::new("/"), Some(home)));
+    }
+
+    #[test]
+    fn directories_above_home_are_never_searched() {
+        // `/Users` is as bad as `/` here - every account on the machine, five
+        // levels deep, and someone else's home is not ours to walk.
+        let home = Path::new("/Users/someone");
+        assert!(!is_searchable_root(Path::new("/Users"), Some(home)));
+    }
+
+    #[test]
+    fn ordinary_directories_are_searched() {
+        let home = Path::new("/Users/someone");
+        assert!(is_searchable_root(Path::new("/Users/someone/models"), Some(home)));
+        assert!(is_searchable_root(Path::new("/Users/someone"), Some(home)));
+        assert!(is_searchable_root(Path::new("/opt/models"), Some(home)));
+    }
+
+    #[test]
+    fn a_command_that_never_finishes_is_killed() {
+        // Detection runs on the main thread during setup, so "wait forever" is
+        // a hung app. Better to lose the answer than the window.
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let started = Instant::now();
+        assert!(run_with_timeout(command, Duration::from_millis(300)).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "run_with_timeout must not outlive its deadline"
+        );
+    }
+
+    #[test]
+    fn a_command_that_finishes_returns_its_output() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("hello");
+        let output = run_with_timeout(command, Duration::from_secs(5)).expect("echo completes");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+    }
 }
 
 #[cfg(test)]

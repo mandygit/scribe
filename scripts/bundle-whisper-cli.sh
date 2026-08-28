@@ -22,7 +22,13 @@
 # Homebrew libexec path, so keeping everything in one flat folder is enough.
 set -euo pipefail
 
-EXPECTED_WHISPER_VERSION="1.8.4"
+# Bumped 1.8.4 -> 1.9.2 on 2026-08-28 after re-verifying transcription against
+# the installed keg, which is what this pin asks for before it moves: both
+# invocations Scribe actually makes (plain `-mc 0`, and the vocabulary path with
+# `-mc N --prompt ... --carry-initial-prompt`) were run end to end with `-ojf`,
+# and the JSON still parses as `read_whisper_json_file` expects - a top-level
+# `transcription` array whose segments carry `text` and `offsets.from`/`.to`.
+EXPECTED_WHISPER_VERSION="1.9.2"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${REPO_ROOT}/src-tauri/resources/whisper"
 

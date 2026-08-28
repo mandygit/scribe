@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './styles.css';
 import {
   DICTATION_HOTKEYS,
@@ -43,6 +43,7 @@ import {
   startRecording,
   stopRecording,
   summarizeMeeting,
+  type TranscriptSegment,
   transcribeMeeting,
   updateAudioProcessingSettings,
   updateDictationSettings,
@@ -1229,13 +1230,7 @@ function MeetingDetailView({
           ) : (
             <div className="transcript">
               {transcriptSegments.map((segment) => (
-                <div className="segment" key={segment.sequenceNumber}>
-                  <p className="speaker">
-                    {segment.speakerLabel ?? 'Speaker'}
-                    <span className="ts">{formatClock(Math.round(segment.startedAtMs / 1000))}</span>
-                  </p>
-                  <p className="text">{segment.text}</p>
-                </div>
+                <TranscriptRow key={segment.sequenceNumber} segment={segment} />
               ))}
             </div>
           )}
@@ -1249,6 +1244,29 @@ function MeetingDetailView({
     </div>
   );
 }
+
+/**
+ * One transcript line, memoised.
+ *
+ * A long meeting is up to `HISTORY_DETAIL_TRANSCRIPT_LIMIT` (5,000) of these,
+ * and they live inside a component that also holds the tab, the copy state and
+ * the title draft. Without this, typing one character into the title field
+ * re-reconciles every row in the meeting.
+ *
+ * Segments are immutable once loaded, so the default shallow prop comparison is
+ * exactly right: a row only re-renders if its own segment object changes.
+ */
+const TranscriptRow = memo(function TranscriptRow({ segment }: { segment: TranscriptSegment }) {
+  return (
+    <div className="segment">
+      <p className="speaker">
+        {segment.speakerLabel ?? 'Speaker'}
+        <span className="ts">{formatClock(Math.round(segment.startedAtMs / 1000))}</span>
+      </p>
+      <p className="text">{segment.text}</p>
+    </div>
+  );
+});
 
 function SummaryView({ summary, modelName }: { summary: MeetingSummary; modelName: string }) {
   return (

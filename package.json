@@ -1,6 +1,6 @@
 {
   "name": "scribe",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,8 +9,8 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "package:prepare": "./scripts/bundle-whisper-cli.sh && ./scripts/fetch-whisper-model.sh && ./scripts/bundle-speexdsp.sh",
-    "package:mac": "bun run package:prepare && tauri build --bundles app",
-    "package:mac:dmg": "bun run package:prepare && tauri build --bundles dmg",
+    "package:mac": "bun run package:prepare && ./scripts/tauri-build-retry.sh --bundles app",
+    "package:mac:dmg": "bun run package:prepare && ./scripts/tauri-build-retry.sh --bundles dmg",
     "test:frontend": "bun test tests/frontend",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri"

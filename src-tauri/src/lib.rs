@@ -1067,6 +1067,20 @@ enum PasteFailureReason {
     /// The target app had no editable focus - the user's cursor wasn't in a
     /// text field. Nothing was written to the clipboard.
     NoTarget,
+    /// The app the user dictated into never came back to the front, so nothing
+    /// was sent anywhere. Distinct from `NoTarget` because the user's cursor
+    /// may well have been in a text field - Scribe just could not get back to
+    /// it, and saying "nothing to paste into" would be a lie about their app.
+    /// Nothing was written to the clipboard.
+    TargetNotFrontmost,
+    /// macOS secure input was active, so no keystroke could be delivered.
+    /// Distinct from `KeystrokeFailed` because nothing failed - the paste was
+    /// never attempted, and the fix is the user's (leave the password field),
+    /// not a permission to re-grant. Nothing was written to the clipboard.
+    SecureInputActive,
+    /// The paste keystroke was delivered and the app inserted nothing. The
+    /// transcript is on the clipboard, deliberately left there.
+    PasteDidNotLand,
     /// The paste keystroke itself failed. The transcript is on the clipboard.
     KeystrokeFailed,
     /// macOS refused the paste keystroke because Scribe does not currently
@@ -1375,12 +1389,38 @@ fn set_positioned_panel_visible(
 /// sleep/wake) and unreproducible without a record of what was dispatched.
 #[cfg(target_os = "macos")]
 fn debug_log(message: &str) {
-    use std::io::Write;
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let dir = std::path::Path::new(&home).join("Library/Logs/Scribe");
-    let _ = std::fs::create_dir_all(&dir);
+    append_debug_log_line(&std::path::Path::new(&home).join("Library/Logs/Scribe"), message);
+}
+
+/// Serialises debug-log writes across threads. See [`append_debug_log_line`].
+static DEBUG_LOG_WRITE: Mutex<()> = Mutex::new(());
+
+/// Appends one timestamped line to `dir/app-debug.log`.
+///
+/// Two things here are load-bearing, and neither was true before.
+///
+/// The line is built in full - timestamp, message and newline - and written
+/// with a single `write_all`. `writeln!` issues a write per format fragment,
+/// and on an `O_APPEND` file only the individual write is atomic, so
+/// concurrent threads produced lines with two timestamps run together and the
+/// next line missing its own. That is not cosmetic: this log is the primary
+/// diagnostic for paste failures, and on 2026-08-28 a corrupted line caused a
+/// stale "accessibility=granted" to be read as the current verdict.
+///
+/// The write is also serialised, and the timestamp is taken while the lock is
+/// held, so lines cannot arrive out of order relative to their own timestamps.
+/// A poisoned lock is recovered from rather than propagated: the guard protects
+/// no invariant beyond "one writer at a time", and a panicking thread elsewhere
+/// must not silently turn logging off for the rest of the process.
+fn append_debug_log_line(dir: &std::path::Path, message: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(dir);
+    let guard = DEBUG_LOG_WRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1390,8 +1430,9 @@ fn debug_log(message: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let _ = writeln!(file, "{timestamp} {message}");
+        let _ = file.write_all(format!("{timestamp} {message}\n").as_bytes());
     }
+    drop(guard);
 }
 
 /// Shows or hides the "Record this meeting?" popup.
@@ -1472,6 +1513,38 @@ const PILL_BOTTOM_MARGIN: f64 = 8.0;
 /// the key window (mouseenter simply never fires there).
 #[cfg(desktop)]
 static PILL_RECT: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+
+/// The monitor the cursor is currently on, which is the one the user is
+/// working on and therefore the only place these floating windows are any use.
+///
+/// Anchoring to the primary monitor instead put the paste-failure recovery
+/// widget on a different screen from the app the dictation was aimed at - and
+/// a recovery affordance nobody is looking at is the same as none at all,
+/// since the transcript it holds is otherwise only reachable from the app's
+/// Dictation tab. Multiple displays are also where the activation races these
+/// windows report on are worst, so it is the case that needs it most.
+///
+/// Work areas are compared in logical points, the space `macos_cursor` reports
+/// in and `position_window` computes frames in. `None` when the cursor cannot
+/// be read or sits outside every work area (the menu bar, say), leaving the
+/// caller its primary-monitor fallback.
+#[cfg(desktop)]
+fn monitor_under_cursor(window: &tauri::WebviewWindow) -> Option<tauri::Monitor> {
+    #[cfg(target_os = "macos")]
+    let (cursor_x, cursor_y) = macos_cursor::location()?;
+    #[cfg(not(target_os = "macos"))]
+    return None;
+    #[cfg(target_os = "macos")]
+    window.available_monitors().ok()?.into_iter().find(|monitor| {
+        let scale = monitor.scale_factor();
+        let area = monitor.work_area();
+        let x = area.position.x as f64 / scale;
+        let y = area.position.y as f64 / scale;
+        let width = area.size.width as f64 / scale;
+        let height = area.size.height as f64 / scale;
+        cursor_x >= x && cursor_x < x + width && cursor_y >= y && cursor_y < y + height
+    })
+}
 
 /// Records the pill frame most recently applied by `position_window`.
 #[cfg(desktop)]
@@ -1721,9 +1794,8 @@ fn position_window(
     window_height: f64,
     margin: f64,
 ) -> Option<(f64, f64)> {
-    let Ok(Some(monitor)) = window.primary_monitor() else {
-        return None;
-    };
+    let monitor = monitor_under_cursor(window)
+        .or_else(|| window.primary_monitor().ok().flatten())?;
     let scale = monitor.scale_factor();
     let work_area = monitor.work_area();
     let work_x = work_area.position.x as f64 / scale;
@@ -1783,12 +1855,32 @@ fn make_window_non_activating(app: &AppHandle, label: &str) {
 
     // NSWindowStyleMaskNonactivatingPanel — a click must not activate Scribe (the
     // app stays in the background; only its key window changes). Both floating
-    // windows are borderless, so this is the only style bit either needs. The
-    // dictation pill still briefly takes *key* focus on click, so the dictation
-    // flow re-activates the user's previous app before pasting (see
-    // `start_dictation_session` / inject).
+    // windows are borderless, so this is the only style bit either needs.
     const NS_NONACTIVATING_PANEL: i32 = 1 << 7;
     panel.set_style_mask(NS_NONACTIVATING_PANEL);
+
+    // ...and a click must not take *key* focus either, which is a separate
+    // thing and was the cause of a much worse bug than it sounds.
+    deny_key_window_to_panels();
+    //
+    // Clicking the pill's mic button routes through Scribe's own WKWebView and
+    // made this panel key, blurring whatever the user was typing in. AppKit
+    // apps survive that: TextEdit restores its first responder when its window
+    // gets key back. Chromium web content does not - the DOM focus is simply
+    // gone - so an Electron composer came back with *nothing* focused, and
+    // dictation had nowhere to insert and nothing to paste into. Measured
+    // 2026-08-28 by sampling Claude's focused element every 50ms across a real
+    // dictation: `AXTextArea` before the click, no focused element at all for
+    // the entire 13.7s the pill was non-idle, `AXTextArea` again once it went
+    // back to idle. Same dictation via the hotkey - which never touches
+    // Scribe's windows - pasted perfectly.
+    //
+    // `becomesKeyOnlyIfNeeded` says: only take key focus if a control actually
+    // needs it, i.e. a text field. Neither of these windows has one - the pill
+    // is a button and the recovery widget is two - so neither ever needs key,
+    // and the click can fire without costing the user their focus. Mouse
+    // events do not require key status, so the buttons keep working.
+    panel.set_becomes_key_only_if_needed(true);
 
     // Keep the window visible across spaces and alongside other apps' full-screen
     // windows, matching its always-on-top intent.
@@ -1796,6 +1888,65 @@ fn make_window_non_activating(app: &AppHandle, label: &str) {
         NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
     );
+}
+
+/// Stops Scribe's floating panels from ever taking keyboard focus.
+///
+/// `tauri-nspanel` converts these windows to its own `RawNSPanel` class, which
+/// hardcodes `canBecomeKeyWindow` to YES ("to ensure that RawNSPanel can become
+/// a key window"). That overrides the `.focusable(false)` the windows are built
+/// with, and it is not configurable - `set_becomes_key_only_if_needed` cannot
+/// undo it either, because a WKWebView counts as a control that needs key.
+///
+/// The consequence was not subtle. Clicking the pill's mic button made the pill
+/// the key window, so the keyboard belonged to Scribe for the whole dictation:
+/// an Electron composer lost its focus and never got it back in time, dictated
+/// text had nowhere to land, and - the observation that finally explained it -
+/// the user could not TYPE into their own app either while the pill was up.
+/// Native apps hid the problem by restoring their first responder afterwards.
+///
+/// Mouse events do not require key status and `accept_first_mouse` is already
+/// set, so the mic button and the recovery widget's buttons keep working; they
+/// simply no longer cost the user their keyboard. Replacing the method on the
+/// shared class covers every panel Scribe creates, which is what we want -
+/// none of them has a text field, so none of them has any business being key.
+#[cfg(target_os = "macos")]
+fn deny_key_window_to_panels() {
+    use objc2::runtime::{AnyClass, Bool, Sel};
+    use objc2::sel;
+
+    extern "C" fn never_becomes_key(_: *mut objc2::runtime::AnyObject, _: Sel) -> Bool {
+        Bool::NO
+    }
+
+    let Some(class) = AnyClass::get(c"RawNSPanel") else {
+        debug_log("panel: RawNSPanel class not found; cannot deny key window");
+        return;
+    };
+    // SAFETY: replacing one method on a class we know the signature of
+    // (`- (BOOL)canBecomeKeyWindow`), with a function of exactly that shape.
+    let replaced = unsafe {
+        class_replaceMethod(
+            class as *const AnyClass,
+            sel!(canBecomeKeyWindow),
+            never_becomes_key as *const std::ffi::c_void,
+            c"c@:".as_ptr(),
+        )
+    };
+    debug_log(&format!(
+        "panel: canBecomeKeyWindow overridden to NO (previous impl {})",
+        if replaced.is_null() { "none" } else { "replaced" }
+    ));
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn class_replaceMethod(
+        class: *const objc2::runtime::AnyClass,
+        name: objc2::runtime::Sel,
+        imp: *const std::ffi::c_void,
+        types: *const std::ffi::c_char,
+    ) -> *const std::ffi::c_void;
 }
 
 /// Handles one line of output from the meeting-detector sidecar: advances the
@@ -2023,7 +2174,29 @@ fn start_dictation_session(app: &AppHandle) {
             // capturing it any later would risk recording the wrong app.
             #[cfg(target_os = "macos")]
             if let Ok(mut target) = state.dictation_target_app.lock() {
-                *target = dictation::capture_frontmost_app();
+                *target = dictation_target_app(app);
+                // Hand key focus straight back to the app being dictated into.
+                //
+                // Starting from the pill routes the click through Scribe's own
+                // WKWebView, which takes key focus, and AppKit gives it to the
+                // panel whatever we ask for - `becomesKeyOnlyIfNeeded` does not
+                // help, because a web view counts as a control that needs key.
+                // Native apps shrug that off (TextEdit restores its first
+                // responder), but Chromium web content drops DOM focus and only
+                // restores it when its window is key again. Holding key for the
+                // whole dictation therefore meant an Electron composer had
+                // nothing focused by the time the text was ready, and both
+                // insertion and paste had nowhere to go.
+                //
+                // Measured 2026-08-28, sampling Claude's focused element every
+                // 50ms: `AXTextArea` before the click, nothing at all for the
+                // 13.7s the pill was non-idle, and `AXTextArea` again the
+                // moment it went back to idle and gave key up. So the focus
+                // does come back on its own - just far too late. Giving it back
+                // now, rather than at the end, is the whole fix.
+                if let Some(pid) = *target {
+                    dictation::reactivate(pid);
+                }
             }
             eprintln!("dictation: listening…");
             set_recording_indicator(app, true);
@@ -2039,6 +2212,34 @@ fn start_dictation_session(app: &AppHandle) {
             emit_dictation_state(app, "idle");
         }
     }
+}
+
+/// Which app this dictation should be pasted into.
+///
+/// Normally the app the user was last in, tracked continuously because a
+/// point-in-time reading is wrong for the pill (see `capture_frontmost_app`).
+/// The exception is Scribe itself: dictating with the notes editor focused used
+/// to reactivate whatever external app the user last touched, drag it forward -
+/// across a Space, if that is where it lives - and type into it, so Scribe was
+/// the one app in the system that could not be dictated into, and an unrelated
+/// app silently received the text.
+///
+/// Keyed on Scribe's *main window* holding key focus rather than on Scribe
+/// being frontmost. Those differ exactly where it matters: clicking the pill
+/// routes through Scribe's own WKWebView and can briefly make Scribe frontmost
+/// without its main window ever becoming key, which is the whole reason the
+/// external tracker exists (confirmed live 2026-08-06). A background app has no
+/// key window at all, so this is false whenever the user is in another app.
+#[cfg(target_os = "macos")]
+fn dictation_target_app(app: &AppHandle) -> Option<dictation::TargetAppPid> {
+    let in_scribes_own_window = app
+        .get_webview_window(MAIN_WINDOW)
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false);
+    if in_scribes_own_window {
+        return Some(std::process::id() as dictation::TargetAppPid);
+    }
+    dictation::capture_frontmost_app()
 }
 
 /// Stops the in-flight dictation and runs transcribe → optional polish → inject
@@ -2109,6 +2310,48 @@ fn stop_and_process_dictation(app: &AppHandle) {
         match outcome {
             Ok((text, _)) if text.trim().is_empty() => {
                 eprintln!("dictation: no speech detected, nothing inserted");
+            }
+            Ok((text, dictation::InjectOutcome::PasteDidNotLand)) => {
+                // The app took the keystroke and did nothing with it. Not an
+                // error anywhere in the stack, which is exactly why this went
+                // unnoticed before. Log only the length, never the text.
+                eprintln!(
+                    "dictation: paste did not land, {} characters left on the clipboard",
+                    text.chars().count()
+                );
+                debug_log(&format!(
+                    "dictation: paste did not land, {} characters left on the clipboard",
+                    text.chars().count()
+                ));
+                emit_dictation_paste_failed(&app, PasteFailureReason::PasteDidNotLand);
+            }
+            Ok((text, dictation::InjectOutcome::SecureInputActive)) => {
+                // Not an error either: macOS was refusing synthesised
+                // keystrokes, so the paste was withheld rather than fired into
+                // a window server that would drop it. Log only the length.
+                eprintln!(
+                    "dictation: secure input active, held {} characters for recovery",
+                    text.chars().count()
+                );
+                debug_log(&format!(
+                    "dictation: secure input active, held {} characters for recovery",
+                    text.chars().count()
+                ));
+                emit_dictation_paste_failed(&app, PasteFailureReason::SecureInputActive);
+            }
+            Ok((text, dictation::InjectOutcome::TargetNotFrontmost)) => {
+                // Also not an error: the transcription worked and the paste was
+                // deliberately withheld rather than fired at whichever app
+                // happened to be in front. Log only the length, never the text.
+                eprintln!(
+                    "dictation: target app never came forward, held {} characters for recovery",
+                    text.chars().count()
+                );
+                debug_log(&format!(
+                    "dictation: target app never came forward, held {} characters for recovery",
+                    text.chars().count()
+                ));
+                emit_dictation_paste_failed(&app, PasteFailureReason::TargetNotFrontmost);
             }
             Ok((text, dictation::InjectOutcome::NoPasteTarget)) => {
                 // Not an error: the transcription worked, there was just
@@ -3640,6 +3883,52 @@ fn map_lock_error<T>(error: std::sync::PoisonError<T>) -> AppError {
         code: "app_state_lock_failed".to_string(),
         message: "Could not acquire application state lock.".to_string(),
         details: Some(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod debug_log_tests {
+    use super::append_debug_log_line;
+
+    #[test]
+    fn concurrent_writes_never_interleave() {
+        // The bug this replaces: `writeln!` wrote each format fragment
+        // separately, so two threads logging at once produced a line with both
+        // timestamps run together and a following line with none. Every line
+        // must stand on its own - a log that cannot be read line by line is
+        // worse than no log, because it is read as though it can be.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                let path = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for line in 0..60 {
+                        append_debug_log_line(&path, &format!("thread={thread} line={line}"));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("logging thread");
+        }
+
+        let contents =
+            std::fs::read_to_string(dir.path().join("app-debug.log")).expect("log written");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 8 * 60, "every write must produce exactly one line");
+        for line in lines {
+            let (timestamp, rest) = line.split_once(' ').unwrap_or_else(|| {
+                panic!("line has no timestamp separator: {line:?}");
+            });
+            assert!(
+                timestamp.chars().all(|c| c.is_ascii_digit()) && !timestamp.is_empty(),
+                "line does not start with a single timestamp: {line:?}"
+            );
+            assert!(
+                rest.starts_with("thread=") && rest.matches("thread=").count() == 1,
+                "line carries more than one message: {line:?}"
+            );
+        }
     }
 }
 

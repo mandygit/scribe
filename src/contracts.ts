@@ -324,6 +324,9 @@ export interface LastDictationRecovery {
 /** Why a dictation's paste didn't land. See `listenToDictationPasteFailed`. */
 export type DictationPasteFailureReason =
   | 'no_target'
+  | 'target_not_frontmost'
+  | 'secure_input_active'
+  | 'paste_did_not_land'
   | 'keystroke_failed'
   | 'accessibility_denied';
 
