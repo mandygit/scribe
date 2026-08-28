@@ -1389,12 +1389,38 @@ fn set_positioned_panel_visible(
 /// sleep/wake) and unreproducible without a record of what was dispatched.
 #[cfg(target_os = "macos")]
 fn debug_log(message: &str) {
-    use std::io::Write;
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let dir = std::path::Path::new(&home).join("Library/Logs/Scribe");
-    let _ = std::fs::create_dir_all(&dir);
+    append_debug_log_line(&std::path::Path::new(&home).join("Library/Logs/Scribe"), message);
+}
+
+/// Serialises debug-log writes across threads. See [`append_debug_log_line`].
+static DEBUG_LOG_WRITE: Mutex<()> = Mutex::new(());
+
+/// Appends one timestamped line to `dir/app-debug.log`.
+///
+/// Two things here are load-bearing, and neither was true before.
+///
+/// The line is built in full - timestamp, message and newline - and written
+/// with a single `write_all`. `writeln!` issues a write per format fragment,
+/// and on an `O_APPEND` file only the individual write is atomic, so
+/// concurrent threads produced lines with two timestamps run together and the
+/// next line missing its own. That is not cosmetic: this log is the primary
+/// diagnostic for paste failures, and on 2026-08-28 a corrupted line caused a
+/// stale "accessibility=granted" to be read as the current verdict.
+///
+/// The write is also serialised, and the timestamp is taken while the lock is
+/// held, so lines cannot arrive out of order relative to their own timestamps.
+/// A poisoned lock is recovered from rather than propagated: the guard protects
+/// no invariant beyond "one writer at a time", and a panicking thread elsewhere
+/// must not silently turn logging off for the rest of the process.
+fn append_debug_log_line(dir: &std::path::Path, message: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(dir);
+    let guard = DEBUG_LOG_WRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1404,8 +1430,9 @@ fn debug_log(message: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let _ = writeln!(file, "{timestamp} {message}");
+        let _ = file.write_all(format!("{timestamp} {message}\n").as_bytes());
     }
+    drop(guard);
 }
 
 /// Shows or hides the "Record this meeting?" popup.
@@ -3856,6 +3883,52 @@ fn map_lock_error<T>(error: std::sync::PoisonError<T>) -> AppError {
         code: "app_state_lock_failed".to_string(),
         message: "Could not acquire application state lock.".to_string(),
         details: Some(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod debug_log_tests {
+    use super::append_debug_log_line;
+
+    #[test]
+    fn concurrent_writes_never_interleave() {
+        // The bug this replaces: `writeln!` wrote each format fragment
+        // separately, so two threads logging at once produced a line with both
+        // timestamps run together and a following line with none. Every line
+        // must stand on its own - a log that cannot be read line by line is
+        // worse than no log, because it is read as though it can be.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                let path = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for line in 0..60 {
+                        append_debug_log_line(&path, &format!("thread={thread} line={line}"));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("logging thread");
+        }
+
+        let contents =
+            std::fs::read_to_string(dir.path().join("app-debug.log")).expect("log written");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 8 * 60, "every write must produce exactly one line");
+        for line in lines {
+            let (timestamp, rest) = line.split_once(' ').unwrap_or_else(|| {
+                panic!("line has no timestamp separator: {line:?}");
+            });
+            assert!(
+                timestamp.chars().all(|c| c.is_ascii_digit()) && !timestamp.is_empty(),
+                "line does not start with a single timestamp: {line:?}"
+            );
+            assert!(
+                rest.starts_with("thread=") && rest.matches("thread=").count() == 1,
+                "line carries more than one message: {line:?}"
+            );
+        }
     }
 }
 
