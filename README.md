@@ -1,20 +1,24 @@
 # Scribe
 
-**Private, on-device meeting notes and dictation for macOS.**
+**Private, on-device dictation and meeting notes for macOS. No subscription, no cloud.**
 
 ![Scribe in action: meeting summary, transcript, trends, and system-wide dictation](docs/demo.gif)
 
-Scribe is a Tauri desktop app that records meetings locally, transcribes them with
-`whisper.cpp`, and writes concise notes (executive summary, decisions, open
-questions, action items) with a local LLM — nothing leaves your Mac. It also
-ships a system-wide dictation mode: double-press the 🌐 (Fn) key, speak, and the transcribed
-(optionally polished) text is pasted into whatever app you were typing into.
+**Speak anywhere.** Double-press the 🌐 (Fn) key, talk, and the transcribed
+text is pasted straight into whatever app you were typing into, optionally
+cleaned up by Apple Intelligence first. It is a free, local alternative to
+[Wispr Flow](https://wisprflow.ai) and [superwhisper](https://superwhisper.com):
+the same hotkey-and-floating-pill workflow, except transcription and polish run
+entirely on your Mac. No account, no subscription, no audio leaving the machine.
 
-The dictation mode makes Scribe a private, local alternative to
-[Wispr Flow](https://wisprflow.ai): the same speak-anywhere workflow (hotkey,
-floating pill, AI-polished text injected into the focused app), but
-transcription and polish run entirely on-device — no subscription, no audio
-leaving your machine.
+**And it sits in on your meetings.** Scribe records locally (your mic plus
+remote participants via ScreenCaptureKit), transcribes with `whisper.cpp`, and
+writes concise notes (executive summary, decisions, open questions, action
+items) using an LLM running on your own machine.
+
+Everything runs offline. `whisper.cpp` and a speech model ship inside the app,
+so transcription works the moment you install it; only meeting summaries need
+a local LLM server (LM Studio or Ollama) that you point Scribe at.
 
 ## What it does today
 
