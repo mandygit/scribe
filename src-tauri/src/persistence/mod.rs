@@ -1641,6 +1641,11 @@ fn run_migrations(connection: &Connection) -> Result<(), AppError> {
         "speaking_improvements_source",
         "TEXT NOT NULL DEFAULT 'none'",
     )?;
+    // Deliberately *not* `domain::DEFAULT_DICTATION_HOTKEY`. This default is
+    // what a row that predates dictation gets when the column is added, and
+    // those are existing installs; the Rust default governs new ones. Tying
+    // them together would silently move long-time users onto whatever the
+    // current default happens to be - which is now the Fn key.
     ensure_settings_column(
         connection,
         "dictation_hotkey",

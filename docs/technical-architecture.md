@@ -328,7 +328,9 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Hotkey["Global hotkey\n(tauri-plugin-global-shortcut,\ndouble-press to toggle)"] --> Capture["DictationRecorder\n(reuses cpal mic backend)"]
+    Chord["Modifier chord\n(tauri-plugin-global-shortcut)"] --> Press["DictationHotkey\n(double-press starts,\nsingle press stops)"]
+    FnTap["Fn/Globe key\n(listen-only CGEventTap,\ndictation/fn_tap)"] --> Press
+    Press --> Capture["DictationRecorder\n(reuses cpal mic backend)"]
     Capture --> Whisper2["whisper-cli\n(same transcriber as meetings)"]
     Whisper2 --> Polish{"Polish enabled?"}
     Polish -- yes --> PolishHelper["Swift sidecar: dictation-polish\n(Apple Intelligence / FoundationModels,\nmacOS 15+)"]
@@ -337,7 +339,7 @@ flowchart LR
     Raw --> Inject
     Esc["Escape\n(claimed only while in flight)"] -. cancels .-> Capture
     Esc -. discards .-> Inject
-    Pill["Floating pill (NSPanel)"] -. shows state .-> Hotkey
+    Pill["Floating pill (NSPanel)"] -. shows state .-> Press
 ```
 
 - **Capture reuses the same `cpal`-backed recorder** as meeting recording
@@ -349,7 +351,14 @@ flowchart LR
   paste) without needing per-app integration; the cost is a brief clipboard
   overwrite, which the injection code is careful to sequence correctly
   (write clipboard, then simulate paste, hiding the pill window first so
-  focus doesn't bounce to Scribe instead of the target app).
+  focus doesn't bounce to Scribe instead of the target app). `inject_text`
+  snapshots the clipboard and puts it back afterwards, so dictating never
+  costs the user what they had copied. Polish-selection has to snapshot
+  *earlier still*, before its own Cmd+C: by the time `inject_text` looks, the
+  clipboard already holds the raw selection, so restoring at that point would
+  put the selection back rather than the user's clipboard. The one deliberate
+  exception is a failed paste, where the polished text is left in place
+  because it is then the only copy of it anywhere.
 - **Apple Intelligence polish is optional and degrades silently.** The
   `dictation-polish` Swift sidecar uses `FoundationModels`, available macOS
   15+; on older macOS or when the on-device model isn't ready, it exits
@@ -369,6 +378,24 @@ flowchart LR
   incidental single press) — modeled on the Wispr Flow interaction pattern,
   since a single global hotkey with no visual "recording" affordance needs a
   very deliberate trigger gesture to avoid accidental activation.
+- **The Fn/Globe key needs a second, unrelated input mechanism.** macOS never
+  reports Fn as a key press: it appears only as a `flagsChanged` event
+  carrying keycode 63, and Carbon's `RegisterEventHotKey`, which backs
+  `tauri-plugin-global-shortcut`, fires on key *down*. No global-shortcut API
+  can express it, so `dictation/fn_tap` runs a `CGEventTap` of its own and
+  feeds the same `DictationHotkey` state machine. The tap is deliberately
+  **listen-only**: such a tap cannot alter or drop an event, so whatever the
+  Globe key already does on the user's Mac keeps working and no other app's
+  binding can break. The cost is that Scribe cannot suppress the system's own
+  Globe action either, so `globe_key_is_free` reads `AppleFnUsageType` and
+  Settings explains the conflict rather than rewriting a system preference.
+  Two smaller consequences fall out of the tap being an event tap: the
+  callback runs on the main thread with a deadline (the system disables a tap
+  whose callback overruns), so it only decides what the press *means* and
+  hands the work to the next run-loop turn; and nothing about a healthy tap
+  proves the key reaches it, since a remap or a non-Apple external keyboard
+  can swallow Fn below us, hence the self-test in Settings and its fallback
+  to a chord.
 - **Escape cancels, and is claimed only while a dictation is in flight.** A
   registered global shortcut is exclusive - for as long as Escape is
   registered, no other app on the system sees it - and Escape is far too
@@ -639,5 +666,7 @@ already pulls in — `tauri::async_runtime::spawn_blocking` is used directly.
 - `docs/decisions/adr-002-offline-aec-adapter.md` — why offline SpeexDSP AEC, dlopen'd rather than linked.
 - `docs/decisions/adr-003-summarizer-model-and-timeout.md` — the 26B-model timeout incident, and why the default model/timeout/`/no_think` are set the way they are.
 - `docs/decisions/adr-004-teams-meeting-detection.md` — why detection fires on a live call rather than the pre-join screen, and why it's window geometry, not Accessibility text-scraping.
+- `docs/decisions/adr-005-self-contained-bundle.md` - why the DMG ships whisper-cli, a model and SpeexDSP by relinking Homebrew kegs, and why detected paths are resolved on read rather than persisted.
+- `docs/decisions/adr-006-fn-key-dictation-hotkey.md` - why the Fn/Globe key needs its own event tap, why that tap is listen-only, and why Scribe reports the Globe-key conflict rather than rewriting the setting.
 - `docs/record-and-review-plan.md`, `docs/ideas/meeting-coach.md` — original product direction for the unshipped features in §12.
 - `docs/distributing.md` — the team-facing version of the ad-hoc-signing workaround.

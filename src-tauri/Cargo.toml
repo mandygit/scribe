@@ -1,6 +1,6 @@
 [package]
 name = "scribe"
-version = "0.5.0"
+version = "0.6.0"
 description = "Scribe desktop meeting coach scaffold"
 authors = ["Scribe"]
 edition = "2021"

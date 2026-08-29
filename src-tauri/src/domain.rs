@@ -206,8 +206,19 @@ pub struct ScribeSettings {
     pub prompt_on_teams_meeting: bool,
 }
 
-/// Default token for the dictation hotkey: double-press Control+Option+D.
-pub const DEFAULT_DICTATION_HOTKEY: &str = "ctrl+option+d";
+/// Token for the Fn/Globe key. Unlike every other hotkey token this one is not
+/// a modifier chord and can never be a global shortcut - macOS reports Fn only
+/// as a flag change, never as a key press - so it is served by an event tap
+/// instead. See `crate::dictation::fn_tap`.
+pub const FN_HOTKEY_TOKEN: &str = "fn";
+
+/// Default token for the dictation hotkey: double-press the Fn/Globe key.
+///
+/// This governs *new* installs only. An existing install keeps whatever it has
+/// already persisted, because `dictation_hotkey` is a stored column rather than
+/// a value defaulted on read - so changing this never moves anyone off the
+/// hotkey they are used to.
+pub const DEFAULT_DICTATION_HOTKEY: &str = FN_HOTKEY_TOKEN;
 
 /// Default token for the polish-selection hotkey: single-press Control+Option+P.
 pub const DEFAULT_POLISH_SELECTION_HOTKEY: &str = "ctrl+option+p";

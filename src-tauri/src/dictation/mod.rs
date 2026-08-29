@@ -10,6 +10,7 @@ use crate::domain::AppError;
 
 pub mod ax;
 pub mod capture;
+pub mod fn_tap;
 pub mod hotkey;
 pub mod inject;
 pub mod paste_target;
@@ -19,6 +20,7 @@ pub use capture::{
     new_dictation_session_id, new_dictation_wav_path, session_stats, transcribe_clip,
     DictationRecorder,
 };
+pub use fn_tap::FnKeyTap;
 pub use hotkey::{DictationHotkey, HotkeyAction};
 pub use inject::{
     capture_frontmost_app, copy_to_clipboard, inject_text, probe_accessibility, reactivate,

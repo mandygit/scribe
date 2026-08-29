@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { formatHotkey } from './format';
 import './pill.css';
 import {
   copyLastDictation,
@@ -58,34 +59,6 @@ const FOOTPRINT_RANK: Record<PillFootprint, number> = {
  * moves the bars, and the gain lifts normal speech towards full height.
  */
 const normalizeLevel = (level: number): number => Math.min(1, Math.sqrt(Math.max(0, level)) * 2.2);
-
-/** Renders "cmd+shift+d" as the macOS-style "⌘⇧D". */
-const formatHotkey = (hotkey: string): string =>
-  hotkey
-    .split('+')
-    .map((part) => {
-      const token = part.trim().toLowerCase();
-      switch (token) {
-        case 'cmd':
-        case 'command':
-        case 'super':
-        case 'meta':
-          return '⌘';
-        case 'shift':
-          return '⇧';
-        case 'option':
-        case 'alt':
-          return '⌥';
-        case 'ctrl':
-        case 'control':
-          return '⌃';
-        case 'space':
-          return 'Space';
-        default:
-          return token.toUpperCase();
-      }
-    })
-    .join('');
 
 /** Browser-only handle for exercising the pill's states without the native shell. */
 interface PillDevWindow {

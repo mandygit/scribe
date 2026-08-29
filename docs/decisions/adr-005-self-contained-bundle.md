@@ -23,7 +23,8 @@ dylib tree), the whisper model, and audio conversion (previously ffmpeg).
 ## Decision
 
 1. **whisper-cli**: `scripts/bundle-whisper-cli.sh` copies the pinned
-   Homebrew keg (whisper-cpp 1.8.4 plus its ggml libraries, the dlopen'd
+   Homebrew keg (whisper-cpp 1.8.4 when this was decided, plus its ggml
+   libraries, the dlopen'd
    Metal/BLAS/per-CPU-generation backends, and libomp) into
    `src-tauri/resources/whisper/` and rewrites every non-system load path to
    `@loader_path`, then re-signs each file ad hoc. ggml finds its backends by
@@ -62,15 +63,23 @@ dylib tree), the whisper model, and audio conversion (previously ffmpeg).
   *file*, not a directory, so it cannot replace the executable-directory
   search.
 
+## Updates
+
+- **2026-08-28**: pinned whisper-cpp bumped 1.8.4 -> 1.9.2 after re-verifying
+  transcription against it. The decision and mechanism are unchanged.
+
 ## Consequences
 
-- The DMG grows to roughly 230 MB but works on a fresh Mac with no Homebrew.
+- The DMG grows to roughly 180 MB but works on a fresh Mac with no Homebrew.
 - Verified by running the relocated `whisper-cli` under a `sandbox-exec`
   profile that denies reading `/opt/homebrew`: all backends load from the
   bundle and a real transcription succeeds.
-- The build machine must have `whisper-cpp` 1.8.4 installed via Homebrew;
-  the bundle script fails loudly on version drift so transcription flags
-  (`-mc` sizing, JSON output) stay verified against the shipped binary.
+- The build machine must have the pinned `whisper-cpp` installed via Homebrew.
+  The version lives in `EXPECTED_WHISPER_VERSION` in
+  `scripts/bundle-whisper-cli.sh`, which is the source of truth and fails
+  loudly on drift, so transcription flags (`-mc` sizing, JSON output) stay
+  verified against the shipped binary. Bumping it means re-verifying
+  transcription first, then updating that constant.
 - Recipients still install a local LLM server themselves for summaries
   (LM Studio/Ollama) - deliberately out of scope.
 - Builds remain ad-hoc signed until there's an Apple Developer ID, so

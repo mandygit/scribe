@@ -33,7 +33,7 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use scribe_lib::dictation::{inject_text, InjectOutcome};
+use scribe_lib::dictation::{inject_text, polish_selection, InjectOutcome, SelectionPolishOutcome};
 
 /// How long to let a freshly opened window take key focus inside an app that is
 /// already frontmost. Unlike activation, this is an intra-app handoff with
@@ -293,5 +293,47 @@ fn live_inject_leaves_the_clipboard_alone() {
     assert_eq!(
         clipboard_after, sentinel,
         "dictating must leave the user's clipboard exactly as it found it"
+    );
+}
+
+/// Polishing a selection must leave the clipboard exactly as it found it, the
+/// same guarantee `live_inject_leaves_the_clipboard_alone` makes for dictation.
+///
+/// This one is easy to get wrong in a way that looks right: `inject_text`
+/// already snapshots and restores, so the clipboard *is* restored - just to the
+/// raw selection that `copy_selection` put there moments earlier, rather than
+/// to whatever the user had copied. The assertion below is the difference.
+#[test]
+#[ignore = "requires Accessibility permission, Apple Intelligence, and drives TextEdit"]
+fn live_polish_selection_leaves_the_clipboard_alone() {
+    let sentinel = format!("clipboard-sentinel-{}", std::process::id());
+    let messy = "so um i think we should like maybe ship it on tuesday";
+    osascript(&format!("set the clipboard to \"{sentinel}\""));
+
+    activate_and_wait("TextEdit");
+    osascript("tell application \"TextEdit\" to make new document");
+    sleep(WINDOW_SETTLE);
+    osascript(&format!(
+        "tell application \"TextEdit\" to set text of front document to \"{messy}\""
+    ));
+    sleep(WINDOW_SETTLE);
+    osascript("tell application \"System Events\" to keystroke \"a\" using command down");
+    sleep(WINDOW_SETTLE);
+
+    let outcome = polish_selection().expect("polish_selection runs");
+
+    let contents = osascript("tell application \"TextEdit\" to get text of front document");
+    let clipboard_after = clipboard();
+    osascript("tell application \"TextEdit\" to close front document saving no");
+
+    assert_eq!(outcome, SelectionPolishOutcome::Applied);
+    assert_ne!(
+        contents.trim(),
+        messy,
+        "the selection should have been replaced with polished text"
+    );
+    assert_eq!(
+        clipboard_after, sentinel,
+        "polishing must leave the user's clipboard exactly as it found it"
     );
 }

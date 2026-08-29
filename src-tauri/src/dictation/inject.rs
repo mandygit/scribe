@@ -3,7 +3,7 @@
 //! Two mechanisms, tried in that order:
 //!
 //! 1. **Write it into the focused element via Accessibility** - see
-//!    [`insert_via_accessibility`]. The text goes straight where the caret is,
+//!    `insert_via_accessibility`. The text goes straight where the caret is,
 //!    the clipboard is never touched, and the app either accepts the write or
 //!    says why it did not.
 //! 2. **Clipboard and a synthesised Cmd+V**, restoring the clipboard's previous
@@ -129,7 +129,7 @@ fn frontmost_app_pid() -> Option<TargetAppPid> {
     )
 }
 
-/// Starts a background thread that keeps [`LAST_EXTERNAL_FRONTMOST`] fresh
+/// Starts a background thread that keeps `LAST_EXTERNAL_FRONTMOST` fresh
 /// for the lifetime of the app. Must be called once at startup.
 ///
 /// A point-in-time "what's frontmost right now" query, taken only when
@@ -198,7 +198,7 @@ pub fn capture_frontmost_app() -> Option<TargetAppPid> {
 /// deprecated to a no-op since macOS 14, so there is no way to force it. That
 /// is survivable: the path that needs the handoff is the one where the user
 /// clicked the pill, and Scribe *is* active then. What is not survivable is
-/// assuming it happened - see [`wait_until_frontmost`], and note that a
+/// assuming it happened - see `wait_until_frontmost`, and note that a
 /// backgrounded app describes neither a focused element nor a focused window,
 /// which reads exactly like having nothing to paste into (observed
 /// 2026-08-20: a dictation aimed at Claude's message box was refused with
@@ -260,7 +260,7 @@ const TARGET_ACTIVATION_POLL: Duration = Duration::from_millis(25);
 
 /// Every flavor of every item on the pasteboard, as raw bytes keyed by UTI.
 /// Full fidelity — screenshots, rich text, and multi-item copies all survive.
-type ClipboardSnapshot = Vec<Vec<(String, Vec<u8>)>>;
+pub(super) type ClipboardSnapshot = Vec<Vec<(String, Vec<u8>)>>;
 
 /// Injects `text` into `target` (the app that was frontmost when dictation
 /// started, from [`capture_frontmost_app`]). Blank text is a no-op so a
@@ -480,7 +480,7 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
 
 /// Reads every item and flavor off the general pasteboard. Lazily-promised
 /// flavors are materialised by `dataForType`; anything unreadable is skipped.
-fn snapshot_clipboard() -> ClipboardSnapshot {
+pub(super) fn snapshot_clipboard() -> ClipboardSnapshot {
     let pasteboard = NSPasteboard::generalPasteboard();
     let Some(items) = pasteboard.pasteboardItems() else {
         return Vec::new();
@@ -501,7 +501,7 @@ fn snapshot_clipboard() -> ClipboardSnapshot {
 
 /// Replaces the general pasteboard's contents with a previously captured
 /// snapshot. Returns whether the write was accepted.
-fn restore_clipboard(snapshot: &ClipboardSnapshot) -> bool {
+pub(super) fn restore_clipboard(snapshot: &ClipboardSnapshot) -> bool {
     let objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = snapshot
         .iter()
         .map(|flavors| {

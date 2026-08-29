@@ -18,3 +18,37 @@ export const formatClock = (seconds: number): string => {
 
 export const meetingTitle = (item: { title: string | null; startedAtMs: number }): string =>
   item.title?.trim() ? item.title : `Meeting · ${formatDate(item.startedAtMs)}`;
+
+/** Renders "cmd+shift+d" as the macOS-style "⌘⇧D", and "fn" as "Fn". */
+export const formatHotkey = (hotkey: string): string =>
+  hotkey
+    .split('+')
+    .map((part) => {
+      const token = part.trim().toLowerCase();
+      switch (token) {
+        case 'cmd':
+        case 'command':
+        case 'super':
+        case 'meta':
+          return '⌘';
+        case 'shift':
+          return '⇧';
+        case 'option':
+        case 'alt':
+          return '⌥';
+        case 'ctrl':
+        case 'control':
+          return '⌃';
+        case 'space':
+          return 'Space';
+        // The only token naming a whole key rather than a modifier. Spelled
+        // out rather than shown as 🌐, which renders as a full-colour emoji
+        // and breaks the monochrome run of ⌘⇧⌥ glyphs beside it. Settings
+        // still shows the globe, where picking the key is the point.
+        case 'fn':
+          return 'Fn';
+        default:
+          return token.toUpperCase();
+      }
+    })
+    .join('');

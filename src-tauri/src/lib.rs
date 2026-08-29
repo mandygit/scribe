@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Mutex,
     },
 };
@@ -15,10 +15,11 @@ use audio::{
     AudioDevice, CpalCaptureBackend, RecordingManager, RecordingMetadata, RecordingStarted,
     ScreenCaptureKitSystemAudioBackend,
 };
-use dictation::{DictationHotkey, DictationRecorder, HotkeyAction};
+use dictation::{DictationHotkey, DictationRecorder, FnKeyTap, HotkeyAction};
 use domain::{
     AnalyzerProvider, AppError, DictationSessionId, MeetingId, MeetingLifecycleState,
     ProcessingStage, ReportId, ScribeSettings, SummarizerProvider, ThemePreference,
+    FN_HOTKEY_TOKEN,
 };
 use meeting_detection::{advance, CallPromptState, DetectorEvent, PromptAction, TeamsCallDetector};
 use nudges::{
@@ -62,6 +63,13 @@ struct AppState {
     recordings: Mutex<RecordingManager<CpalCaptureBackend, ScreenCaptureKitSystemAudioBackend>>,
     dictation: Mutex<DictationRecorder<CpalCaptureBackend>>,
     dictation_hotkey: Mutex<DictationHotkey>,
+    /// The live Fn-key event tap, when `fn` is the chosen dictation hotkey.
+    /// `None` for every other hotkey, which are global shortcuts instead.
+    dictation_fn_tap: Mutex<Option<FnKeyTap>>,
+    /// Set while Settings is asking the user to prove Scribe can see their Fn
+    /// key. Taps are reported to the UI and go no further, so the test cannot
+    /// start a dictation the user did not ask for.
+    dictation_fn_self_test: AtomicBool,
     /// Counts consecutive polish-selection presses with nothing selected, so
     /// the notice can start friendly and get terser after a few repeats.
     polish_selection_notice_count: Mutex<u32>,
@@ -2109,7 +2117,9 @@ fn stop_meeting_detection(app: &AppHandle) {
 /// Maps a persisted hotkey token (dictation or polish-selection) to a
 /// registrable global shortcut. The set is deliberately small and vetted to
 /// avoid the bare F-keys (media keys on Mac laptops) and F5 (Apple Dictation).
-/// Returns None for an unknown token.
+/// Returns None for an unknown token - including `fn`, which is deliberately
+/// absent: no global shortcut can express it, so it is served by an event tap
+/// (see `register_dictation_hotkey`).
 #[cfg(desktop)]
 fn hotkey_shortcut_for(token: &str) -> Option<tauri_plugin_global_shortcut::Shortcut> {
     use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
@@ -2165,16 +2175,82 @@ where
         })
 }
 
+/// Whether a persisted token names a dictation hotkey Scribe can actually
+/// bind: one of the vetted chords, or the Fn key.
+#[cfg(desktop)]
+fn is_supported_dictation_hotkey(token: &str) -> bool {
+    token == FN_HOTKEY_TOKEN || hotkey_shortcut_for(token).is_some()
+}
+
 /// Registers (or re-registers) the dictation hotkey.
+///
+/// The hotkey comes from one of two unrelated sources: every chord token is a
+/// global shortcut, while `fn` is an event tap, because macOS reports the Fn
+/// key only as a flag change and no global-shortcut API can bind it. Switching
+/// between them has to tear the old source down, or both would keep firing.
 #[cfg(desktop)]
 fn register_dictation_hotkey(
     app: &AppHandle,
     previous_token: Option<&str>,
     token: &str,
 ) -> Result<(), AppError> {
+    if token == FN_HOTKEY_TOKEN {
+        if let Some(previous) = previous_token {
+            if previous != token {
+                if let Some(previous_shortcut) = hotkey_shortcut_for(previous) {
+                    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+                    let _ = app.global_shortcut().unregister(previous_shortcut);
+                }
+            }
+        }
+        return start_dictation_fn_tap(app);
+    }
+
+    stop_dictation_fn_tap(app);
     register_hotkey(app, previous_token, token, "dictation_hotkey", |app| {
         on_dictation_hotkey_press(app);
     })
+}
+
+/// Starts watching the Fn key, unless it is already being watched. Idempotent,
+/// so re-saving settings with `fn` still selected does not churn the tap.
+#[cfg(desktop)]
+fn start_dictation_fn_tap(app: &AppHandle) -> Result<(), AppError> {
+    let state = app.state::<AppState>();
+    let mut tap = state.dictation_fn_tap.lock().map_err(map_lock_error)?;
+    if tap.is_some() {
+        return Ok(());
+    }
+    let handle = app.clone();
+    *tap = Some(FnKeyTap::start(move || on_dictation_fn_tap(&handle))?);
+    debug_log("dictation: watching the Fn key");
+    Ok(())
+}
+
+/// Stops watching the Fn key, if it was.
+///
+/// The teardown is deliberately handed to the main thread: the tap's callback
+/// runs there, so freeing its state from any other thread could race a press
+/// already in flight. Best-effort - if the hop fails the app is shutting down,
+/// and the tap dies with the process anyway.
+#[cfg(desktop)]
+fn stop_dictation_fn_tap(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let taken = match state.dictation_fn_tap.lock() {
+        Ok(mut tap) => tap.take(),
+        Err(_) => {
+            eprintln!("dictation: fn tap lock poisoned");
+            return;
+        }
+    };
+    let Some(tap) = taken else {
+        return;
+    };
+    if app.run_on_main_thread(move || drop(tap)).is_err() {
+        eprintln!("dictation: could not release the fn key watcher");
+    } else {
+        debug_log("dictation: stopped watching the Fn key");
+    }
 }
 
 /// Registers the polish-selection hotkey: polishes whatever text is selected
@@ -2749,26 +2825,73 @@ fn copy_last_dictation(state: State<'_, AppState>) -> Result<bool, AppError> {
 /// Handles one dictation hotkey press: advances the Wispr-style press tracker and
 /// starts or stops dictation via the shared session helpers.
 fn on_dictation_hotkey_press(app: &AppHandle) {
+    let action = decide_dictation_hotkey_action(app);
+    apply_dictation_hotkey_action(app, action);
+}
+
+/// Advances the press tracker and reports what this press means. Cheap by
+/// design - a lock and some arithmetic - so it can run somewhere with a
+/// deadline, which is exactly what the Fn tap's callback is.
+fn decide_dictation_hotkey_action(app: &AppHandle) -> HotkeyAction {
     let state = app.state::<AppState>();
     let now_ms = match current_time_ms() {
         Ok(now) => now,
         Err(error) => {
             eprintln!("dictation hotkey: clock error: {}", error.message);
-            return;
+            return HotkeyAction::None;
         }
     };
     let action = match state.dictation_hotkey.lock() {
         Ok(mut tracker) => tracker.on_press(now_ms),
         Err(_) => {
             eprintln!("dictation hotkey: press tracker lock poisoned");
-            return;
+            HotkeyAction::None
         }
     };
+    action
+}
 
+/// Carries out what a press decided. Opens the microphone and reads the focused
+/// app's Accessibility tree, either of which can take a while, so this must not
+/// run anywhere that is on a clock.
+fn apply_dictation_hotkey_action(app: &AppHandle, action: HotkeyAction) {
     match action {
         HotkeyAction::None => {}
         HotkeyAction::StartRecording => start_dictation_session(app),
         HotkeyAction::StopRecording => stop_and_process_dictation(app),
+    }
+}
+
+/// Handles one bare tap of the Fn key.
+///
+/// The decision is made inline so presses keep their exact order and timing,
+/// but the work is handed to the next turn of the main run loop. This runs
+/// inside the event tap's own callback, and the system switches a tap off if
+/// its callback overruns - so doing the work here would cost the *next* press,
+/// most likely the one meant to stop the dictation this one just started.
+#[cfg(desktop)]
+fn on_dictation_fn_tap(app: &AppHandle) {
+    // A self-test consumes the tap rather than passing it on. Asking someone to
+    // press the key and then starting a recording they never asked for would be
+    // its own bug, and it would leave the press tracker half-armed besides.
+    if app
+        .state::<AppState>()
+        .dictation_fn_self_test
+        .load(Ordering::SeqCst)
+    {
+        let _ = app.emit(FN_KEY_TAPPED_EVENT, ());
+        return;
+    }
+    let action = decide_dictation_hotkey_action(app);
+    if action == HotkeyAction::None {
+        return;
+    }
+    let handle = app.clone();
+    if app
+        .run_on_main_thread(move || apply_dictation_hotkey_action(&handle, action))
+        .is_err()
+    {
+        eprintln!("dictation: could not dispatch the fn key press");
     }
 }
 
@@ -2833,7 +2956,7 @@ fn update_dictation_settings(
     dictation_polish_enabled: bool,
 ) -> Result<ScribeSettings, AppError> {
     #[cfg(desktop)]
-    if hotkey_shortcut_for(&dictation_hotkey).is_none() {
+    if !is_supported_dictation_hotkey(&dictation_hotkey) {
         return Err(AppError {
             code: "dictation_hotkey_unsupported".to_string(),
             message: format!("Unsupported dictation hotkey: {dictation_hotkey}"),
@@ -2964,9 +3087,61 @@ fn open_permission_settings(pane: String) -> Result<(), AppError> {
     permissions::open_system_settings_pane(&pane)
 }
 
+/// Whether the Globe/Fn key is free for dictation, or the system still acts on
+/// it too. Read live rather than cached: the whole point is that the user goes
+/// and changes it, comes back, and expects the warning to have cleared.
+#[cfg(desktop)]
+#[tauri::command]
+fn check_globe_key_free() -> bool {
+    dictation::fn_tap::globe_key_is_free()
+}
+
+/// Fires when a bare Fn tap arrives while a self-test is listening.
+#[cfg(desktop)]
+const FN_KEY_TAPPED_EVENT: &str = "scribe://fn-key-tapped";
+
+/// Whether Scribe currently has a live watcher on the Fn key.
+///
+/// False while any other hotkey is selected - and also when the tap was
+/// refused, which is the case worth surfacing: dictation is then silently
+/// unreachable by its own default hotkey.
+#[cfg(desktop)]
+#[tauri::command]
+fn fn_key_watcher_is_running(state: State<'_, AppState>) -> bool {
+    state
+        .dictation_fn_tap
+        .lock()
+        .map(|tap| tap.is_some())
+        .unwrap_or(false)
+}
+
+/// Starts or stops the Fn self-test.
+///
+/// Nothing about a working tap proves itself: a Karabiner remap or a non-Apple
+/// external keyboard can swallow Fn below us, so the tap comes up healthy and
+/// simply never hears anything. The only way to tell that apart from "the user
+/// has not tried yet" is to ask them to press it and watch.
+#[cfg(desktop)]
+#[tauri::command]
+fn set_fn_self_test(state: State<'_, AppState>, listening: bool) {
+    state
+        .dictation_fn_self_test
+        .store(listening, Ordering::SeqCst);
+}
+
 /// Longest accepted vocabulary text. Whisper truncates carried prompts to
 /// half its text context anyway, so anything longer would silently lose terms.
 const MAX_TRANSCRIBER_VOCABULARY_CHARS: usize = 600;
+
+/// Drops a path that only echoes what detection would find anyway, so the
+/// stored value means "the user chose this" rather than "this is where it
+/// happened to be the first time we looked".
+fn user_override_only(path: Option<String>, detected: Option<&str>) -> Option<String> {
+    match (path, detected) {
+        (Some(path), Some(detected)) if path == detected => None,
+        (path, _) => path,
+    }
+}
 
 #[tauri::command]
 fn update_transcriber_settings(
@@ -2991,14 +3166,31 @@ fn update_transcriber_settings(
             });
         }
     }
+    // Settings reach the UI hydrated with detected paths, and the UI posts back
+    // whatever is in its fields - so a path the user never chose arrives here
+    // looking exactly like one they did. Storing only genuine overrides keeps
+    // the column empty in that case, which is what lets bundled resources stay
+    // the default and lets a future upgrade change them.
+    let detected = path_detection::detect_local_paths();
     let repository = state.repository.lock().map_err(map_lock_error)?;
     let mut settings = repository.get_settings()?;
-    settings.transcriber_bin_path = normalize_optional_path(transcriber_bin_path);
-    settings.transcriber_model_path = normalize_optional_path(transcriber_model_path);
+    settings.transcriber_bin_path = user_override_only(
+        normalize_optional_path(transcriber_bin_path),
+        detected.transcriber_bin_path.as_deref(),
+    );
+    settings.transcriber_model_path = user_override_only(
+        normalize_optional_path(transcriber_model_path),
+        detected.transcriber_model_path.as_deref(),
+    );
     settings.transcriber_vocabulary = transcriber_vocabulary;
-    settings.speaker_embedding_model_path = normalize_optional_path(speaker_embedding_model_path);
-    settings.speaker_segmentation_model_path =
-        normalize_optional_path(speaker_segmentation_model_path);
+    settings.speaker_embedding_model_path = user_override_only(
+        normalize_optional_path(speaker_embedding_model_path),
+        detected.speaker_embedding_model_path.as_deref(),
+    );
+    settings.speaker_segmentation_model_path = user_override_only(
+        normalize_optional_path(speaker_segmentation_model_path),
+        detected.speaker_segmentation_model_path.as_deref(),
+    );
     repository.upsert_settings(&settings, current_time_ms()?)?;
     Ok(hydrate_settings_with_local_defaults(settings))
 }
@@ -3293,6 +3485,9 @@ pub fn run() {
             update_summarizer_settings,
             list_summarizer_models,
             check_permissions,
+            check_globe_key_free,
+            fn_key_watcher_is_running,
+            set_fn_self_test,
             open_permission_settings,
             update_transcriber_settings,
             update_audio_processing_settings,
@@ -3308,18 +3503,19 @@ pub fn run() {
             let database_path = app_data_dir.join(SCRIBE_DATABASE_FILE_NAME);
             let repository = SqliteRepository::open(&database_path)
                 .map_err(|error| std::io::Error::other(error.message))?;
-            let saved_settings = repository
-                .get_settings()
-                .map_err(|error| std::io::Error::other(error.message))?;
-            let hydrated_settings = hydrate_settings_with_local_defaults(saved_settings.clone());
-            if hydrated_settings != saved_settings {
+            let hydrated_settings = hydrate_settings_with_local_defaults(
                 repository
-                    .upsert_settings(
-                        &hydrated_settings,
-                        current_time_ms().map_err(|error| std::io::Error::other(error.message))?,
-                    )
-                    .map_err(|error| std::io::Error::other(error.message))?;
-            }
+                    .get_settings()
+                    .map_err(|error| std::io::Error::other(error.message))?,
+            );
+            // Hydrated for this run's own use only, and deliberately never
+            // written back. Persisting detected paths turned a detection result
+            // into a permanent user override: once stored, hydration sees a
+            // non-empty value and stops filling it, so the resources Scribe
+            // ships could never take over again - not even after an upgrade
+            // bundling a newer whisper-cli or a better model. Detection is
+            // cheap and already runs on every read via `load_effective_settings`,
+            // so there is nothing to cache here.
             app.manage(AppState {
                 repository: Mutex::new(repository),
                 recordings: Mutex::new(RecordingManager::new(
@@ -3328,6 +3524,8 @@ pub fn run() {
                 )),
                 dictation: Mutex::new(DictationRecorder::new(CpalCaptureBackend::new())),
                 dictation_hotkey: Mutex::new(DictationHotkey::new()),
+                dictation_fn_tap: Mutex::new(None),
+                dictation_fn_self_test: AtomicBool::new(false),
                 polish_selection_notice_count: Mutex::new(0),
                 meeting_detector: Mutex::new(TeamsCallDetector::new()),
                 meeting_call_state: Mutex::new(CallPromptState::default()),
@@ -4151,7 +4349,7 @@ fn app_data_dir(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
     })
 }
 
-fn current_time_ms() -> Result<u64, AppError> {
+pub(crate) fn current_time_ms() -> Result<u64, AppError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -5063,5 +5261,87 @@ mod tests {
                 updated_at_ms: 2_000,
             })
             .expect("meeting can be created");
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod dictation_hotkey_routing_tests {
+    use super::*;
+    use crate::domain::DEFAULT_POLISH_SELECTION_HOTKEY;
+
+    #[test]
+    fn the_fn_token_is_bindable_even_though_no_shortcut_can_express_it() {
+        assert!(is_supported_dictation_hotkey(FN_HOTKEY_TOKEN));
+        // The distinction that makes the routing necessary in the first place.
+        assert!(hotkey_shortcut_for(FN_HOTKEY_TOKEN).is_none());
+    }
+
+    #[test]
+    fn every_chord_on_the_allowlist_is_bindable() {
+        for token in [
+            "ctrl+option+d",
+            "cmd+shift+d",
+            "cmd+shift+space",
+            DEFAULT_POLISH_SELECTION_HOTKEY,
+        ] {
+            assert!(is_supported_dictation_hotkey(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn the_shipped_default_is_bindable() {
+        assert!(is_supported_dictation_hotkey(
+            crate::domain::DEFAULT_DICTATION_HOTKEY
+        ));
+    }
+
+    #[test]
+    fn unknown_tokens_are_rejected() {
+        for token in ["", "fn+d", "FN", "globe", "ctrl+option+z"] {
+            assert!(!is_supported_dictation_hotkey(token), "{token}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcriber_path_override_tests {
+    use super::user_override_only;
+
+    #[test]
+    fn a_path_matching_detection_is_not_stored() {
+        // The UI receives hydrated settings and posts them straight back, so
+        // this is what an untouched field looks like on save. Storing it would
+        // freeze today's detection result in place forever.
+        assert_eq!(
+            user_override_only(
+                Some("/Applications/Scribe.app/Contents/Resources/whisper/whisper-cli".to_string()),
+                Some("/Applications/Scribe.app/Contents/Resources/whisper/whisper-cli"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_path_the_user_actually_chose_is_stored() {
+        assert_eq!(
+            user_override_only(
+                Some("/Users/someone/models/ggml-large-v3.bin".to_string()),
+                Some("/Applications/Scribe.app/Contents/Resources/models/ggml-small-q5_1.bin"),
+            ),
+            Some("/Users/someone/models/ggml-large-v3.bin".to_string())
+        );
+    }
+
+    #[test]
+    fn an_override_survives_when_nothing_was_detected() {
+        assert_eq!(
+            user_override_only(Some("/opt/whisper/whisper-cli".to_string()), None),
+            Some("/opt/whisper/whisper-cli".to_string())
+        );
+    }
+
+    #[test]
+    fn clearing_a_field_stays_cleared() {
+        assert_eq!(user_override_only(None, Some("/some/detected/path")), None);
     }
 }

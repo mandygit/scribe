@@ -65,6 +65,7 @@ export const SUMMARIZER_PROVIDERS = [
 
 /** Selectable dictation hotkeys, matching the Rust allowlist. */
 export const DICTATION_HOTKEYS = [
+  { value: 'fn', label: '🌐 Fn (double-press)' },
   { value: 'cmd+shift+d', label: '⌘⇧D (double-press)' },
   { value: 'ctrl+option+d', label: '⌃⌥D (double-press)' },
   { value: 'cmd+shift+space', label: '⌘⇧Space (double-press)' },

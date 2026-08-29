@@ -7,7 +7,7 @@
 Scribe is a Tauri desktop app that records meetings locally, transcribes them with
 `whisper.cpp`, and writes concise notes (executive summary, decisions, open
 questions, action items) with a local LLM — nothing leaves your Mac. It also
-ships a system-wide dictation mode: hold a hotkey, speak, and the transcribed
+ships a system-wide dictation mode: double-press the 🌐 (Fn) key, speak, and the transcribed
 (optionally polished) text is pasted into whatever app you were typing into.
 
 The dictation mode makes Scribe a private, local alternative to
@@ -27,7 +27,7 @@ leaving your machine.
 | Copy to Slack/Teams | One click copies the generated notes (bold section labels, bullet lists, no tables) as rich text that pastes cleanly into chat apps. |
 | Meeting workspace | Each meeting opens in Summary / Notes / Transcript tabs, with an editable notes pane alongside the generated summary. |
 | History & trends | Every meeting's transcript, metrics, and notes are stored locally in SQLite; a trends view charts pace/filler words/score over time. |
-| Dictation | Global hotkey (double-press to toggle), esc to cancel, floating non-activating pill UI, optional on-device polish via Apple Intelligence (macOS 15+), paste-based injection into the focused app. |
+| Dictation | Hotkey (double-press to start, press once to stop), the 🌐/Fn key by default or a modifier chord; esc to cancel, floating non-activating pill UI, optional on-device polish via Apple Intelligence (macOS 15+), paste-based injection into the focused app. |
 | Retention controls | Configure how long raw audio is kept; transcripts and notes are kept regardless. |
 | Permission onboarding | First-run flow for Microphone / Screen Recording / Accessibility, with a clear explanation of what's degraded without each. |
 
@@ -66,9 +66,10 @@ bun run tauri dev
 ```
 
 On first launch, Scribe walks you through granting Microphone / Screen
-Recording / Accessibility permissions, and its Settings screen lets you point
-at your `whisper-cli` binary/model path and your LLM server's host/port/model
-(with a "Detect" button to list what's available).
+Recording / Accessibility permissions. Transcription needs no setup: the
+`whisper-cli` binary and speech model ship inside the app. Settings lets you
+point at a different model if you want one, and at your LLM server's
+host/port/model (with a "Detect" button to list what's available).
 
 ## Everyday commands
 
@@ -79,7 +80,7 @@ at your `whisper-cli` binary/model path and your LLM server's host/port/model
 | `bun run build` | Type-check (`tsc --noEmit`) and build the frontend bundle. |
 | `bun run test:frontend` | Bun-based frontend tests (`tests/frontend/`). |
 | `cd src-tauri && cargo check` | Fast Rust compile check. |
-| `cd src-tauri && cargo test` | Rust unit/integration tests (150+; a few native ones are `#[ignore]`d since they need real hardware/whisper-cli/LM Studio). |
+| `cd src-tauri && cargo test` | Rust unit/integration tests (190+; a few native ones are `#[ignore]`d since they need real hardware/whisper-cli/LM Studio). |
 | `bun run package:prepare` | Assemble the bundled tooling (relinked `whisper-cli`, whisper model, libspeexdsp) into `src-tauri/resources/`. Runs automatically before the two package commands. |
 | `bun run package:mac` | Build a local unsigned `.app` bundle with all tooling included. |
 | `bun run package:mac:dmg` | Build a self-contained `.dmg` for handing to another Mac. |
@@ -164,7 +165,7 @@ this yet.
 | `src-tauri/src/audio/` | Mic capture (cpal), system audio (ScreenCaptureKit sidecar), AEC (SpeexDSP), WAV I/O. |
 | `src-tauri/src/transcription/` | `whisper-cli` subprocess wrapper, streaming replay. |
 | `src-tauri/src/summarizer/` | LM Studio/Ollama/custom chat client, map-reduce summarization. |
-| `src-tauri/src/dictation/` | Hotkey detection, capture, clipboard injection, Apple Intelligence polish. |
+| `src-tauri/src/dictation/` | Hotkey detection (chords via global shortcut, the Fn key via its own event tap), capture, clipboard injection, Apple Intelligence polish. |
 | `src-tauri/src/rules/`, `src-tauri/src/nudges/` | Deterministic transcript metrics (pace, filler words) that feed the trends view. |
 | `src-tauri/src/persistence/` | `SqliteRepository` — all SQL lives here. |
 | `src-tauri/native/` | Swift sidecar sources (system audio capture, dictation polish). |

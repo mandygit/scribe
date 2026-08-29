@@ -990,6 +990,39 @@ button {
   color: var(--text-muted);
   margin: 2px 0 0;
 }
+
+/* A row inside a settings group for something only the user can fix, out in
+   System Settings. Shares the .field layout and borrows the danger palette (the
+   only semantic one here): the hotkey does still work, but sharing the key can
+   silently change your keyboard layout mid-sentence, which earns the weight. */
+.field-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  margin: 12px 0;
+  border-radius: var(--radius);
+  background: var(--bg-danger);
+}
+.field-notice .field-label {
+  font-size: 14px;
+  color: var(--text-danger);
+}
+/* Side-by-side controls in a .field row, for when there is more than one way
+   forward and neither is the obvious default. */
+.field-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.field-notice .field-desc {
+  font-size: 12px;
+  color: var(--text-danger);
+  margin: 2px 0 0;
+  max-width: 62ch;
+}
 .field input[type="text"],
 .field select {
   height: 34px;

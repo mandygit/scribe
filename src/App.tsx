@@ -13,11 +13,13 @@ import { copySummaryToClipboard } from './summary-clipboard';
 import {
   type AppStatus,
   type AudioDevice,
+  checkGlobeKeyFree,
   checkPermissions,
   type DictationSessionRecord,
   type DictationStatsSummary,
   deleteDictationSession,
   deleteMeeting,
+  fnKeyWatcherIsRunning,
   getAppStatus,
   getDictationStatsSummary,
   getLastDictationRecovery,
@@ -27,6 +29,7 @@ import {
   listAudioDevices,
   listDictationSessions,
   listenToDictationState,
+  listenToFnKeyTapped,
   listenToRecordingStarted,
   listenToRecordingStopped,
   listMeetingHistory,
@@ -40,6 +43,7 @@ import {
   type PermissionsSnapshot,
   type ScribeSettings,
   sendCompletionNotification,
+  setFnSelfTest,
   startRecording,
   stopRecording,
   summarizeMeeting,
@@ -73,7 +77,7 @@ const FALLBACK_SETTINGS: ScribeSettings = {
   transcriberVocabulary: null,
   speakerEmbeddingModelPath: null,
   speakerSegmentationModelPath: null,
-  dictationHotkey: 'ctrl+option+d',
+  dictationHotkey: 'fn',
   dictationPolishEnabled: false,
   polishSelectionHotkey: 'ctrl+option+p',
   summarizerProvider: 'lmStudio',
@@ -1455,7 +1459,6 @@ function SettingsView({
   onReviewPermissions: () => void;
   permissions: PermissionsSnapshot | null;
 }) {
-  const [transcriberBin, setTranscriberBin] = useState(settings.transcriberBinPath ?? '');
   const [transcriberModel, setTranscriberModel] = useState(settings.transcriberModelPath ?? '');
   const [transcriberVocabulary, setTranscriberVocabulary] = useState(settings.transcriberVocabulary ?? '');
   const [summarizerHostInput, setSummarizerHostInput] = useState(settings.summarizerHost);
@@ -1464,6 +1467,106 @@ function SettingsView({
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [detecting, setDetecting] = useState(false);
   const [detectStatus, setDetectStatus] = useState<string | null>(null);
+  // null until the first answer arrives, so the warning never flashes on load.
+  const [globeKeyFree, setGlobeKeyFree] = useState<boolean | null>(null);
+  const [openingKeyboardPane, setOpeningKeyboardPane] = useState(false);
+  // Whether Scribe has a live watcher on the key at all. A refused watcher is
+  // the one failure the user cannot diagnose from the outside: dictation is
+  // simply unreachable by its own hotkey.
+  const [fnWatcherRunning, setFnWatcherRunning] = useState<boolean | null>(null);
+  const [selfTest, setSelfTest] = useState<'idle' | 'listening' | 'seen' | 'unseen'>('idle');
+
+  const usingFnHotkey = settings.dictationHotkey === 'fn';
+
+  // The fix lives in System Settings, so the answer can change while this view
+  // is open. Re-checking on window focus is what makes the warning clear by
+  // itself when the user comes back from changing it.
+  useEffect(() => {
+    if (!usingFnHotkey) {
+      setGlobeKeyFree(null);
+      // Also stand the self-test down. Its row is gone with the Fn hotkey, but
+      // its effect lives on this component, and an armed self-test swallows
+      // taps - so leaving it running would make dictation look broken the next
+      // time the user switches back.
+      setSelfTest('idle');
+      return;
+    }
+    let cancelled = false;
+    const refresh = () => {
+      checkGlobeKeyFree()
+        .then((free) => {
+          if (!cancelled) setGlobeKeyFree(free);
+        })
+        .catch(() => {
+          // Not knowing is not worth an error banner: dictation still works,
+          // it just may share the key.
+          if (!cancelled) setGlobeKeyFree(null);
+        });
+    };
+    refresh();
+    window.addEventListener('focus', refresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', refresh);
+    };
+  }, [usingFnHotkey]);
+
+  useEffect(() => {
+    if (!usingFnHotkey) {
+      setFnWatcherRunning(null);
+      return;
+    }
+    let cancelled = false;
+    fnKeyWatcherIsRunning()
+      .then((running) => {
+        if (!cancelled) setFnWatcherRunning(running);
+      })
+      .catch(() => {
+        if (!cancelled) setFnWatcherRunning(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [usingFnHotkey]);
+
+  // A healthy watcher proves nothing on its own: a Karabiner remap or a
+  // non-Apple external keyboard can swallow Fn below us, so it comes up fine
+  // and never hears anything. Watching for one real press is the only way to
+  // tell that apart from "hasn't tried yet".
+  useEffect(() => {
+    if (selfTest !== 'listening') return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void setFnSelfTest(true).catch(() => undefined);
+    void listenToFnKeyTapped(() => setSelfTest('seen'))
+      .then((handle) => {
+        if (cancelled) handle();
+        else unlisten = handle;
+      })
+      .catch(() => {
+        // Never attached, so no tap can ever arrive. Say so now rather than
+        // leaving the user watching "Waiting..." until the timeout.
+        if (!cancelled) setSelfTest('unseen');
+      });
+    const timeout = window.setTimeout(() => setSelfTest('unseen'), 8000);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      window.clearTimeout(timeout);
+      void setFnSelfTest(false).catch(() => undefined);
+    };
+  }, [selfTest]);
+
+  const openKeyboardSettings = useCallback(async () => {
+    setOpeningKeyboardPane(true);
+    try {
+      await openPermissionSettings('Keyboard');
+    } catch {
+      /* best-effort deep link; the warning text names the setting either way */
+    } finally {
+      setOpeningKeyboardPane(false);
+    }
+  }, []);
 
   const saveAudio = useCallback(
     async (next: Partial<Pick<ScribeSettings, 'enableSystemAudio' | 'enableEchoCancellation'>>) => {
@@ -1591,7 +1694,10 @@ function SettingsView({
     onError(null);
     try {
       const updated = await updateTranscriberSettings(
-        transcriberBin.trim() || null,
+        // No longer editable here: Scribe bundles whisper-cli, and a mismatched
+        // binary breaks transcription quietly. Passed through rather than
+        // nulled so an override set by an older build survives.
+        settings.transcriberBinPath,
         transcriberModel.trim() || null,
         transcriberVocabulary.trim() || null,
         settings.speakerEmbeddingModelPath,
@@ -1606,7 +1712,7 @@ function SettingsView({
     onSettings,
     settings.speakerEmbeddingModelPath,
     settings.speakerSegmentationModelPath,
-    transcriberBin,
+    settings.transcriberBinPath,
     transcriberModel,
     transcriberVocabulary,
   ]);
@@ -1730,6 +1836,78 @@ function SettingsView({
             ))}
           </select>
         </div>
+        {usingFnHotkey && globeKeyFree === false && (
+          <div className="field-notice">
+            <div>
+              <div className="field-label">Your Mac still uses the 🌐 key</div>
+              <p className="field-desc">
+                Scribe listens for the key without taking it, so macOS keeps acting on it too: the tap that stops a
+                dictation also fires the Globe key's own action - switching input source, the emoji picker, or Apple
+                Dictation. Set <strong>Press 🌐 key to</strong> → <strong>Do Nothing</strong> in Keyboard settings.
+              </p>
+            </div>
+            <button type="button" className="ghost-btn" onClick={() => void openKeyboardSettings()}>
+              {openingKeyboardPane ? 'Opening…' : 'Open Keyboard settings'}
+            </button>
+          </div>
+        )}
+        {usingFnHotkey && fnWatcherRunning === false && (
+          <div className="field-notice">
+            <div>
+              <div className="field-label">Scribe isn't watching the 🌐 key</div>
+              <p className="field-desc">
+                Watching it needs Accessibility permission, so dictation can't be started by its hotkey until that's
+                granted. Review permissions above, or pick a different hotkey.
+              </p>
+            </div>
+          </div>
+        )}
+        {usingFnHotkey && (
+          <div className="field">
+            <div>
+              <div className="field-label">Check the 🌐 key works</div>
+              <p className="field-desc">
+                {selfTest === 'listening'
+                  ? 'Tap the 🌐 key once now. It won\u2019t start a dictation while this test is running.'
+                  : selfTest === 'seen'
+                    ? 'Scribe saw your 🌐 key. The hotkey will work.'
+                    : selfTest === 'unseen'
+                      ? "Scribe didn't see a tap. Some external keyboards and remapping tools handle 🌐 themselves, so it never reaches Scribe at all. In that case, use a different hotkey."
+                      : 'Some keyboards never send 🌐 to macOS at all. Press the button, then tap the key to be sure.'}
+              </p>
+            </div>
+            {selfTest === 'unseen' ? (
+              // Both ways out. Failing this test does not prove the key is
+              // unreachable - the likeliest cause is simply not tapping in
+              // time - so offering only the fallback would push people off a
+              // hotkey that works.
+              <div className="field-actions">
+                <button type="button" className="ghost-btn" onClick={() => setSelfTest('listening')}>
+                  Try again
+                </button>
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  onClick={() => {
+                    setSelfTest('idle');
+                    void saveDictation({ dictationHotkey: 'ctrl+option+d' });
+                  }}
+                >
+                  Use ⌃⌥D instead
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="ghost-btn"
+                disabled={selfTest === 'listening'}
+                onClick={() => setSelfTest('listening')}
+              >
+                {selfTest === 'listening' ? 'Waiting…' : selfTest === 'seen' ? 'Test again' : 'Test the key'}
+              </button>
+            )}
+          </div>
+        )}
         <div className="field">
           <div>
             <div className="field-label">Polish with Apple Intelligence</div>
@@ -1861,28 +2039,21 @@ function SettingsView({
 
       <section className="settings-group">
         <h2>Transcription</h2>
-        <p className="hint">Point Scribe at your local whisper.cpp binary and model.</p>
+        <p className="hint">
+          Scribe ships with whisper.cpp and a speech model, and uses them out of the box. Nothing here needs setting up.
+        </p>
         <div className="field">
           <div>
-            <div className="field-label">whisper-cli path</div>
-            <p className="field-desc">Leave blank to auto-detect on PATH.</p>
-          </div>
-          <input
-            type="text"
-            value={transcriberBin}
-            placeholder="/opt/homebrew/bin/whisper-cli"
-            onChange={(event) => setTranscriberBin(event.target.value)}
-          />
-        </div>
-        <div className="field">
-          <div>
-            <div className="field-label">Model path</div>
-            <p className="field-desc">A downloaded whisper.cpp .bin model.</p>
+            <div className="field-label">Model</div>
+            <p className="field-desc">
+              Override only to use a different whisper.cpp model, such as a larger one for more accuracy on a fast Mac.
+              Clear it to go back to the model Scribe ships with.
+            </p>
           </div>
           <input
             type="text"
             value={transcriberModel}
-            placeholder="/path/to/ggml-small.bin"
+            placeholder="Using the bundled model"
             onChange={(event) => setTranscriberModel(event.target.value)}
           />
         </div>

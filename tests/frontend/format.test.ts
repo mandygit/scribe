@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { formatClock, formatDuration, meetingTitle } from '../../src/format';
+import { formatClock, formatDuration, formatHotkey, meetingTitle } from '../../src/format';
 
 describe('formatDuration', () => {
   it('returns a dash for null or sub-second input', () => {
@@ -37,5 +37,18 @@ describe('meetingTitle', () => {
   it('falls back to a dated label when title is blank', () => {
     const label = meetingTitle({ title: null, startedAtMs: Date.UTC(2026, 5, 27) });
     expect(label.startsWith('Meeting · ')).toBe(true);
+  });
+});
+
+describe('formatHotkey', () => {
+  it('renders modifier chords as macOS glyphs', () => {
+    expect(formatHotkey('cmd+shift+d')).toBe('⌘⇧D');
+    expect(formatHotkey('ctrl+option+d')).toBe('⌃⌥D');
+    expect(formatHotkey('cmd+shift+space')).toBe('⌘⇧Space');
+  });
+
+  it('spells out the Fn key rather than showing the colour globe emoji', () => {
+    // 🌐 renders in full colour and breaks the pill's monochrome glyph run.
+    expect(formatHotkey('fn')).toBe('Fn');
   });
 });

@@ -104,25 +104,41 @@ fn probe_temp_path(stem: &str, extension: &str) -> std::path::PathBuf {
     ))
 }
 
-/// Panes accepted by [`open_system_settings_pane`], matching macOS's
-/// `x-apple.systempreferences` Privacy sub-panes.
-const VALID_SETTINGS_PANES: &[&str] = &["Microphone", "ScreenCapture", "Accessibility"];
+/// The System Settings URL for a pane Scribe will open, or `None` for anything
+/// not on the list. An allowlist rather than a passthrough: the pane name
+/// arrives from the frontend, and `open` would happily launch any URL scheme
+/// on the system.
+///
+/// The three privacy panes share one query-string form; Keyboard is a separate
+/// settings extension with its own URL, which is why this is a mapping and not
+/// a list.
+fn settings_pane_url(pane: &str) -> Option<String> {
+    match pane {
+        "Microphone" | "ScreenCapture" | "Accessibility" => Some(format!(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_{pane}"
+        )),
+        // Where "Press 🌐 key to" lives, for freeing the Globe key up for
+        // dictation - see `dictation::fn_tap::globe_key_is_free`.
+        "Keyboard" => {
+            Some("x-apple.systempreferences:com.apple.Keyboard-Settings.extension".to_string())
+        }
+        _ => None,
+    }
+}
 
-/// Deep-links to the relevant Privacy & Security pane in System Settings, for
-/// when a permission has already been denied and only the user can undo that
-/// (macOS does not re-prompt after an explicit deny).
+/// Deep-links to a System Settings pane the user has to visit themselves: a
+/// permission macOS won't re-prompt for after an explicit deny, or a keyboard
+/// setting Scribe deliberately won't rewrite on their behalf.
 pub fn open_system_settings_pane(pane: &str) -> Result<(), AppError> {
-    if !VALID_SETTINGS_PANES.contains(&pane) {
+    let Some(url) = settings_pane_url(pane) else {
         return Err(AppError {
             code: "permissions_unknown_pane".to_string(),
             message: format!("Unknown System Settings pane: {pane}"),
             details: None,
         });
-    }
+    };
     Command::new("open")
-        .arg(format!(
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_{pane}"
-        ))
+        .arg(url)
         .status()
         .map_err(|error| AppError {
             code: "permissions_open_settings_failed".to_string(),

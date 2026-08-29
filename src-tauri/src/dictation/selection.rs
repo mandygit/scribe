@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use crate::domain::AppError;
 
-use super::inject::{copy_selection, inject_text, read_clipboard};
+use super::inject::{
+    copy_selection, inject_text, read_clipboard, restore_clipboard, snapshot_clipboard,
+};
 use super::polish_text;
 
 /// How often to re-check the clipboard while waiting for a synthesised
@@ -34,8 +36,32 @@ pub enum SelectionPolishOutcome {
 }
 
 /// Copies the focused app's current selection, polishes it, and pastes the
-/// result back in place.
+/// result back in place, leaving the user's clipboard as it found it.
+///
+/// The clipboard has to be saved *here*, before the Cmd+C. `inject_text` takes
+/// its own snapshot and faithfully restores it, but by then `copy_selection`
+/// has already overwritten the clipboard with the raw selection - so that
+/// restore puts the selection back, not whatever the user had copied, which is
+/// gone. Dictation does not have this problem because nothing overwrites the
+/// clipboard before `inject_text` runs.
 pub fn polish_selection() -> Result<SelectionPolishOutcome, AppError> {
+    let saved = snapshot_clipboard();
+    let outcome = polish_selection_inner();
+    // The one case that must NOT be undone: a failed paste deliberately leaves
+    // the polished text on the clipboard, because that is then the only copy
+    // of it anywhere. Putting the user's clipboard back over it would be the
+    // silent loss that fallback exists to prevent.
+    let polished_text_is_the_only_copy =
+        matches!(outcome, Ok(SelectionPolishOutcome::PasteFailed));
+    if !polished_text_is_the_only_copy && !saved.is_empty() {
+        // Best-effort: a restore hiccup is not worth failing a polish that
+        // already landed in the user's document.
+        restore_clipboard(&saved);
+    }
+    outcome
+}
+
+fn polish_selection_inner() -> Result<SelectionPolishOutcome, AppError> {
     let before = read_clipboard().unwrap_or_default();
     eprintln!(
         "polish_selection: clipboard before Cmd+C has {} chars",

@@ -34,6 +34,7 @@ export const DICTATION_PILL_HOVER_EVENT = 'scribe://dictation-pill-hover';
 export const POLISH_SELECTION_NOTICE_EVENT = 'scribe://polish-selection-notice';
 export const MEETING_DETECTED_EVENT = 'scribe://meeting-detected';
 export const MEETING_CALL_ENDED_EVENT = 'scribe://meeting-call-ended';
+export const FN_KEY_TAPPED_EVENT = 'scribe://fn-key-tapped';
 export const RECORDING_STARTED_EVENT = 'scribe://recording-started';
 export const RECORDING_STOPPED_EVENT = 'scribe://recording-stopped';
 
@@ -248,8 +249,36 @@ export const listSummarizerModels = async (
 export const checkPermissions = async (): Promise<PermissionsSnapshot> =>
   invokeNative<PermissionsSnapshot>('check_permissions');
 
-export const openPermissionSettings = async (pane: 'Microphone' | 'ScreenCapture' | 'Accessibility'): Promise<void> =>
-  invokeNative<void>('open_permission_settings', { pane });
+export const openPermissionSettings = async (
+  pane: 'Microphone' | 'ScreenCapture' | 'Accessibility' | 'Keyboard',
+): Promise<void> => invokeNative<void>('open_permission_settings', { pane });
+
+/**
+ * Whether the Globe/Fn key is free for dictation, or macOS still acts on it
+ * too. Read live, because the fix is a system setting the user goes and
+ * changes outside Scribe.
+ */
+export const checkGlobeKeyFree = async (): Promise<boolean> => invokeNative<boolean>('check_globe_key_free');
+
+/**
+ * Whether Scribe currently has a live watcher on the Fn key. False for any
+ * other hotkey, and also when the watcher was refused - which is the case worth
+ * showing, since dictation is then unreachable by its own default hotkey.
+ */
+export const fnKeyWatcherIsRunning = async (): Promise<boolean> => invokeNative<boolean>('fn_key_watcher_is_running');
+
+/**
+ * Starts/stops the Fn self-test. While it is listening, taps are reported to
+ * the UI and go no further, so testing the key cannot start a dictation.
+ */
+export const setFnSelfTest = async (listening: boolean): Promise<void> =>
+  invokeNative<void>('set_fn_self_test', { listening });
+
+/** Fires on each bare Fn tap, but only while a self-test is listening. */
+export const listenToFnKeyTapped = async (onTapped: () => void): Promise<UnlistenFn> => {
+  assertTauriRuntime();
+  return listen(FN_KEY_TAPPED_EVENT, () => onTapped());
+};
 
 export const sendCompletionNotification = async (title: string, body: string): Promise<void> =>
   invokeNative<void>('send_completion_notification', { title, body });

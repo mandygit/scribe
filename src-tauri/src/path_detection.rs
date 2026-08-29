@@ -22,11 +22,11 @@ const SPEAKER_SEGMENTATION_QUERY: &str =
     "kMDItemFSName == \"*.onnx\"c && (kMDItemFSName == \"*segmentation*\"c || kMDItemFSName == \"*pyannote*\"c || kMDItemFSName == \"*speaker*\"c)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DetectedLocalPaths {
-    transcriber_bin_path: Option<String>,
-    transcriber_model_path: Option<String>,
-    speaker_embedding_model_path: Option<String>,
-    speaker_segmentation_model_path: Option<String>,
+pub(crate) struct DetectedLocalPaths {
+    pub(crate) transcriber_bin_path: Option<String>,
+    pub(crate) transcriber_model_path: Option<String>,
+    pub(crate) speaker_embedding_model_path: Option<String>,
+    pub(crate) speaker_segmentation_model_path: Option<String>,
 }
 
 enum ModelKind {
@@ -63,7 +63,7 @@ fn missing_path(path: &Option<String>) -> bool {
     path.as_deref().map(str::trim).map_or(true, str::is_empty)
 }
 
-fn detect_local_paths() -> DetectedLocalPaths {
+pub(crate) fn detect_local_paths() -> DetectedLocalPaths {
     DETECTED_LOCAL_PATHS
         .get_or_init(|| DetectedLocalPaths {
             transcriber_bin_path: detect_whisper_binary_path(),
